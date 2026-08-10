@@ -161,3 +161,44 @@ datasets/TartanAir.pickle
 datasets/TartanAir
 TartanAirResults
 thirdparty/*
+
+
+# =========================
+# Research workspace
+# =========================
+
+# Research datasets
+research/assets/
+research/datasets/
+research/data/
+
+# Experiment outputs
+research/results/
+research/outputs/
+research/logs/
+
+# Local checkpoints and weights
+research/checkpoints/
+research/weights/
+research/models/
+*.ckpt
+
+# Local experiment cache
+research/cache/
+
+# Build artifacts
+**/build/
+**/cmake-build-*/
+**/CMakeFiles/
+**/CMakeCache.txt
+
+# Visualization generated files
+*.mp4
+*.avi
+*.png
+*.jpg
+
+# IDE / OS
+.DS_Store
+.idea/
+.vscode/
