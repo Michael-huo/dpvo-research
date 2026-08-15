@@ -169,22 +169,10 @@ thirdparty/*
 
 # Research datasets
 research/assets/
-research/datasets/
-research/data/
 
 # Experiment outputs
 research/results/
-research/outputs/
-research/logs/
 
-# Local checkpoints and weights
-research/checkpoints/
-research/weights/
-research/models/
-*.ckpt
-
-# Local experiment cache
-research/cache/
 
 # Build artifacts
 **/build/

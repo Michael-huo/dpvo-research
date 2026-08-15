@@ -1,107 +1,39 @@
 name: dpvo
+
 channels:
   - conda-forge
+
 dependencies:
-  - _openmp_mutex=4.5=20_gnu
-  - bzip2=1.0.8=hda65f42_10
-  - ca-certificates=2026.7.22=hbd8a1cb_0
-  - icu=78.3=h54a6638_2
-  - ld_impl_linux-64=2.46.1=default_hbd61a6d_102
-  - libexpat=2.8.1=hecca717_1
-  - libffi=3.7.0=h3435931_0
-  - libgcc=16.1.0=ha9f2e26_1
-  - libgomp=16.1.0=he0feb66_1
-  - liblzma=5.8.3=hb03c661_0
-  - libnsl=2.0.1=hb9d3cd8_1
-  - libsqlite=3.53.4=hf4e2dac_0
-  - libstdcxx=16.1.0=h934c35e_1
-  - libuuid=2.42.2=h5347b49_0
-  - libxcrypt=4.4.38=h280c20c_0
-  - libzlib=1.3.2=h25fd6f3_3
-  - ncurses=6.6=hdb14827_0
-  - openssl=3.6.3=h35e630c_1
-  - packaging=26.3=pyhc364b38_0
-  - pip=26.2.1=pyh8b19718_0
-  - python=3.10.20=h267e890_1_cpython
-  - readline=8.3=h853b02a_0
-  - setuptools=83.0.0=pyh332efcf_0
-  - tk=8.6.13=noxft_hd70dff1_3
-  - wheel=0.47.0=pyhd8ed1ab_0
-  - zstd=1.5.7=hb78ec9c_6
+  # Core environment
+  - python=3.10.14
+  - pip
+  - cmake=3.22.2
+
+  # Python dependencies
   - pip:
-      - absl-py==2.5.0
-      - apsw==3.53.4.0
-      - argcomplete==3.7.2
-      - colorama==0.4.6
-      - contourpy==1.3.2
-      - cycler==0.12.1
-      - dpvo==0.0.0
-      - einops==0.8.2
-      - evo==1.37.0
-      - exceptiongroup==1.3.1
-      - filelock==3.29.0
-      - fonttools==4.63.0
-      - fsspec==2026.4.0
-      - grpcio==1.83.0
-      - iniconfig==2.3.0
-      - jinja2==3.1.6
-      - kiwisolver==1.5.0
-      - kornia==0.8.2
-      - kornia-rs==0.1.14
-      - llvmlite==0.48.0
-      - lz4==4.4.5
-      - markdown==3.10.3
-      - markupsafe==3.0.3
-      - matplotlib==3.10.9
-      - mpmath==1.3.0
-      - natsort==8.4.0
-      - networkx==3.4.2
-      - numba==0.66.0
-      - numexpr==2.14.1
-      - numpy==2.2.6
-      - nvidia-cublas-cu12==12.1.3.1
-      - nvidia-cuda-cupti-cu12==12.1.105
-      - nvidia-cuda-nvrtc-cu12==12.1.105
-      - nvidia-cuda-runtime-cu12==12.1.105
-      - nvidia-cudnn-cu12==8.9.2.26
-      - nvidia-cufft-cu12==11.0.2.54
-      - nvidia-curand-cu12==10.3.2.106
-      - nvidia-cusolver-cu12==11.4.5.107
-      - nvidia-cusparse-cu12==12.1.0.106
-      - nvidia-nccl-cu12==2.20.5
-      - nvidia-nvjitlink-cu12==12.9.86
-      - nvidia-nvtx-cu12==12.1.105
-      - opencv-python==5.0.0.93
-      - pandas==2.3.3
-      - pillow==12.2.0
-      - pluggy==1.6.0
-      - plyfile==1.1.5
-      - protobuf==7.35.1
-      - pygments==2.20.0
-      - pyparsing==3.3.2
-      - pypose==0.9.5
-      - pytest==9.1.1
-      - python-dateutil==2.9.0.post0
-      - pytz==2026.3.post1
-      - pyyaml==6.0.3
-      - rosbags==0.11.3
-      - ruamel-yaml==0.19.1
-      - scipy==1.15.3
-      - seaborn==0.13.2
-      - six==1.17.0
-      - sympy==1.14.0
-      - tensorboard==2.21.0
-      - tensorboard-data-server==0.7.2
-      - tomli==2.4.1
+      # PyTorch CUDA 12.1 wheels
+      - --extra-index-url https://download.pytorch.org/whl/cu121
+
+      # PyG wheels matched to PyTorch 2.3.1 + CUDA 12.1
+      - --find-links https://data.pyg.org/whl/torch-2.3.1+cu121.html
+
+      # PyTorch stack
       - torch==2.3.1+cu121
-      - torch-scatter==2.1.2+pt23cu121
-      - torchaudio==2.3.1+cu121
       - torchvision==0.18.1+cu121
+      - torchaudio==2.3.1+cu121
+      - torch-scatter==2.1.2+pt23cu121
+
+      # DPVO runtime dependencies
+      - numpy==2.2.6
+      - scipy==1.15.3
+      - matplotlib==3.10.9
+      - tensorboard==2.21.0
+      - numba==0.66.0
       - tqdm==4.70.0
-      - triton==2.3.1
-      - typing-extensions==4.15.0
-      - tzdata==2026.3
-      - werkzeug==3.1.8
+      - einops==0.8.2
+      - pypose==0.9.5
+      - kornia==0.8.2
+      - plyfile==1.1.5
+      - evo==1.37.0
+      - opencv-python==5.0.0.93
       - yacs==0.1.8
-      - zstandard==0.25.0
-prefix: /home/hx/miniforge3/envs/dpvo
