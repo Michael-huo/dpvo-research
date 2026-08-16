@@ -1,4 +1,4 @@
-a# Byte-compiled / optimized / DLL files
+# Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
 *$py.class
@@ -173,6 +173,8 @@ research/assets/
 # Experiment outputs
 research/results/
 
+# External runtime assets
+ORBvoc.txt
 
 # Build artifacts
 **/build/
