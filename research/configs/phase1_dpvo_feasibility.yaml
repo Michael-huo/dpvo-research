@@ -1,0 +1,31 @@
+experiment:
+  name: experiment_1_dpvo_internal_behavior
+  sequences: [MH_01_easy, MH_03_medium, MH_05_difficult]
+  stride: 2
+  skip: 0
+  seed: 1234
+  sanity_frames: 200
+
+paths:
+  euroc_root: research/assets/datasets/euroc
+  calib: calib/euroc.txt
+  groundtruth_pattern: datasets/euroc_groundtruth/{sequence}.txt
+  network: research/assets/models/dpvo.pth
+  dpvo_config: config/default.yaml
+  output_root: research/results/phase1-dpvo-feasibility/exp1
+
+behavior:
+  enabled: true
+  observation_bottom_k: 500000
+  correlation_temperature: 1.0
+  patches_per_frame: 96
+  trajectory_window_frames: 20
+  trajectory_window_min_associations: 10
+  bootstrap_iterations: 2000
+  bootstrap_block_windows: 5
+
+probe:
+  patch_tensor_samples: 0
+  correlation_tensor_samples: 0
+  validate_finite_every: 25
+  sanity_validation: false
