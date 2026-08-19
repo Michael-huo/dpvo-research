@@ -189,3 +189,50 @@ MH_01 → MH_03 → MH_05 是 EuRoC nominal difficulty order，不是单变量�
 low-confidence + weak-correlation patch 比例由 11.7%→16.6%→19.4% 增加，说明 nominally harder 条件下固定 random patch budget 中低质量 correspondence 增多。Figure 4 中 texture 与 model-derived motion 下的 matching degradation 最清晰；这仍是 difficulty proxy 的描述性结果。internal state 与 local trajectory RMSE 没有稳定的跨序列关联，且 global ATE 为 non-monotonic（MH_03 高于 MH_05）。MH_01 → MH_03 → MH_05 仅是 EuRoC nominal difficulty order，不是单变量控制实验，因此这些结果不构成难度、内部量或轨迹误差之间的因果结论。
 
 完整 evidence、五张 comparison figures 及 Q1–Q7 讨论位于 `research/results/phase1-dpvo-feasibility/exp1/comparison/`。Experiment 1 的 Decision Gate 是优先验证 correspondence representation，而不是 confidence fusion。Experiment 1 在此暂停，不进入 Experiment 2 或 JEPA。
+
+## Phase 1 / Experiment 2
+
+### Research Question
+
+Experiment 2 验证：当 DPVO local correspondence representation 已经退化时，当前固定的 V-JEPA dense representation 是否仍然保留具有几何一致性的互补 correspondence information？
+
+本实验不修改 DPVO、不进行 feature fusion、也不训练模型；它只对 DPVO 与 V-JEPA representation 进行离线 feasibility comparison。
+
+### Protocol
+
+固定序列为 `MH_01_easy` 与 `MH_05_difficult`。DPVO grouping 使用 Experiment 1 的 `corr_margin_l0`：MH_01 Q20=`0.0`、Q80=`0.3967015743255615`；good=`corr_margin_l0 >= Q80`，bad=`corr_margin_l0 <= Q20`。Q20 的 tie 保留，bad 组称为 `MH_01 Q20 frozen-threshold bad group`，不视为严格 bottom 20%。
+
+正式实验使用每组 1000 samples、四组共 4000 correct temporal pairs，以及 200 temporal-shuffled controls；seed=`1234`，共享 source-frame cap=`8`。V-JEPA 固定为 V-JEPA 2.1 ViT-B/16 384 的 final EMA encoder dense tokens、framewise representation、24×24 token grid、768-dimensional feature 与 full-grid cosine retrieval。核心指标为 peak margin、epipolar error、cycle consistency 和 geometry consistency；epipolar geometry 在已验证的 EuRoC cam0 undistorted pinhole domain 中计算。
+
+### Main Results
+
+| Group | Peak margin | Epipolar error (tokens) | Cycle success | Geometry consistency |
+|---|---:|---:|---:|---:|
+| MH01 good | 0.01849 | 2.1349 | 58.4% | 20.9% |
+| MH01 bad | 0.00881 | 4.5702 | 14.1% | 3.0% |
+| MH05 good | 0.01899 | 1.9491 | 58.5% | 22.9% |
+| MH05 bad | 0.00832 | 4.2228 | 15.8% | 3.5% |
+
+DPVO good→bad 时，两条序列均稳定表现为 JEPA peak margin 下降、epipolar error 上升、cycle success 大幅下降，以及 geometry consistency 大幅下降。`geometry consistency` 是 geometry+cycle 一致的 feasibility operational criterion，不宣称已经恢复真实 correspondence。
+
+### Temporal-gap Control
+
+固定使用 `|dt| <= 2 s`、`2 < |dt| <= 5 s` 与 `|dt| > 5 s` 三个 bin。全部 6 个 sequence×gap 的 good→bad 对照中，peak margin 均下降、epipolar error 均上升、cycle success 与 geometry consistency 均下降。因此 formal 结果不能主要归因于 good/bad 的 temporal-gap 分布差异。完整 12-cell table 位于 `research/results/phase1-dpvo-feasibility/exp2/formal/report/REPORT.md`。
+
+### Shuffled Null Control
+
+200 个 paired joint-valid controls 的 correct / temporal-shuffled 指标分别为：peak margin 0.01326 / 0.00781，epipolar error 3.5358 / 5.7875 tokens，cycle success 33.5% / 15.5%，geometry consistency 12.0% / 2.0%。这表明当前 V-JEPA representation 确实包含一定 temporal correspondence signal，因此 negative 结果不能解释为 measurement pipeline 完全失效。
+
+但 DPVO-bad 时 JEPA correspondence quality 同样明显下降，没有形成稳定、明显规模的 DPVO-bad / JEPA-good population。Shuffled 仅是 descriptive null sanity，并非 NEGATIVE 的必要判据。
+
+### Decision Gate
+
+**Experiment 2: NEGATIVE**
+
+“当前固定的 V-JEPA 2.1 ViT-B framewise final dense representation 未表现出对 DPVO local correspondence 的明显互补性。”
+
+该结论不表示 V-JEPA 没有 correspondence information，也不表示 JEPA 无法用于 VSLAM。Experiment 2 只否定当前最直接的 off-the-shelf V-JEPA dense token → DPVO local correspondence 融合方式；它不否定 temporal/world-state representation、task-aligned latent、latent prediction，或 sparse-image + predicted latent hybrid VSLAM 的后续可能性。
+
+### Next Research Direction
+
+Experiment 3 将不继续尝试直接 local-token fusion，而首先验证：“Sparse real images + Oracle task latent 是否能够恢复 sparse-image VSLAM 的精度损失？”这是 feature-domain / latent-domain VSLAM 的 upper-bound feasibility test；本轮不实现 Experiment 3。

@@ -1,0 +1,60 @@
+schema_version: 1
+
+experiment:
+  name: phase1_exp2_jepa_correspondence
+  sequences:
+    - MH_01_easy
+    - MH_05_difficult
+  seed: 1234
+  per_source_frame_cap: 8
+  shuffled_min_frame_separation: 300
+
+sampling_profiles:
+  smoke:
+    samples_per_group: 50
+    shuffled_per_group: 10
+  formal:
+    samples_per_group: 1000
+    shuffled_per_group: 50
+
+thresholds:
+  source_sequence: MH_01_easy
+  metric: corr_margin_l0
+  q20_quantile: 0.20
+  q80_quantile: 0.80
+  expected_q20: 0.0
+  expected_q80: 0.3967015743255615
+  bad_operator: le
+  good_operator: ge
+  bad_group_description: MH_01 Q20 frozen-threshold bad group
+
+coordinates:
+  dpvo_resolution_scale: 4.0
+  raw_image_hw: [480, 752]
+  vjepa_crop_size: 384
+  vjepa_short_side_scale: 1.1428571428571428
+  token_patch_size: 16
+  expected_token_grid_hw: [24, 24]
+
+paths:
+  exp1_root: research/results/phase1-dpvo-feasibility/exp1
+  euroc_root: research/assets/datasets/euroc
+  euroc_calibration: calib/euroc.txt
+  groundtruth_pattern: datasets/euroc_groundtruth/{sequence}.txt
+  output_root: research/results/phase1-dpvo-feasibility/exp2
+
+vjepa:
+  repo: /home/hx/vjepa2-research
+  python: /home/hx/miniforge3/envs/vjepa/bin/python
+  expected_git_commit: be4a39cf6252ee003dbe96f22176529c5c0a39c9
+  model_alias: vjepa2_1_vit_base_384
+  model_name: V-JEPA 2.1 ViT-B/16 384
+  checkpoint: research/assets/model/vjepa2_1_vitb_dist_vitG_384.pt
+  representation: final dense patch tokens (ema_encoder)
+  feature_mode: image_tokenizer_framewise
+  batch_size: 4
+
+metrics:
+  peak_exclusion_chebyshev_radius: 1
+  cycle_success_threshold_tokens: 1.0
+  epipolar_threshold_tokens: 1.0
