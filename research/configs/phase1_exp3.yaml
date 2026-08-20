@@ -1,0 +1,20 @@
+experiment:
+  name: phase1_exp3_final_representative
+  sequences: [MH_01_easy, MH_03_medium, MH_05_difficult]
+  stride: 2
+  skip: 0
+  seed: 1234
+  nominal_rgb_upload_ratio: 0.125
+  post_bootstrap_anchor_interval: 8
+
+runtime:
+  loop_closure: false
+  classic_loop_closure: false
+
+paths:
+  euroc_root: research/assets/datasets/euroc
+  calibration: calib/euroc.txt
+  groundtruth_pattern: datasets/euroc_groundtruth/{sequence}.txt
+  checkpoint: research/assets/models/dpvo.pth
+  dpvo_config: config/default.yaml
+  output: research/results/phase1-dpvo-feasibility/exp3
