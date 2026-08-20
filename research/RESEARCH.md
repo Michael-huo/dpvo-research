@@ -236,3 +236,74 @@ DPVO good→bad 时，两条序列均稳定表现为 JEPA peak margin 下降、e
 ### Next Research Direction
 
 Experiment 3 将不继续尝试直接 local-token fusion，而首先验证：“Sparse real images + Oracle task latent 是否能够恢复 sparse-image VSLAM 的精度损失？”这是 feature-domain / latent-domain VSLAM 的 upper-bound feasibility test；本轮不实现 Experiment 3。
+
+## Phase 1 / Experiment 3
+
+### Research Question
+
+Experiment 3 验证：在真实 RGB 严重稀疏时，`Sparse real RGB + perfect DPVO task latent` 是否存在恢复 sparse-image VSLAM 精度损失的 upper bound？Oracle latent 由缺失帧的隐藏 RGB 直接提取 DPVO target FMap，仅用于判断 task representation 的潜力，不代表可部署的预测模型。
+
+固定使用 stride=2、seed=1234、`config/default.yaml`、同一 checkpoint，并关闭 `LOOP_CLOSURE` 与 `CLASSIC_LOOP_CLOSURE`。最终正式复现命令只有：
+
+```bash
+python -m research.src.phase1_dpvo_feasibility.exp3.run_exp3
+```
+
+该入口独立执行 MH_01_easy、MH_03_medium、MH_05_difficult 的 K=8 representative protocol；历史 formal artifacts 仅作为经过 provenance/hash 验证的可选 cache。K=8 表示 severe-sparsity representative setting，用于展示 Sparse RGB 已显著退化时的 upper-bound behavior，不是调参得到的最佳参数。
+
+### Smoke
+
+400-candidate MH_01_easy smoke 使用 nominal 25% RGB upload。common-anchor global Sim(3) ATE 为：Full RGB 0.00411 m、Sparse RGB 0.09130 m、Oracle FMap 0.00490 m，preliminary gap recovery 约 99.1%。Native packet replay 与正常 DPVO 基本等价，Oracle extractor 通过 FMap equivalence microcheck；294/294 latent nodes 获得 factor、correlation、update 与 BA coverage，latent-source factors 和 placeholder violations 均为 0，最终为 `INTERFACE_READY`。
+
+该结果只说明短窗口中存在强 Oracle upper-bound signal，不能代表完整序列稳定性。
+
+### Formal Sweep
+
+正式实验覆盖 MH_01_easy、MH_05_difficult 的 nominal 50%/25%/12.5%。12.5% severe-sparsity 结果为：
+
+| Sequence | Full Anchor ATE [m] | Sparse Anchor ATE [m] | Oracle Anchor ATE [m] | Gap Recovery |
+|---|---:|---:|---:|---:|
+| MH_01_easy | 0.0992 | 3.7418 | 1.4082 | 64.1% |
+| MH_05_difficult | 0.1446 | 5.8487 | 1.1215 | 82.9% |
+
+但收益并不跨 ratio 稳定：MH01 50% 仅从 0.1221 m 改善到 0.1154 m；MH05 50% 从 0.1740 m 恶化到 0.2703 m；MH01 25% 从 0.0935 m 恶化到 2.8207 m，MH05 25% 从 0.1881 m 恶化到 0.3448 m。因此不能只保留 severe-sparsity 正结果，也不能宣称 Oracle FMap 能稳定替代缺失 RGB。Formal Decision 为 `PARTIAL`。
+
+Full RGB 使用 upstream normal culling，Sparse RGB 与 Oracle FMap 使用共同 no-culling policy；核心公平比较始终是 Sparse RGB 与 Sparse + Oracle FMap。Full 只作为性能 reference，Oracle 优于 Full 或 gap recovery 大于 1 不能解释为 latent 强于真实 RGB observation。
+
+### Auxiliary Topology Diagnosis
+
+Naive Oracle 将 latent 当作普通 raw DPVO state，导致 latent-inclusive frame distance 消耗 `PATCH_LIFETIME` 与 `REMOVAL_WINDOW`，削弱 real-anchor connectivity。Auxiliary diagnosis 恢复了 100% Sparse-like cumulative anchor-factor identities，同时保留原 anchor→latent policy，结果为：
+
+| Setting | Naive Oracle ATE [m] | Auxiliary Oracle ATE [m] | Anchor Topology Coverage |
+|---|---:|---:|---:|
+| MH01 25% | 2.8207 | 0.7248 | 100% |
+| MH05 25% | 0.3448 | 0.8988 | 100% |
+| MH05 12.5% | 1.1215 | 5.6853 | 100% |
+
+MH01 25% 明显改善，但 MH05 25% 和 12.5% 未保留 naive Oracle 的收益，最终为 `CONDITIONAL`。这说明 anchor-topology dilution 是 integration instability 的影响因素之一，但不能单独解释不稳定性；恢复 Sparse anchor topology 也不是稳定解决方案。Auxiliary 仅是 graph-semantics diagnosis，不作为最终 representative trajectory method。
+
+### Final Three-Sequence Representative Result
+
+最终使用 MH01/MH03/MH05、K=8，展示 Full RGB、Sparse RGB 与原始 naive Oracle FMap 三种方法。MH01/MH05 直接复用通过 hash/provenance 检查的 formal trajectories；MH03 新运行完整 1350 candidates 的三个 methods。
+
+| Sequence | Actual RGB Upload | Full Anchor ATE [m] | Sparse Anchor ATE [m] | Oracle Anchor ATE [m] | Gap Recovery |
+|---|---:|---:|---:|---:|---:|
+| MH_01_easy | 12.93% | 0.0992 | 3.7418 | 1.4082 | 64.1% |
+| MH_03_medium | 14.74% | 0.1817 | 3.3845 | 2.9395 | 13.9% |
+| MH_05_difficult | 16.18% | 0.1446 | 5.8487 | 1.1215 | 82.9% |
+
+MH03 表现为 intermediate recovery：Oracle 相对 Sparse 改善约 13.15%，但恢复幅度远小于 MH01/MH05。这进一步支持 Oracle upper bound 的 sequence dependence，不改变整体 Decision。
+
+三张轨迹图位于 `research/results/phase1-dpvo-feasibility/exp3/final/report/figures/`。Full RGB 为 dense trajectory，Oracle FMap 为 dense hybrid trajectory；Sparse RGB 只按时间顺序连接实际 accepted RGB-anchor poses 方便观察，没有插值，也不是 dense estimated trajectory。三种估计均使用相同 common-anchor评价约定，各自在 common anchors 上拟合 global Sim(3) 后应用于其可用轨迹。
+
+### Exp3 Final Decision
+
+**PARTIAL / CONDITIONAL UPPER-BOUND EVIDENCE**
+
+Experiment 3 provides PARTIAL / CONDITIONAL upper-bound evidence that perfect task latent can bridge severe RGB sparsity, but robust measurement–prediction graph integration remains unsolved.
+
+Experiment 3 证明完美 DPVO task latent 在严重图像稀疏条件下具有显著的精度恢复潜力，但该收益依赖序列、稀疏程度和 latent graph integration。真实 measurement 与预测 latent 不能简单使用完全相同的图语义，稳定的 measurement–prediction coupling 仍是后续需要解决的问题。
+
+### Next Direction
+
+下一阶段不继续 Oracle graph ablation。Experiment 4 将首先脱离 trajectory/runtime，验证 `V-JEPA current-frame state → lightweight task adapter → DPVO FMap-like task latent` 能否逼近 Oracle task representation；本轮不实现 Experiment 4。
