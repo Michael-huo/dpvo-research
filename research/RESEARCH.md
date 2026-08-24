@@ -304,6 +304,47 @@ Experiment 3 provides PARTIAL / CONDITIONAL upper-bound evidence that perfect ta
 
 Experiment 3 证明完美 DPVO task latent 在严重图像稀疏条件下具有显著的精度恢复潜力，但该收益依赖序列、稀疏程度和 latent graph integration。真实 measurement 与预测 latent 不能简单使用完全相同的图语义，稳定的 measurement–prediction coupling 仍是后续需要解决的问题。
 
-### Next Direction
+## Experiment 4: JEPA-DPVO Representation Bridge Validation
 
-下一阶段不继续 Oracle graph ablation。Experiment 4 将首先脱离 trajectory/runtime，验证 `V-JEPA current-frame state → lightweight task adapter → DPVO FMap-like task latent` 能否逼近 Oracle task representation；本轮不实现 Experiment 4。
+### Research Question
+
+验证 frozen V-JEPA representation 是否包含 DPVO feature space 所需的信息，以及二者之间是否存在可学习映射关系。
+
+### Protocol
+
+- EuRoC dataset，cam0，stride=2。
+- MH_01_easy 用于训练，MH_03_medium 用于验证，MH_05_difficult 用于测试。
+- 实验包含 Adapter mapping、Random / Mean / LowRank baseline comparison、Temporal retrieval analysis，以及 Adapter capacity scaling。
+- Bridge validation 中 Adapter 与 LowRank Linear 均训练 50 epochs；capacity scaling 中 small、medium、large Adapter 均训练 100 epochs。
+
+### Main Results
+
+Adapter：
+
+- cosine similarity: `0.22400`
+- MSE: `0.06128`
+- norm ratio: `0.99187`
+
+Baseline：
+
+- Random cosine approximately `0`
+- Mean FMap cosine: `0.08968`
+- LowRank cosine: `0.12346`
+
+Temporal retrieval：
+
+- JEPA top1 within ±1: `0.86280`
+- FMap top1 within ±1: `0.84872`
+
+Capacity scaling：
+
+- small: best validation metric `0.72772`
+- medium: `0.72988`
+- large: `0.73981`
+
+### Conclusion
+
+1. Frozen V-JEPA representation contains transferable information related to DPVO feature space.
+2. The learned Adapter significantly outperforms non-parametric and linear baselines, showing that nonlinear alignment is required.
+3. Temporal retrieval confirms that JEPA preserves motion-related temporal consistency.
+4. Increasing adapter capacity provides limited benefit, suggesting that future work should focus on task-aware integration rather than simply enlarging the mapping network.

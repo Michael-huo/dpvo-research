@@ -146,6 +146,12 @@ dist
 *.vscode/
 *.pth
 tests
+!research/src/phase1_dpvo_feasibility/exp4/tests/
+!research/src/phase1_dpvo_feasibility/exp4/tests/__init__.py
+!research/src/phase1_dpvo_feasibility/exp4/tests/test_*.py
+!research/src/phase1_dpvo_feasibility/exp4/adapter/tests/
+!research/src/phase1_dpvo_feasibility/exp4/adapter/tests/__init__.py
+!research/src/phase1_dpvo_feasibility/exp4/adapter/tests/test_*.py
 checkpoints
 runs
 cache
