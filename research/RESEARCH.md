@@ -348,3 +348,43 @@ Capacity scaling：
 2. The learned Adapter significantly outperforms non-parametric and linear baselines, showing that nonlinear alignment is required.
 3. Temporal retrieval confirms that JEPA preserves motion-related temporal consistency.
 4. Increasing adapter capacity provides limited benefit, suggesting that future work should focus on task-aware integration rather than simply enlarging the mapping network.
+
+## Phase 1 / Experiment 6
+
+Exp6已按三个独立科学问题最终收口。三个模块共享FrameIdentity、ratio schedule、FMap-only packet、evaluation与provenance实现，但不存在runner之间的执行依赖。
+
+### Decomposition — DPVO Visual-State Contract
+
+回答“hidden frame的VSLAM最少需要什么视觉状态”。最终conditions固定为Full RGB、Sparse RGB和True-FMap。True-FMap在线packet只保存`fmap`；`patch_xy`按FrameIdentity/seed确定性派生，`gmap/fmap2`由FMap派生，`imap`为zero，colors删除；pose/depth、source/target factors、update、BA与upstream culling保持正常语义。该模块不加载JEPA、bridge或predictor。
+
+```bash
+/home/hx/miniforge3/envs/dpvo/bin/python -m research.src.phase1_dpvo_feasibility.exp6.run_decomposition --sequences MH_01_easy
+```
+
+### H1 Interface — Oracle JEPA → DPVO
+
+回答“真实hidden JEPA能否经固定interface提供DPVO视觉状态”。MH01 fresh训练coordinate-correct block-5→FMap bridge；MH03/MH05只进行frozen zero-shot evaluation。conditions固定为Full RGB、Sparse RGB、True-FMap和Oracle JEPA→bridge。该实验是interface upper bound，不是deployment；canonical model artifact只有`bridge.pt`。
+
+```bash
+/home/hx/miniforge3/envs/dpvo/bin/python -m research.src.phase1_dpvo_feasibility.exp6.run_h1 --sequences MH_01_easy
+```
+
+### H2 Prediction & Efficiency — Delayed Deployment
+
+回答“uploaded sparse anchors能否预测hidden JEPA并支持VSLAM”。H2只加载canonical H1 `bridge.pt`，不会调用H1或重训bridge。strict condition的在线capability只有uploaded anchor RGB、anchor identity和hidden identity/timestamp：anchor RGB通过原生DPVO FNet/Patchifier形成anchor observation，同时提取JEPA context供predictor复用；hidden observation只能来自predicted JEPA经frozen bridge生成的FMap-only packet。A5必须真实到达并完成JEPA编码，随后才预测并按时间戳顺序提交buffered hidden observations，最后只插入一次native A5。因此它是合法delayed/bracketed deployment，但`timestamp_causal=false`，不作causal或strict-real-time声明。
+
+当前MH01 fresh结果：Full RGB ATE `0.079045 m`、Sparse RGB `0.186759 m`、Oracle JEPA `0.076517 m`、Predicted JEPA `0.707725 m`。Held-out representation test的predicted token cosine为`0.957137`。这些数字属于当前三模块产物，不与已删除的探索runner或checkpoint混用。
+
+H2 `results.json`同时保存raw/encoded transmission reduction、同步后的preprocess/encoder/predictor/bridge/DPVO latency、context wait、effective hidden delay、peak online VRAM与descriptive break-even uplink bandwidth。训练和offline Oracle/True-FMap diagnostics与strict replay有显式生命周期隔离。每条sequence还保存一张`feature_diagnostics.png`，固定seed抽样hidden frames并展示Oracle/Predicted JEPA、bridge FMap及对应cosine-error map；该图只用于offline诊断，不进入训练或DPVO online input。
+
+```bash
+/home/hx/miniforge3/envs/dpvo/bin/python -m research.src.phase1_dpvo_feasibility.exp6.run_h2 --sequences MH_01_easy
+```
+
+Canonical outputs仅位于：
+
+- `research/results/phase1-dpvo-feasibility/exp6/decomposition/`
+- `research/results/phase1-dpvo-feasibility/exp6/h1_interface/`
+- `research/results/phase1-dpvo-feasibility/exp6/h2_prediction/`
+
+`--sequences`始终表示完整输出集合，不做增量合并。当前三模块不读取任何旧Exp6 runner、predictor、bridge、results或memmap。
