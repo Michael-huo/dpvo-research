@@ -1,0 +1,64 @@
+schema_version: 1
+experiment:
+  name: phase1_h1_interface
+  seed: 1234
+  bridge_initialization_seed: 1236
+  training_sequence: MH_01_easy
+  default_sequences: [MH_01_easy]
+  supported_sequences: [MH_01_easy, MH_03_medium, MH_05_difficult]
+  bootstrap_accepted_nodes: 8
+  post_bootstrap_anchor_interval: 5
+  anchor_ratio: 0.2
+dataset:
+  dataset_type: euroc
+  root: research/assets/datasets/euroc
+  groups: [machine_hall, vicon_room1, vicon_room2]
+  camera: cam0
+  stride: 2
+  skip: 0
+  groundtruth_pattern: datasets/euroc_groundtruth/{sequence}.txt
+paths:
+  calibration: calib/euroc.txt
+  dpvo_checkpoint: research/assets/models/dpvo.pth
+  dpvo_config: config/default.yaml
+  output_root: research/results/phase1-feasibility/h1_interface
+runtime:
+  jepa_python: /home/hx/miniforge3/envs/vjepa/bin/python
+jepa:
+  repo: /home/hx/vjepa2-research
+  checkpoint: research/assets/model/vjepa2_1_vitb_dist_vitG_384.pt
+  checkpoint_sha256: 848a77c33cc9e6649ed2119c9bea1e2c569bcdab9539ff3e7c02ccc2959ddf4d
+  expected_git_commit: be4a39cf6252ee003dbe96f22176529c5c0a39c9
+  model_alias: vjepa2_1_vit_base_384
+  layer_zero_based: 5
+  target_height: 384
+  patch_size: 16
+  batch_size: 4
+  feature_dim: 768
+teacher: {fmap_channels: 128, fmap_scale: 4, artifact_dtype: float16_native}
+bridge:
+  architecture: block5_coordinate_correct_shallow_spatial_v1
+  hidden_channels: 160
+  optimizer: adamw
+  learning_rate: 1.0e-4
+  weight_decay: 1.0e-4
+  batch_size: 4
+  passes: 2
+  epochs_per_pass: 30
+  reset_optimizer_and_grad_scaler_between_passes: true
+  repeat_epoch_local_batch_order_each_pass: true
+  cosine_weight: 1.0
+  smooth_l1_weight: 0.1
+  scheduler: none
+  checkpoint_selector: second_pass_final_epoch
+  amp: true
+split:
+  method: contiguous_60_20_20_v1
+  train_fraction: 0.60
+  validation_fraction: 0.20
+  test_fraction: 0.20
+  expected_hidden_counts: {train: 876, validation: 295, test: 295}
+evaluation:
+  rpe_horizon_seconds: 1.0
+  rpe_pair_tolerance_ns: 1000000
+  groundtruth_max_association_ns: 20000000
