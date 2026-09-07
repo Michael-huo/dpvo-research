@@ -78,6 +78,22 @@ def worker(config: dict[str, Any]) -> int:
         if action == "close":
             _emit({"status": "closed"})
             return 0
+        if action == "prepare_online":
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            _emit({
+                "status": "online_ready", "request_id": request.get("request_id"),
+                "worker_cuda_synchronized": True, "worker_peak_memory_reset": True,
+            })
+            continue
+        if action == "flush_online":
+            torch.cuda.synchronize()
+            _emit({
+                "status": "online_flushed", "request_id": request.get("request_id"),
+                "worker_cuda_synchronized": True,
+                "peak_gpu_memory_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            })
+            continue
         if action != "extract":
             raise ValueError(f"unsupported worker action: {action}")
         source = np.load(request["input_npy"], mmap_mode="r")

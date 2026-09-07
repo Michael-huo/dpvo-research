@@ -130,6 +130,38 @@ class JepaSidecar:
         )
         return result
 
+    def prepare_online(self, request_id: str = "online") -> dict[str, Any]:
+        assert self.process.stdin is not None
+        self.process.stdin.write(json.dumps({
+            "action": "prepare_online", "request_id": request_id,
+        }) + "\n")
+        self.process.stdin.flush()
+        result = self._receive()
+        if (result.get("status") != "online_ready"
+                or result.get("request_id") != request_id
+                or not result.get("worker_cuda_synchronized")
+                or not result.get("worker_peak_memory_reset")):
+            raise RuntimeError(f"V-JEPA worker online-ready barrier failed: {result}")
+        self.provenance["peak_gpu_memory_allocated_bytes"] = 0
+        return result
+
+    def flush_online(self, request_id: str = "online") -> dict[str, Any]:
+        assert self.process.stdin is not None
+        self.process.stdin.write(json.dumps({
+            "action": "flush_online", "request_id": request_id,
+        }) + "\n")
+        self.process.stdin.flush()
+        result = self._receive()
+        if (result.get("status") != "online_flushed"
+                or result.get("request_id") != request_id
+                or not result.get("worker_cuda_synchronized")):
+            raise RuntimeError(f"V-JEPA worker online flush barrier failed: {result}")
+        self.provenance["peak_gpu_memory_allocated_bytes"] = max(
+            int(self.provenance["peak_gpu_memory_allocated_bytes"]),
+            int(result.get("peak_gpu_memory_allocated_bytes", 0)),
+        )
+        return result
+
     def __enter__(self) -> "JepaSidecar":
         return self
 
@@ -206,16 +238,31 @@ class RestrictedFeatureView:
         self.__allowed = frozenset(allowed)
         self.capability = capability
         self.contains_rgb_or_path = False
+        self.read_count = 0
+        self.read_keys: list[str] = []
 
     def get(self, identity_or_key: FrameIdentity | str) -> np.ndarray:
         key = identity_or_key.key if isinstance(identity_or_key, FrameIdentity) else identity_or_key
         if key not in self.__allowed:
             raise PermissionError(f"{self.capability} cannot access {key}")
-        return self.__store.get(key)
+        value = self.__store.get(key)
+        self.read_count += 1
+        self.read_keys.append(key)
+        return value
 
     @property
     def allowed_identity_sha256(self) -> str:
         return canonical_sha256(sorted(self.__allowed))
+
+    def usage_payload(self) -> dict[str, Any]:
+        return {
+            "capability": self.capability,
+            "allowed_identity_count": len(self.__allowed),
+            "allowed_identity_sha256": self.allowed_identity_sha256,
+            "read_count": self.read_count,
+            "read_identity_sha256": canonical_sha256(self.read_keys),
+            "store_closed": self.__store.closed,
+        }
 
 
 def extract_block5_store(

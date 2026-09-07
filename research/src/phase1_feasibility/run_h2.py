@@ -7,6 +7,7 @@ import copy
 import io
 import json
 import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
@@ -24,7 +25,7 @@ from .evaluation import (dense_hidden_ate, evaluate_paired_trajectory,
                          population_coverage)
 from .h2_deployment import DelayedDeploymentProvider
 from .jepa_fmap import build_bridge, coordinate_masks, tokens_to_field
-from .jepa_runtime import (CompactFeatureStore, extract_block5_store,
+from .jepa_runtime import (CompactFeatureStore, RestrictedFeatureView, extract_block5_store,
                            extract_true_fmap_store, load_dpvo_domain,
                            sequence_geometry)
 from .oracle_packet import FMapZeroContextPacket
@@ -33,12 +34,13 @@ from .predictor import (AnchorInterval, RobustTransportBlock5Predictor,
                         predictor_metadata, predictor_state_sha256,
                         split_anchor_intervals)
 from .profiling import (OnlineProfiler, break_even_payload,
+                        graph_workload_payload, matched_wall_clock_payload,
                         transmission_payload)
 from .protocol import (REPO_ROOT, SUPPORTED_SEQUENCES, atomic_write_bytes,
                        canonical_sha256, load_sequence_records,
                        post_bootstrap_ratio_roles, ratio_schedule_payload,
                        repo_path, sha256_file)
-from .h2_training import (_field, _plot_feature_diagnostics,
+from .h2_training import (_field, _hidden_identities, _plot_feature_diagnostics,
                           build_robust_correspondence_store,
                           calibrate_train_only_thresholds, held_out_representation,
                           tiny_overfit, train_predictor)
@@ -46,7 +48,7 @@ from .transport import robust_protocol_metadata
 from .runtime import (OnlineFrame, PacketObservation, materialize_schedule,
                       run_deployment_observations, run_formal_mode,
                       run_packet_observations,
-                      sanitize_full_oracle_frames)
+                      sanitize_full_oracle_frames, warmup_dpvo_frontend)
 from .schema import VISUAL_STATE_CONTRACT_SHA256, condition_metadata
 from .registry import (
     base_lineage, complete_lineage, empty_index, publish_current_canonical,
@@ -85,6 +87,19 @@ def load_config(path: str | Path = DEFAULT_CONFIG) -> tuple[dict[str, Any], Path
     if config["split"].get("expected_counts") != expected:
         raise ValueError("frozen H2 219/72/73 split changed")
     return config, resolved
+
+
+def _repository_provenance() -> dict[str, Any]:
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=REPO_ROOT, check=True,
+            capture_output=True, text=True,
+        ).stdout.strip()
+    return {
+        "head_commit": git("rev-parse", "HEAD"),
+        "worktree_dirty": bool(git("status", "--short")),
+        "source_hash_is_authoritative_when_dirty": True,
+    }
 
 
 def _unique_identities(intervals: Sequence[AnchorInterval]) -> tuple[Any, ...]:
@@ -309,6 +324,9 @@ def _compact_runtime(row: Mapping[str, Any]) -> dict[str, Any]:
         "candidate_consumed_exactly_once", "candidate_identity_order_sha256",
         "finite_trajectory", "tracking_success", "trajectory_pose_count",
         "timestamp_contract_exact", "elapsed_seconds", "peak_gpu_vram_bytes",
+        "final_active_factor_count", "dpvo_graph_runtime_total_ms",
+        "dpvo_graph_runtime_mean_ms_per_processed_observation",
+        "cross_process_timing_barrier",
         "representation",
     )
     return {key: row.get(key) for key in keys}
@@ -371,12 +389,17 @@ def _run_strict_replay(
         transport_calibration=thresholds, profiler=profiler, predict_hidden=True,
     )
     temporary.mkdir(parents=True, exist_ok=False)
-    runtime, arrays = run_deployment_observations(
-        provider.observations(), calibration, config,
-        image_height=height, image_width=width,
-        condition_name="predicted_jepa_hidden", expected_roles=roles,
-        profiler=profiler, on_tracked=provider.on_tracked,
+    warmup = warmup_dpvo_frontend(
+        records[0], calibration, config, packet_runtime=True,
     )
+    with provider.online_session():
+        runtime, arrays = run_deployment_observations(
+            provider.observations(), calibration, config,
+            image_height=height, image_width=width,
+            condition_name="predicted_jepa_hidden", expected_roles=roles,
+            profiler=profiler, worker_barrier=provider,
+            on_tracked=provider.on_tracked,
+        )
     usage = provider.usage_payload()
     runtime["provider_usage"] = usage
     if not usage["anchor_encoded_exactly_once"]:
@@ -396,6 +419,10 @@ def _run_strict_replay(
         online_profile["peak_online_vram_main_process_bytes"]
         + online_profile["peak_online_vram_jepa_worker_bytes"]
     )
+    online_profile["warmup"] = warmup | {
+        "additional_h2_components": ["v_jepa_encoder", "predictor", "frozen_h1_bridge"],
+        "worker_online_stats_reset_after_warmup": True,
+    }
     return runtime, arrays, online_profile
 
 
@@ -419,13 +446,21 @@ def _run_sequence(
     all_online = [OnlineFrame(row.identity, row.rgb_path) for row in records]
     packet_online = sanitize_full_oracle_frames(records, roles)
     all_anchor = {row.identity.key: "anchor" for row in records}
+    full_warmup = warmup_dpvo_frontend(
+        records[0], calibration, config, packet_runtime=False,
+    )
     full_runtime, full_arrays = run_formal_mode(
         "matched_full_rgb", all_online, calibration, config, roles=all_anchor,
         condition_name="full_rgb_reference",
+        matched_timing=True, profile_graph_runtime=True, collect_graph_trace=False,
+    )
+    sparse_warmup = warmup_dpvo_frontend(
+        records[0], calibration, config, packet_runtime=False,
     )
     sparse_runtime, sparse_arrays = run_formal_mode(
         "sparse_rgb", packet_online, calibration, config, roles=roles,
         condition_name="sparse_rgb_reference",
+        matched_timing=True, profile_graph_runtime=True, collect_graph_trace=False,
     )
     reference_temp = temporary / "offline_reference"
     reference_temp.mkdir()
@@ -502,16 +537,51 @@ def _run_sequence(
         },
     )
     transmission = transmission_payload(records, dict(roles))
-    full_compute_ms = float(full_runtime["elapsed_seconds"]) * 1000.0
+    matched_wall = matched_wall_clock_payload(
+        full_rgb_seconds=float(full_runtime["elapsed_seconds"]),
+        h2_seconds=float(predicted_runtime["elapsed_seconds"]),
+        sparse_rgb_seconds=float(sparse_runtime["elapsed_seconds"]),
+    )
+    graph_workload = {
+        "full_rgb": graph_workload_payload(full_runtime),
+        "h2": graph_workload_payload(predicted_runtime),
+        "sparse_rgb": graph_workload_payload(sparse_runtime),
+    }
     efficiency = {
         "transmission": transmission,
-        "online_cloud": online_profile,
-        "full_rgb_reference_cloud_compute_ms": full_compute_ms,
+        "timing_protocol": {
+            "schema": "matched_online_wall_clock_cross_process_v1",
+            "sequence": sequence,
+            "effective_candidate_count": len(records),
+            "effective_candidate_identity_sha256": canonical_sha256(
+                [identity.key for identity in identities]
+            ),
+            "measurement_order": ["h2", "full_rgb", "sparse_rgb"],
+            "timer": "time_perf_counter_with_cuda_synchronize_boundaries",
+            "start": "after_model_load_component_warmup_worker_online_ready_and_main_cuda_sync",
+            "stop": "after_dpvo_terminate_worker_flush_ack_and_main_cuda_sync",
+            "included": ["online_decode_preprocess", "online_ipc", "online_inference",
+                         "dpvo_frontend", "dpvo_graph_runtime", "worker_flush_ack"],
+            "excluded": ["training", "model_load", "checkpoint_load", "warmup",
+                         "offline_oracle_extraction", "offline_teacher_extraction",
+                         "diagnostics", "artifact_serialization"],
+            "warmup": {"h2": online_profile["warmup"],
+                       "full_rgb": full_warmup, "sparse_rgb": sparse_warmup},
+            "cross_process_barrier": predicted_runtime["cross_process_timing_barrier"],
+            "stateful_dpvo_graph_warmup": False,
+            "timed_dpvo_instances_start_fresh": True,
+        },
+        "matched_online_wall_clock": matched_wall,
+        "h2_stage_profile": online_profile,
+        "graph_workload": graph_workload,
         "break_even_uplink_bandwidth": break_even_payload(
             encoded_full_bytes=transmission["encoded_full_bytes"],
             encoded_anchor_bytes=transmission["encoded_anchor_bytes"],
-            h2_cloud_compute_ms=online_profile["cloud_compute_ms"],
-            full_rgb_cloud_compute_ms=full_compute_ms,
+            extra_cloud_compute_s=matched_wall["extra_cloud_compute_s"],
+        ),
+        "interpretation_guard": (
+            "wall_time_must_be_interpreted_with_trajectory_quality_and_graph_workload;"
+            "a_shorter_h2_runtime_is_not_automatically_a_compute_efficiency_improvement"
         ),
     }
     all_store.close(); true_store.close(); shutil.rmtree(reference_temp)
@@ -597,10 +667,27 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             dev_store, training["split"], training["transform"], mask,
             config, robust_dev,
         )
+        lineage = dict(training["lineage"])
+        lineage["train_only_calibration_sha256"] = thresholds["calibration_sha256"]
+        lineage["training_lineage_sha256"] = canonical_sha256(lineage)
+        checkpoint = _save_predictor(
+            checkpoint_path, predictor, config, thresholds, lineage,
+        )
+        _validate_fresh_predictor(checkpoint_path, config, lineage)
+        dev_store.close()
         test_temp = temporary / "predictor_test"
         test_store, test_extraction = extract_block5_store(
             training_records, _unique_identities(training["split"]["test"]),
             calibration, config, test_temp, training["transform"],
+        )
+        test_teacher_store, test_teacher_extraction = extract_true_fmap_store(
+            training_records, _hidden_identities(training["split"]["test"]),
+            calibration, config, test_temp / "test_teacher", training["transform"],
+        )
+        test_teacher = RestrictedFeatureView(
+            test_teacher_store,
+            {item.key for item in _hidden_identities(training["split"]["test"])},
+            "h2_test_true_fmap_teacher",
         )
         robust_test, robust_test_meta = build_robust_correspondence_store(
             training["split"]["test"], test_store, training["transform"],
@@ -608,17 +695,13 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         )
         held_out = held_out_representation(
             training["split"]["test"], test_store, training["transform"],
-            mask, robust_test, predictor, bridge,
+            mask, robust_test, predictor, bridge, test_teacher,
         )
-        lineage = dict(training["lineage"])
-        lineage["train_only_calibration_sha256"] = thresholds["calibration_sha256"]
-        lineage["training_lineage_sha256"] = canonical_sha256(lineage)
-        checkpoint = _save_predictor(
-            checkpoint_path, predictor, config, thresholds, lineage,
-        )
-        dev_store.close()
-        test_store.close()
-        _validate_fresh_predictor(checkpoint_path, config, lineage)
+        test_teacher_usage = test_teacher.usage_payload()
+        test_teacher_store.close(); test_store.close()
+        stores_closed = all(store.closed for store in (dev_store, test_store, test_teacher_store))
+        if not stores_closed:
+            raise RuntimeError("all H2 training/reference stores must close before deployment")
         training_record = {
             "sequence": TRAINING_SEQUENCE, "lineage": lineage,
             "schedule": training["schedule"], "split": training["split_payload"],
@@ -629,10 +712,22 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             "held_out_representation": held_out,
             "development_extraction": dev_extraction,
             "test_extraction": test_extraction,
+            "offline_true_fmap_diagnostics": {
+                "held_out_test": {
+                    "extraction": test_teacher_extraction,
+                    "usage": test_teacher_usage | {"store_closed": True},
+                    "created_after_checkpoint_selection": True,
+                    "created_after_checkpoint_freeze_save_and_validation": True,
+                },
+                "test_was_read_during_training_or_selection": False,
+            },
             "development_correspondence": robust_dev_meta,
             "test_correspondence": robust_test_meta,
-            "stores_closed_before_deployment": True,
+            "stores_closed_before_deployment": stores_closed,
         }
+        del test_teacher
+        del test_teacher_store
+        del dev_store, test_store
         predictor_sha256 = sha256_file(checkpoint_path)
         records_by_sequence: dict[str, Sequence[Any]] = {TRAINING_SEQUENCE: training_records}
         for sequence in requested:
@@ -649,6 +744,13 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 "config_file": str(config_path.relative_to(REPO_ROOT)),
                 "config_file_sha256": sha256_file(config_path),
                 "h1_results_json_reads": 0,
+                "repository": _repository_provenance(),
+                "checkpoint_lineage": {
+                    "h1_bridge_sha256": bridge_meta["file_sha256"],
+                    "h2_predictor_sha256": predictor_sha256,
+                    "dpvo_checkpoint_sha256": provenance["config_protocol"]["dpvo_checkpoint_sha256"],
+                    "vjepa_checkpoint_sha256": config["jepa"]["checkpoint_sha256"],
+                },
             }
             if sequence == TRAINING_SEQUENCE:
                 bootstrap_end = training["lineage"]["bootstrap_end_candidate_index"]

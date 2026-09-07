@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+import contextlib
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -175,9 +176,48 @@ class DelayedDeploymentProvider:
         self._sidecar.extract(source, destination, "warmup")
         tokens = torch.from_numpy(np.asarray(np.load(destination), dtype=np.float32)).cuda()
         with torch.no_grad():
-            self.bridge(tokens)
+            field = tokens_to_field(tokens, self.transform)
+            batch = len(self.intervals[0].hidden) if self.intervals else 1
+            transport = field.repeat(batch, 1, 1, 1)
+            reliability = torch.ones(
+                batch, 1, field.shape[-2], field.shape[-1], device="cuda",
+            )
+            alpha = torch.full((batch,), .5, device="cuda")
+            delta = torch.full((batch,), .5, device="cuda")
+            predicted = self.predictor(
+                transport, torch.zeros_like(transport), reliability,
+                reliability, reliability, alpha, delta,
+            )
+            self.bridge(predicted.flatten(2).transpose(1, 2))
         torch.cuda.synchronize()
         source.unlink(); destination.unlink()
+
+    @contextlib.contextmanager
+    def online_session(self) -> Iterator["DelayedDeploymentProvider"]:
+        if self._sidecar is not None:
+            raise RuntimeError("deployment sidecar session is already active")
+        first_anchor = next(item for item in self.identities if item.key in self.anchor_paths)
+        with JepaSidecar(self.config, self.temporary) as sidecar:
+            self._sidecar = sidecar
+            self._warmup(first_anchor)
+            try:
+                yield self
+            finally:
+                self._sidecar = None
+
+    def prepare_online(self) -> dict[str, Any]:
+        if self._sidecar is None:
+            raise RuntimeError("deployment sidecar is not active")
+        return self._sidecar.prepare_online("h2_matched_online")
+
+    def flush_online(self) -> dict[str, Any]:
+        if self._sidecar is None:
+            raise RuntimeError("deployment sidecar is not active")
+        result = self._sidecar.flush_online("h2_matched_online")
+        self.jepa_peak_online_vram_bytes = int(
+            self._sidecar.provenance["peak_gpu_memory_allocated_bytes"]
+        )
+        return result
 
     def _record_yield(self, identity: Any) -> None:
         if identity.key in self.yielded_candidate_keys:
@@ -185,54 +225,47 @@ class DelayedDeploymentProvider:
         self.yielded_candidate_keys.append(identity.key)
 
     def observations(self) -> Iterator[AnchorRGBObservation | PacketObservation]:
-        first_anchor = next(item for item in self.identities if item.key in self.anchor_paths)
-        with JepaSidecar(self.config, self.temporary) as sidecar:
-            self._sidecar = sidecar
-            self._warmup(first_anchor)
-            torch.cuda.empty_cache(); torch.cuda.reset_peak_memory_stats()
-            for identity in self.identities:
-                if identity.key not in self.anchor_paths:
-                    continue
-                interval = self._closing.get(identity.key)
-                interval_compute_started = self.profiler.cloud_compute_ms
-                jepa_input, dpvo_image, intrinsics = self._preprocess(identity)
-                right = self._encode_preprocessed(
-                    identity, str(identity.candidate_index), jepa_input,
-                )
-                self.available_anchor_keys.add(identity.key)
-                if interval is not None and self.predict_hidden:
-                    predicted = self._predict_interval(interval, right)
-                    predicted_packets = self._bridge_packet(predicted)
-                    for offset, query in enumerate(interval.hidden):
-                        key = query.identity.key
-                        self.interval_start_compute_ms[key] = interval_compute_started
-                        wait = (interval.anchor1.timestamp_ns - query.identity.timestamp_ns) / 1e6
-                        self.hidden_context_wait[key] = wait
-                        self.profiler.context_wait_ms.append(wait)
-                        self.consumed_hidden_keys.append(key)
-                        self._record_yield(query.identity)
-                        yield PacketObservation(
-                            query.identity,
-                            FMapZeroContextPacket(predicted_packets.fmap[offset:offset + 1]),
-                            "hidden", interval.anchor1.timestamp_ns,
-                        )
-                self._record_yield(identity)
-                yield AnchorRGBObservation(
-                    identity, dpvo_image, intrinsics, identity.timestamp_ns,
-                )
-                self._last_anchor_key = identity.key
-                self._last_anchor_field = right.detach().half().cpu()
-            self.jepa_peak_online_vram_bytes = int(
-                sidecar.provenance["peak_gpu_memory_allocated_bytes"]
+        if self._sidecar is None:
+            raise RuntimeError("observations require an active online sidecar session")
+        for identity in self.identities:
+            if identity.key not in self.anchor_paths:
+                continue
+            interval = self._closing.get(identity.key)
+            interval_compute_started = self.profiler.profiled_stage_subtotal_ms
+            jepa_input, dpvo_image, intrinsics = self._preprocess(identity)
+            right = self._encode_preprocessed(
+                identity, str(identity.candidate_index), jepa_input,
             )
-            self._sidecar = None
+            self.available_anchor_keys.add(identity.key)
+            if interval is not None and self.predict_hidden:
+                predicted = self._predict_interval(interval, right)
+                predicted_packets = self._bridge_packet(predicted)
+                for offset, query in enumerate(interval.hidden):
+                    key = query.identity.key
+                    self.interval_start_compute_ms[key] = interval_compute_started
+                    wait = (interval.anchor1.timestamp_ns - query.identity.timestamp_ns) / 1e6
+                    self.hidden_context_wait[key] = wait
+                    self.profiler.context_wait_ms.append(wait)
+                    self.consumed_hidden_keys.append(key)
+                    self._record_yield(query.identity)
+                    yield PacketObservation(
+                        query.identity,
+                        FMapZeroContextPacket(predicted_packets.fmap[offset:offset + 1]),
+                        "hidden", interval.anchor1.timestamp_ns,
+                    )
+            self._record_yield(identity)
+            yield AnchorRGBObservation(
+                identity, dpvo_image, intrinsics, identity.timestamp_ns,
+            )
+            self._last_anchor_key = identity.key
+            self._last_anchor_field = right.detach().half().cpu()
 
     def on_tracked(self, observation: Any, _dpvo_ms: float) -> None:
         if not isinstance(observation, PacketObservation) or observation.kind != "hidden":
             return
         key = observation.identity.key
         online_after_closing = (
-            self.profiler.cloud_compute_ms - self.interval_start_compute_ms[key]
+            self.profiler.profiled_stage_subtotal_ms - self.interval_start_compute_ms[key]
         )
         self.profiler.effective_hidden_delay_ms.append(
             self.hidden_context_wait[key] + online_after_closing,

@@ -126,6 +126,18 @@ def _predict(model: torch.nn.Module, transported: TransportResult, alpha: torch.
                  transported.warp1.coverage, transported.fused_confidence, alpha, delta)
 
 
+def _hidden_identities(intervals: Sequence[AnchorInterval]) -> tuple[FrameIdentity, ...]:
+    return tuple(query.identity for interval in intervals for query in interval.hidden)
+
+
+def _diagnostic_teacher_batch(intervals: Sequence[AnchorInterval], store: Any,
+                              device: torch.device) -> torch.Tensor:
+    return torch.stack([
+        torch.from_numpy(store.get(query.identity)).to(device=device, dtype=torch.float32)
+        for interval in intervals for query in interval.hidden
+    ])
+
+
 def tiny_overfit(store: CompactFeatureStore, intervals: Sequence[AnchorInterval], transform: Any,
                  mask: torch.Tensor, config: Mapping[str, Any], robust: RobustCorrespondenceStore) -> dict[str, Any]:
     _seed_everything(int(config["experiment"]["seed"])); selected = tuple(intervals[:8])
@@ -204,19 +216,21 @@ class MetricAccumulator:
 @torch.no_grad()
 def held_out_representation(split_test: Sequence[AnchorInterval], store: CompactFeatureStore,
                             transform: Any, mask: torch.Tensor, robust: RobustCorrespondenceStore,
-                            predictor: torch.nn.Module, bridge: torch.nn.Module) -> dict[str, Any]:
+                            predictor: torch.nn.Module, bridge: torch.nn.Module,
+                            true_teacher: Any) -> dict[str, Any]:
     names = ("robust_transport", "predicted_jepa", "oracle_jepa"); token = {name: MetricAccumulator() for name in names}; fmap = {name: MetricAccumulator() for name in names}; gmap = {name: 0. for name in names}; count = 0
     fmap_mask = torch.from_numpy(coordinate_masks(transform)["fmap_valid_mask"]).cuda()
     for batch in _batches(split_test, 2):
         transported, target, alpha, delta = _transport_batch(batch, store, transform, mask, robust)
         fields = {names[0]: transported.field, names[1]: _predict(predictor, transported, alpha, delta), names[2]: target}
         for name, value in fields.items(): token[name].add(value, target, mask)
-        fmaps = {name: bridge(value.flatten(2).transpose(1,2)) for name,value in fields.items()}; oracle = fmaps[names[2]]
-        for name,value in fmaps.items(): fmap[name].add(value, oracle, fmap_mask)
+        fmaps = {name: bridge(value.flatten(2).transpose(1,2)) for name,value in fields.items()}
         queries = [query for interval in batch for query in interval.hidden]
+        teacher = _diagnostic_teacher_batch(batch, true_teacher, mask.device)
+        for name,value in fmaps.items(): fmap[name].add(value, teacher, fmap_mask)
         for row, query in enumerate(queries):
-            oracle_state,_ = _derive_frontend_state(
-                FMapZeroContextPacket(oracle[row:row+1,None]), query.identity, 1234,
+            teacher_state,_ = _derive_frontend_state(
+                FMapZeroContextPacket(teacher[row:row+1,None]), query.identity, 1234,
                 patches_per_image=96, patch_size=3, context_dim=384,
             )
             for name,value in fmaps.items():
@@ -224,12 +238,18 @@ def held_out_representation(split_test: Sequence[AnchorInterval], store: Compact
                     FMapZeroContextPacket(value[row:row+1,None]), query.identity, 1234,
                     patches_per_image=96, patch_size=3, context_dim=384,
                 )
-                gmap[name] += float(F.cosine_similarity(state.gmap.float().flatten(2), oracle_state.gmap.float().flatten(2), dim=2).mean())
+                gmap[name] += float(F.cosine_similarity(
+                    state.gmap.float().flatten(2), teacher_state.gmap.float().flatten(2), dim=2,
+                ).mean())
             count += 1
     return {"evaluation_role": "held_out_mh01_representation_test",
             "trajectory_generalization_claim": False,
             "gate1_block5": {name: row.payload() for name,row in token.items()},
-            "gate2_frozen_exp6_2": {name: row.payload() | {"derived_gmap_cosine": gmap[name]/count} for name,row in fmap.items()}}
+            "fmap_target": "offline_true_fmap_teacher",
+            "gate2_frozen_h1_bridge_vs_true_fmap": {
+                name: row.payload() | {"derived_gmap_cosine": gmap[name]/count}
+                for name,row in fmap.items()
+            }}
 
 
 def _shared_pca_rgb(fields: Sequence[np.ndarray], valid_mask: np.ndarray
@@ -346,5 +366,3 @@ def _plot_feature_diagnostics(path: Path, sequence: str, intervals: Sequence[Anc
         "oracle_hidden_rgb_usage":"offline_reference_extraction_only",
         "hidden_online_rgb_violation_count":0}
     return payload
-
-

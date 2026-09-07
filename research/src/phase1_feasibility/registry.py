@@ -252,25 +252,38 @@ def _result_summary_lines(module: str, result: Mapping[str, Any]) -> list[str]:
         )
     if module == "h2_prediction":
         predicted = conditions["predicted_jepa_hidden"]
-        runtime = predicted["runtime"]
         if not predicted["strict_deployment"] or predicted["timestamp_causal"] is not False:
             raise ValueError("H2 summary requires strict non-causal deployment results")
         if predicted["closing_anchor_online_available"] is not True:
             raise ValueError("H2 summary requires bracketed closing-anchor availability")
-        deployment_mode = (
-            "delayed/bracketed"
-            if predicted["strict_deployment"] and predicted["closing_anchor_online_available"]
-            else "unsupported"
-        )
-        causality = "non-causal" if predicted["timestamp_causal"] is False else "causal"
+        efficiency = result["efficiency"]
+        transmission = efficiency["transmission"]
+        wall = efficiency["matched_online_wall_clock"]
+        stages = efficiency["h2_stage_profile"]["stages"]
+        context = efficiency["h2_stage_profile"]["context_wait_ms"]
+        break_even = efficiency["break_even_uplink_bandwidth"]
+        bandwidth = break_even["break_even_uplink_bandwidth_mbps"]
+        bandwidth_text = (f"{float(bandwidth):.3f} Mbps" if bandwidth is not None
+                          else break_even["status"])
         lines.extend((
             "",
-            f"- Anchor ratio: {_percentage(result['schedule']['actual_full_sequence_anchor_ratio'], 2)}",
-            "- Uploaded anchors / total candidates: "
-            f"{_count(runtime['rgb_uploaded_frame_count'])} / {_count(result['candidate_count'])}",
-            f"- Hidden count: {_count(result['hidden_count'])}",
-            f"- Hidden RGB violation count: {_count(runtime['hidden_online_rgb_violation_count'])}",
-            f"- Deployment mode: {deployment_mode}, {causality}",
+            "## Efficiency",
+            "",
+            "- Communication: anchor ratio "
+            f"{_percentage(transmission['anchor_ratio'], 2)}; encoded byte reduction "
+            f"{_percentage(transmission['encoded_byte_reduction'], 2)}",
+            "- Cloud compute: Full RGB "
+            f"{_fixed(wall['full_rgb_total_s'], 3)} s; H2 {_fixed(wall['h2_total_s'], 3)} s; "
+            f"H2 / Full RGB {_fixed(wall['h2_over_full_rgb_ratio'], 3)}x; "
+            f"extra {_fixed(wall['extra_cloud_compute_s'], 3)} s",
+            "- H2 stage totals: JEPA encoder "
+            f"{_fixed(stages['jepa_encoder']['total_ms'] / 1000.0, 3)} s; predictor "
+            f"{_fixed(stages['jepa_predictor']['total_ms'] / 1000.0, 3)} s; bridge "
+            f"{_fixed(stages['bridge']['total_ms'] / 1000.0, 3)} s; DPVO graph/runtime "
+            f"{_fixed(stages['dpvo_graph_runtime']['total_ms'] / 1000.0, 3)} s",
+            "- Latency: context wait mean "
+            f"{_fixed(context['mean_ms'], 2)} ms; P95 {_fixed(context['p95_ms'], 2)} ms",
+            f"- System: break-even uplink bandwidth {bandwidth_text}",
         ))
     return lines
 

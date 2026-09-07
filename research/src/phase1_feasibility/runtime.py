@@ -90,7 +90,8 @@ def sanitize_full_oracle_frames(
 
 
 @contextlib.contextmanager
-def _deterministic_patchifier(slam: Any, identity_box: dict[str, FrameIdentity], seed: int):
+def _deterministic_patchifier(slam: Any, identity_box: dict[str, FrameIdentity], seed: int,
+                              frontend_samples_ms: list[float] | None = None):
     original = slam.network.patchify.forward
 
     def forward(*args: Any, **kwargs: Any) -> Any:
@@ -98,7 +99,13 @@ def _deterministic_patchifier(slam: Any, identity_box: dict[str, FrameIdentity],
         if identity is None:
             raise AssertionError("Patchifier called without FrameIdentity")
         with frontend_rng_scope(frontend_seed(identity, seed)):
-            return original(*args, **kwargs)
+            if frontend_samples_ms is None:
+                return original(*args, **kwargs)
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record(); result = original(*args, **kwargs); end.record(); end.synchronize()
+            frontend_samples_ms.append(float(start.elapsed_time(end)))
+            return result
 
     slam.network.patchify.forward = forward
     try:
@@ -158,6 +165,29 @@ def _formal_classes() -> tuple[type[Any], type[Any]]:
     return FormalRGBDPVO, FormalPacketDPVO
 
 
+@torch.no_grad()
+def warmup_dpvo_frontend(record: Any, calibration: np.ndarray,
+                         config: Mapping[str, Any], *, packet_runtime: bool) -> dict[str, Any]:
+    """Warm only the independent frontend on a disposable DPVO instance."""
+    image, _ = _load_frame({"image_path": record.rgb_path}, calibration)
+    rgb_class, packet_class = _formal_classes()
+    cls = packet_class if packet_runtime else rgb_class
+    seed = int(config["experiment"]["seed"])
+    _seed_everything(seed)
+    slam = _make_slam(cls, _runtime_config(config), image)
+    extract_frontend_packet(slam, image, record.identity, seed)
+    torch.cuda.synchronize()
+    del slam
+    torch.cuda.empty_cache()
+    return {
+        "rule": "one_representative_forward_per_independent_online_component",
+        "instance": "throwaway_dpvo",
+        "warmed_components": ["native_dpvo_frontend"],
+        "stateful_dpvo_graph_warmed": False,
+        "timed_dpvo_starts_from_fresh_state": True,
+    }
+
+
 def _state_is_finite(slam: Any) -> bool:
     return bool(
         torch.isfinite(slam.pg.poses_[: int(slam.n)]).all().item()
@@ -214,6 +244,9 @@ def run_formal_mode(
     store: FrontendPacketStore | None = None,
     hidden_provider: Any | None = None,
     condition_name: str | None = None,
+    matched_timing: bool = False,
+    profile_graph_runtime: bool = False,
+    collect_graph_trace: bool = True,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     if mode not in FORMAL_MODES:
         raise ValueError(mode)
@@ -243,8 +276,16 @@ def run_formal_mode(
     bootstrap_end: int | None = None
     first_nonfinite: dict[str, Any] | None = None
     graph_trace: list[dict[str, Any]] = []
+    frontend_samples_ms: list[float] = []
+    graph_samples_ms: list[float] = []
+    if matched_timing:
+        torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
-    scope = _deterministic_patchifier(slam, identity_box, seed) if mode not in PACKET_MODES else contextlib.nullcontext()
+    scope = (_deterministic_patchifier(
+        slam, identity_box, seed,
+        frontend_samples_ms if profile_graph_runtime else None,
+    ) if mode not in PACKET_MODES else contextlib.nullcontext())
     with scope:
         for frame in frames:
             identity = frame.identity
@@ -258,7 +299,16 @@ def run_formal_mode(
                     raise AssertionError("RGB runtime frame lacks RGB capability")
                 identity_box["identity"] = identity
                 image, intrinsics = _load_frame({"image_path": frame.rgb_path}, calibration)
+                if profile_graph_runtime:
+                    torch.cuda.synchronize(); call_started = time.perf_counter()
+                    frontend_before = len(frontend_samples_ms)
                 slam(int(identity.timestamp_ns), image, intrinsics)
+                if profile_graph_runtime:
+                    torch.cuda.synchronize()
+                    call_ms = (time.perf_counter() - call_started) * 1000.0
+                    if len(frontend_samples_ms) != frontend_before + 1:
+                        raise RuntimeError("matched RGB frontend profiling count changed")
+                    graph_samples_ms.append(max(0.0, call_ms - frontend_samples_ms[-1]))
                 rgb_count += 1
             else:
                 if role == "hidden":
@@ -298,7 +348,8 @@ def run_formal_mode(
                     "candidate_index": int(identity.candidate_index),
                     "stage": "post_frame_pose_or_depth",
                 }
-            graph_trace.append({
+            if collect_graph_trace:
+                graph_trace.append({
                 "candidate_index": int(identity.candidate_index),
                 "node_count": int(slam.n), "patch_count": int(slam.m),
                 "active_timestamps_sha256": canonical_sha256([
@@ -320,11 +371,17 @@ def run_formal_mode(
                 ),
                 "pose_finite": bool(torch.isfinite(slam.pg.poses_[: int(slam.n)]).all().item()),
                 "depth_finite": bool(torch.isfinite(slam.pg.patches_[: int(slam.n), :, 2]).all().item()),
-            })
+                })
     final_node_count_before_terminate = int(slam.n)
     final_patch_count_before_terminate = int(slam.m)
+    final_active_factor_count_before_terminate = int(slam.pg.ii.numel())
+    if profile_graph_runtime:
+        torch.cuda.synchronize(); terminate_started = time.perf_counter()
     poses, timestamps = slam.terminate()
     torch.cuda.synchronize()
+    if profile_graph_runtime:
+        graph_samples_ms.append((time.perf_counter() - terminate_started) * 1000.0)
+    matched_elapsed = float(time.perf_counter() - started) if matched_timing else None
     pose_array = np.asarray(poses, dtype=np.float64)
     timestamp_array = np.asarray(timestamps, dtype=np.uint64)
     if first_nonfinite is None and not np.isfinite(pose_array).all():
@@ -343,6 +400,7 @@ def run_formal_mode(
         "hidden_oracle_packet_count": hidden_packet_count,
         "hidden_online_rgb_violation_count": 0,
         "factor_count_allocated": int(slam.exp6_factor_count),
+        "final_active_factor_count": final_active_factor_count_before_terminate,
         "hidden_source_factor_count": int(slam.exp6_hidden_source_factor_count),
         "hidden_target_factor_count": int(slam.exp6_hidden_target_factor_count),
         "packet_integrity_failure_count": 0,
@@ -365,7 +423,12 @@ def run_formal_mode(
             len(timestamp_array) == int(slam.counter)
             and np.array_equal(timestamp_array, np.asarray(slam.tlist, dtype=np.uint64))
         ),
-        "elapsed_seconds": float(time.perf_counter() - started),
+        "elapsed_seconds": (matched_elapsed if matched_elapsed is not None
+                            else float(time.perf_counter() - started)),
+        "dpvo_graph_runtime_total_ms": float(sum(graph_samples_ms)),
+        "dpvo_graph_runtime_mean_ms_per_processed_observation": (
+            float(sum(graph_samples_ms)) / int(slam.counter) if graph_samples_ms else None
+        ),
         "peak_gpu_vram_bytes": int(torch.cuda.max_memory_allocated()),
     }
     arrays = {"poses": pose_array, "timestamps_ns": timestamp_array}
@@ -479,6 +542,7 @@ def run_deployment_observations(
     observations: Any, calibration: np.ndarray, config: Mapping[str, Any], *,
     image_height: int, image_width: int, condition_name: str,
     expected_roles: Mapping[str, str], profiler: Any,
+    worker_barrier: Any | None = None,
     on_tracked: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
     """Run strict H2 with native RGB anchors and FMap-only hidden packets."""
@@ -497,13 +561,15 @@ def run_deployment_observations(
         calibration[:4], dtype=torch.float32, device="cuda",
     )
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
     processed_keys: list[str] = []
     processed_set: set[str] = set()
     native_frontend_keys: set[str] = set()
     hidden_timestamps: set[int] = set()
     previous_timestamp = -1
     first_nonfinite: dict[str, Any] | None = None
+    ready_ack = worker_barrier.prepare_online() if worker_barrier is not None else None
+    torch.cuda.synchronize()
+    torch.cuda.reset_peak_memory_stats()
     started = time.perf_counter()
     for observation in observations:
         if not isinstance(observation, (AnchorRGBObservation, PacketObservation)):
@@ -570,6 +636,7 @@ def run_deployment_observations(
         raise RuntimeError("native anchor frontend population is incomplete or duplicated")
     final_nodes = int(slam.n)
     final_patches = int(slam.m)
+    final_active_factors = int(slam.pg.ii.numel())
     torch.cuda.synchronize()
     terminate_started = time.perf_counter()
     poses, timestamps = slam.terminate()
@@ -578,6 +645,9 @@ def run_deployment_observations(
         "dpvo_graph_runtime",
         (time.perf_counter() - terminate_started) * 1000.0,
     )
+    flush_ack = worker_barrier.flush_online() if worker_barrier is not None else None
+    torch.cuda.synchronize()
+    elapsed_seconds = float(time.perf_counter() - started)
     pose_array = np.asarray(poses, dtype=np.float64)
     timestamp_array = np.asarray(timestamps, dtype=np.uint64)
     if first_nonfinite is None and not np.isfinite(pose_array).all():
@@ -595,6 +665,7 @@ def run_deployment_observations(
         "candidate_consumed_exactly_once": True,
         "candidate_identity_order_sha256": canonical_sha256(processed_keys),
         "factor_count_allocated": int(slam.exp6_factor_count),
+        "final_active_factor_count": final_active_factors,
         "hidden_source_factor_count": int(slam.exp6_hidden_source_factor_count),
         "hidden_target_factor_count": int(slam.exp6_hidden_target_factor_count),
         "finite_trajectory": bool(np.isfinite(pose_array).all()),
@@ -605,7 +676,19 @@ def run_deployment_observations(
             len(timestamp_array) == int(slam.counter)
             and np.array_equal(timestamp_array, np.asarray(slam.tlist, dtype=np.uint64))
         ),
-        "elapsed_seconds": float(time.perf_counter() - started),
+        "elapsed_seconds": elapsed_seconds,
+        "dpvo_graph_runtime_total_ms": float(sum(profiler.samples["dpvo_graph_runtime"])),
+        "dpvo_graph_runtime_mean_ms_per_processed_observation": (
+            float(sum(profiler.samples["dpvo_graph_runtime"])) / len(processed_keys)
+        ),
+        "cross_process_timing_barrier": {
+            "worker_present": worker_barrier is not None,
+            "online_ready_ack": ready_ack,
+            "online_flush_ack": flush_ack,
+            "main_cuda_synchronized_before_start": True,
+            "main_cuda_synchronized_after_worker_flush_before_stop": True,
+            "worker_close_outside_timer": True,
+        },
         "peak_gpu_vram_bytes": int(torch.cuda.max_memory_allocated()),
         "representation": {
             "anchor": "native_dpvo_fnet_patchifier",
