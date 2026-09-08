@@ -17,6 +17,10 @@ from .evaluation import (dense_hidden_ate, evaluate_paired_trajectory,
                          filter_groundtruth_associable_timestamps,
                          freeze_evaluation_population, plot_canonical_trajectories,
                          population_coverage)
+from .efficiency_profiling import (
+    PersistentPerformanceAudit, condition_runtime_diagnostics,
+    performance_diagnosis,
+)
 from .oracle_packet import (FMapZeroContextPacket, FrontendPacketWriter,
                             ZERO_PACKET_SCHEMA, _derive_frontend_state,
                             compare_arrays, extract_frontend_packet)
@@ -243,6 +247,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         Path(__file__).with_name("evaluation.py"),
         Path(__file__).with_name("registry.py"),
         Path(__file__).with_name("schema.py"),
+        Path(__file__).with_name("efficiency_profiling.py"),
     )
     with tempfile.TemporaryDirectory(prefix=".phase1_h0_", dir=root.parent) as name:
         staged_root = Path(name) / "h0_state"
@@ -258,7 +263,16 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 "config_file_sha256": sha256_file(config_path),
             }
             output = staged_root / "sequences" / sequence
-            result = _run_sequence(config, sequence, output)
+            with PersistentPerformanceAudit(
+                "h0_state", f"sequence:{sequence}",
+                components=("dpvo_main_process",),
+            ) as performance:
+                with performance.phase("sequence_evaluation_and_artifact_generation"):
+                    result = _run_sequence(config, sequence, output)
+            performance_payload = performance.payload()
+            performance_payload["condition_runtime"] = condition_runtime_diagnostics(result)
+            performance_payload["diagnosis"] = performance_diagnosis(performance_payload)
+            result["performance_diagnostics"] = performance_payload
             lineage = complete_lineage(base, result["schedule"]["schedule_sha256"])
             write_sequence_metadata(
                 output, "h0_state", sequence, result, lineage, provenance,
@@ -276,6 +290,11 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         "requested_sequences": list(requested),
         "fresh_sequences": list(requested),
         "run_policy": "fresh_current_canonical_replace",
+        "performance_diagnostics": {
+            "persistent": True,
+            "sequence_result_field": "result.performance_diagnostics",
+            "aggregate_summary": "SUMMARY_H0.md",
+        },
     }
 
 

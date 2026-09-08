@@ -21,6 +21,10 @@ from .evaluation import (dense_hidden_ate, evaluate_paired_trajectory,
                          filter_groundtruth_associable_timestamps,
                          freeze_evaluation_population, plot_canonical_trajectories,
                          population_coverage)
+from .efficiency_profiling import (
+    PerformanceRecorder, PersistentPerformanceAudit, add_cuda_worker_mapping,
+    condition_runtime_diagnostics, performance_diagnosis,
+)
 from .jepa_runtime import sequence_geometry, state_dict_sha256
 from .jepa_fmap import (
     build_bridge, contiguous_split,
@@ -268,6 +272,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
     evaluation_source_files = h1_training_sources() + tuple(
         Path(__file__).with_name(name) for name in (
             "runtime.py", "dpvo_backend.py", "evaluation.py", "registry.py", "canonical.py",
+            "efficiency_profiling.py",
         )
     )
     training_records, training_base, training_provenance = h1_training_context(config)
@@ -279,32 +284,57 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         checkpoint_path = staged_root / "bridge.pt"
         index = empty_index("h1_interface", requested)
 
-        bootstrap = materialize_schedule(training_records, calibration, config)
-        training = _training_details(
-            training_records, int(bootstrap["bootstrap_end_candidate_index"]),
-            calibration, config, training_base,
+        with PersistentPerformanceAudit(
+            "h1_interface", "canonical_bridge_training",
+            components=("bridge_training_main_process",),
+        ) as training_performance:
+            with training_performance.phase("schedule_and_split"):
+                bootstrap = materialize_schedule(training_records, calibration, config)
+                training = _training_details(
+                    training_records, int(bootstrap["bootstrap_end_candidate_index"]),
+                    calibration, config, training_base,
+                )
+                training_temp = temporary / "training"
+                training_temp.mkdir()
+            with training_performance.phase("offline_feature_extraction"):
+                training_store, training_extraction = extract_feature_store(
+                    training_records,
+                    set().union(*map(set, training["split_keys"].values())),
+                    calibration, config, training_temp, training["transform"],
+                )
+            with training_performance.phase("bridge_training"):
+                training_batch_performance = PerformanceRecorder(enable_cuda=True)
+                validation_batch_performance = PerformanceRecorder(enable_cuda=True)
+                model, training_summary = train_bridge(
+                    training_store, training["split_keys"], training["transform"],
+                    config, checkpoint_path, training["lineage"],
+                    profiler=training_batch_performance,
+                    validation_profiler=validation_batch_performance,
+                )
+            with training_performance.phase("held_out_representation"):
+                representation = evaluate_representation_control(
+                    model, training_store, training["split_keys"]["test"],
+                    training["transform"], config,
+                )
+            with training_performance.phase("checkpoint_validation"):
+                checked_model, _, _ = load_compatible_bridge(
+                    checkpoint_path, training["transform"],
+                    hidden_channels=int(config["bridge"]["hidden_channels"]),
+                    expected_training_input=h1_training_input(training_base),
+                    expected_training_lineage=training["lineage"],
+                )
+                del checked_model
+        training_performance_payload = training_performance.payload()
+        add_cuda_worker_mapping(
+            training_performance_payload, training_extraction["jepa"],
         )
-        training_temp = temporary / "training"
-        training_temp.mkdir()
-        training_store, training_extraction = extract_feature_store(
-            training_records, set().union(*map(set, training["split_keys"].values())),
-            calibration, config, training_temp, training["transform"],
+        training_performance_payload["training_throughput"] = {
+            "training_batches": training_batch_performance.payload(),
+            "validation_batches": validation_batch_performance.payload(),
+        }
+        training_performance_payload["diagnosis"] = performance_diagnosis(
+            training_performance_payload
         )
-        model, training_summary = train_bridge(
-            training_store, training["split_keys"], training["transform"], config,
-            checkpoint_path, training["lineage"],
-        )
-        representation = evaluate_representation_control(
-            model, training_store, training["split_keys"]["test"],
-            training["transform"], config,
-        )
-        checked_model, _, _ = load_compatible_bridge(
-            checkpoint_path, training["transform"],
-            hidden_channels=int(config["bridge"]["hidden_channels"]),
-            expected_training_input=h1_training_input(training_base),
-            expected_training_lineage=training["lineage"],
-        )
-        del checked_model
         training_record = {
             "sequence": TRAINING_SEQUENCE, "lineage": training["lineage"],
             "schedule": training["schedule"], "split": training["split"],
@@ -312,6 +342,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             "coordinate_transform": training["geometry"],
             "summary": training_summary,
             "held_out_representation": representation,
+            "performance_diagnostics": training_performance_payload,
             "provenance": training_provenance | {
                 "config_file": str(config_path.relative_to(REPO_ROOT)),
                 "config_file_sha256": sha256_file(config_path),
@@ -332,37 +363,63 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 "config_file": str(config_path.relative_to(REPO_ROOT)),
                 "config_file_sha256": sha256_file(config_path),
             }
-            if sequence == TRAINING_SEQUENCE:
-                roles, schedule, transform = (
-                    training["roles"], training["schedule"], training["transform"],
-                )
-                current_store, extraction = training_store, training_extraction
-            else:
-                bootstrap = materialize_schedule(records, calibration, config)
-                roles = post_bootstrap_ratio_roles(
-                    [row.identity for row in records],
-                    bootstrap_end_candidate_index=int(bootstrap["bootstrap_end_candidate_index"]),
-                    anchor_ratio=float(config["experiment"]["anchor_ratio"]),
-                )
-                schedule = ratio_schedule_payload(
-                    [row.identity for row in records],
-                    bootstrap_end_candidate_index=int(bootstrap["bootstrap_end_candidate_index"]),
-                    anchor_ratio=float(config["experiment"]["anchor_ratio"]),
-                )
-                transform, _ = sequence_geometry(records[0], calibration, config)
-                evaluation_temp = temporary / f"evaluation_{sequence}"
-                evaluation_temp.mkdir()
-                hidden = {row.identity.key for row in records if roles[row.identity.key] == "hidden"}
-                current_store, extraction = extract_feature_store(
-                    records, hidden, calibration, config, evaluation_temp, transform,
-                )
-            evaluation_model = build_bridge(transform, channels=160).cuda().eval()
-            evaluation_model.load_state_dict(model.state_dict(), strict=True)
-            output = staged_root / "sequences" / sequence
-            result = _run_sequence(
-                records, calibration, schedule, roles, current_store, evaluation_model,
-                config, output,
-            )
+            with PersistentPerformanceAudit(
+                "h1_interface", f"sequence:{sequence}",
+                components=("dpvo_bridge_main_process",),
+            ) as performance:
+                with performance.phase("schedule_and_feature_preparation"):
+                    if sequence == TRAINING_SEQUENCE:
+                        roles, schedule, transform = (
+                            training["roles"], training["schedule"],
+                            training["transform"],
+                        )
+                        current_store, extraction = training_store, training_extraction
+                    else:
+                        bootstrap = materialize_schedule(records, calibration, config)
+                        roles = post_bootstrap_ratio_roles(
+                            [row.identity for row in records],
+                            bootstrap_end_candidate_index=int(
+                                bootstrap["bootstrap_end_candidate_index"]
+                            ),
+                            anchor_ratio=float(config["experiment"]["anchor_ratio"]),
+                        )
+                        schedule = ratio_schedule_payload(
+                            [row.identity for row in records],
+                            bootstrap_end_candidate_index=int(
+                                bootstrap["bootstrap_end_candidate_index"]
+                            ),
+                            anchor_ratio=float(config["experiment"]["anchor_ratio"]),
+                        )
+                        transform, _ = sequence_geometry(
+                            records[0], calibration, config,
+                        )
+                        evaluation_temp = temporary / f"evaluation_{sequence}"
+                        evaluation_temp.mkdir()
+                        hidden = {
+                            row.identity.key for row in records
+                            if roles[row.identity.key] == "hidden"
+                        }
+                        current_store, extraction = extract_feature_store(
+                            records, hidden, calibration, config, evaluation_temp,
+                            transform,
+                        )
+                with performance.phase("bridge_model_setup"):
+                    evaluation_model = build_bridge(
+                        transform, channels=160,
+                    ).cuda().eval()
+                    evaluation_model.load_state_dict(model.state_dict(), strict=True)
+                    output = staged_root / "sequences" / sequence
+                with performance.phase("sequence_evaluation_and_artifact_generation"):
+                    result = _run_sequence(
+                        records, calibration, schedule, roles, current_store,
+                        evaluation_model, config, output,
+                    )
+            performance_payload = performance.payload()
+            if sequence != TRAINING_SEQUENCE:
+                add_cuda_worker_mapping(performance_payload, extraction["jepa"])
+            performance_payload["condition_runtime"] = condition_runtime_diagnostics(result)
+            performance_payload["diagnosis"] = performance_diagnosis(performance_payload)
+            result["performance_diagnostics"] = performance_payload
             result["oracle_extraction"] = extraction
             lineage = complete_lineage(base, schedule["schedule_sha256"])
             write_sequence_metadata(
@@ -393,6 +450,12 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         "fresh_sequences": list(requested),
         "checkpoint_training": "fresh",
         "run_policy": "fresh_current_canonical_replace",
+        "performance_diagnostics": {
+            "persistent": True,
+            "sequence_result_field": "result.performance_diagnostics",
+            "training_field": "canonical_checkpoint.training.performance_diagnostics",
+            "aggregate_summary": "SUMMARY_H1.md",
+        },
     }
 
 

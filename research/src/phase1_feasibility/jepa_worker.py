@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -61,6 +62,10 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
         "vjepa_git_dirty": bool(_git(repo, "status", "--short")),
         "checkpoint_sha256": _sha256(checkpoint),
         "layers_zero_based": [5],
+        "worker_pid": int(os.getpid()),
+        "logical_cuda_ordinal": 0,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cuda_device_name": torch.cuda.get_device_properties(0).name,
     }
 
 

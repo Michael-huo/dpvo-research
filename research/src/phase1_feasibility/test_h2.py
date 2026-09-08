@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
+from . import h2_deployment
 from .h2_deployment import DelayedDeploymentProvider
 from .jepa_runtime import CompactFeatureStore, JepaSidecar, RestrictedFeatureView
 from .oracle_packet import FMapZeroContextPacket
@@ -169,9 +170,8 @@ class H2ContractTest(unittest.TestCase):
         provider._encode_preprocessed = encode
         provider._bridge_packet = packet
         provider._predict_interval = predict
-        with patch(
-            "research.src.phase1_feasibility.h2_deployment.JepaSidecar",
-            FakeSidecar,
+        with patch.object(
+            h2_deployment, "JepaSidecar", FakeSidecar,
         ), patch.object(torch.cuda, "empty_cache"), patch.object(
             torch.cuda, "reset_peak_memory_stats",
         ):

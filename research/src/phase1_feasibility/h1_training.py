@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -109,22 +110,34 @@ def _batch_indices(indices: np.ndarray, size: int, seed: int) -> Iterable[np.nda
 def _evaluate_bridge(
     model: torch.nn.Module, store: FeatureStore, teacher_rows: np.ndarray,
     token_rows: np.ndarray, mask: torch.Tensor, batch_size: int,
+    profiler: Any | None = None,
 ) -> dict[str, float | int]:
     totals = {"cosine": 0.0, "smooth_l1": 0.0, "mse": 0.0}
     count = 0
     model.eval()
     for start in range(0, len(teacher_rows), batch_size):
+        if profiler is not None: profiler.begin_outer()
         target = teacher_rows[start:start + batch_size]
         source = token_rows[start:start + batch_size]
-        tokens = torch.from_numpy(np.asarray(store.block5[source], np.float32)).cuda()
-        teacher = torch.from_numpy(np.asarray(store.teacher[target], np.float32)).cuda()
-        prediction = model(tokens)
-        losses = masked_reconstruction_loss(prediction, teacher, mask)
+        scope = (contextlib.nullcontext() if profiler is None
+                 else profiler.stage("batch_data_memmap_h2d"))
+        with scope:
+            tokens = torch.from_numpy(np.asarray(store.block5[source], np.float32)).cuda()
+            teacher = torch.from_numpy(np.asarray(store.teacher[target], np.float32)).cuda()
+        scope = (contextlib.nullcontext() if profiler is None
+                 else profiler.stage("validation_forward_loss"))
+        with scope:
+            prediction = model(tokens)
+            losses = masked_reconstruction_loss(prediction, teacher, mask)
         batch = len(target)
-        totals["cosine"] += (1.0 - float(losses["cosine"])) * batch
-        totals["smooth_l1"] += float(losses["smooth_l1"]) * batch
-        totals["mse"] += float(torch.mean((prediction.float() - teacher) ** 2)) * batch
+        scope = (contextlib.nullcontext() if profiler is None
+                 else profiler.stage("synchronization_wait", cuda=False))
+        with scope:
+            totals["cosine"] += (1.0 - float(losses["cosine"])) * batch
+            totals["smooth_l1"] += float(losses["smooth_l1"]) * batch
+            totals["mse"] += float(torch.mean((prediction.float() - teacher) ** 2)) * batch
         count += batch
+        if profiler is not None: profiler.finish_outer()
     return {key: value / count for key, value in totals.items()} | {"sample_count": count}
 
 
@@ -156,6 +169,7 @@ def train_bridge(
     store: FeatureStore, split_keys: Mapping[str, Sequence[str]], transform: Any,
     config: Mapping[str, Any], checkpoint_path: Path,
     training_lineage: Mapping[str, Any] | None = None,
+    *, profiler: Any | None = None, validation_profiler: Any | None = None,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     bridge = config["bridge"]; seed = int(config["experiment"]["seed"])
     init_seed = int(config["experiment"]["bridge_initialization_seed"])
@@ -190,15 +204,33 @@ def train_bridge(
             training_total = 0.0
             model.train()
             for rows in batches:
-                tokens = torch.from_numpy(np.asarray(store.block5[rows], np.float32)).cuda()
-                teacher = torch.from_numpy(np.asarray(store.teacher[rows], np.float32)).cuda()
+                if profiler is not None: profiler.begin_outer()
+                scope = (contextlib.nullcontext() if profiler is None
+                         else profiler.stage("batch_data_memmap_h2d"))
+                with scope:
+                    tokens = torch.from_numpy(np.asarray(store.block5[rows], np.float32)).cuda()
+                    teacher = torch.from_numpy(np.asarray(store.teacher[rows], np.float32)).cuda()
                 optimizer.zero_grad(set_to_none=True)
-                with torch.cuda.amp.autocast(enabled=bool(bridge["amp"])):
-                    loss = masked_reconstruction_loss(model(tokens), teacher, mask)["total"]
-                scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
-                training_total += float(loss.detach()) * len(rows)
+                scope = (contextlib.nullcontext() if profiler is None
+                         else profiler.stage("forward_loss"))
+                with scope:
+                    with torch.cuda.amp.autocast(enabled=bool(bridge["amp"])):
+                        loss = masked_reconstruction_loss(
+                            model(tokens), teacher, mask,
+                        )["total"]
+                scope = (contextlib.nullcontext() if profiler is None
+                         else profiler.stage("backward"))
+                with scope: scaler.scale(loss).backward()
+                scope = (contextlib.nullcontext() if profiler is None
+                         else profiler.stage("optimizer_scaler"))
+                with scope: scaler.step(optimizer); scaler.update()
+                scope = (contextlib.nullcontext() if profiler is None
+                         else profiler.stage("synchronization_wait", cuda=False))
+                with scope: training_total += float(loss.detach()) * len(rows)
+                if profiler is not None: profiler.finish_outer()
             validation = _evaluate_bridge(
                 model, store, validation_rows, validation_rows, mask, batch_size,
+                profiler=validation_profiler,
             )
             value = (1.0 - float(validation["cosine"])) + 0.1 * float(validation["smooth_l1"])
             global_epoch = pass_index * epochs_per_pass + local_epoch + 1

@@ -232,6 +232,41 @@ def _count(value: Any) -> str:
     return "—" if value is None else str(int(value))
 
 
+def _performance_summary_lines(
+    performance: Mapping[str, Any] | None, *, title: str = "Performance diagnostics",
+) -> list[str]:
+    if not performance:
+        return []
+    cpu = performance.get("cpu_wall", {})
+    outer = cpu.get("outer", {})
+    utilization = performance.get("gpu_utilization", {}).get("devices", {})
+    gpu_rows = []
+    for row in sorted(utilization.values(), key=lambda value: value.get("physical_index", 999)):
+        stats = row.get("gpu_utilization_percent", {})
+        gpu_rows.append(
+            f"GPU{row.get('physical_index', '?')} mean {_fixed(stats.get('mean'), 1)}%, "
+            f"P95 {_fixed(stats.get('p95'), 1)}%"
+        )
+    lines = ["", f"## {title}", "",
+             "- Diagnostic-only; excluded from scientific metrics and decisions.",
+             f"- Scope `{performance.get('scope', 'unknown')}` CPU wall: "
+             f"{_fixed(float(outer.get('total_ms', 0.0)) / 1000.0, 3)} s."]
+    if gpu_rows:
+        lines.append("- GPU utilization: " + "; ".join(gpu_rows) + ".")
+    strict = performance.get("strict_h2_predictor")
+    if strict:
+        cpu_outer = strict.get("cpu", {}).get("outer", {}).get("total_ms")
+        cuda_outer = strict.get("cuda", {}).get("outer", {}).get("total_ms")
+        lines.append(
+            "- H2 predictor timing domains: CPU outer "
+            f"{_fixed(cpu_outer / 1000.0 if cpu_outer is not None else None, 3)} s; "
+            "CUDA-event outer "
+            f"{_fixed(cuda_outer / 1000.0 if cuda_outer is not None else None, 3)} s; "
+            "the two domains are not combined."
+        )
+    return lines
+
+
 def _result_summary_lines(module: str, result: Mapping[str, Any]) -> list[str]:
     """Render display-only values without mutating the authoritative result."""
     lines = [
@@ -285,6 +320,7 @@ def _result_summary_lines(module: str, result: Mapping[str, Any]) -> list[str]:
             f"{_fixed(context['mean_ms'], 2)} ms; P95 {_fixed(context['p95_ms'], 2)} ms",
             f"- System: break-even uplink bandwidth {bandwidth_text}",
         ))
+    lines.extend(_performance_summary_lines(result.get("performance_diagnostics")))
     return lines
 
 
@@ -320,6 +356,15 @@ def render_aggregate_summary(root: Path, module: str, index: Mapping[str, Any]) 
         lines.extend((f"### {sequence}", ""))
         lines.extend(_result_summary_lines(module, payload["result"]))
         lines.append("")
+    checkpoint = index.get("canonical_checkpoint")
+    if isinstance(checkpoint, Mapping):
+        training = checkpoint.get("training", {})
+        lines.extend(_performance_summary_lines(
+            training.get("performance_diagnostics"),
+            title="Canonical training performance diagnostics",
+        ))
+        if lines and lines[-1] != "":
+            lines.append("")
     return "\n".join(lines)
 
 

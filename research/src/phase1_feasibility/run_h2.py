@@ -23,6 +23,10 @@ from .evaluation import (dense_hidden_ate, evaluate_paired_trajectory,
                          filter_groundtruth_associable_timestamps,
                          freeze_evaluation_population, plot_canonical_trajectories,
                          population_coverage)
+from .efficiency_profiling import (
+    PerformanceRecorder, PersistentPerformanceAudit, TransferLedger,
+    add_cuda_worker_mapping, condition_runtime_diagnostics, performance_diagnosis,
+)
 from .h2_deployment import DelayedDeploymentProvider
 from .jepa_fmap import build_bridge, coordinate_masks, tokens_to_field
 from .jepa_runtime import (CompactFeatureStore, RestrictedFeatureView, extract_block5_store,
@@ -374,7 +378,9 @@ def _run_strict_replay(
     records: Sequence[Any], roles: Mapping[str, str], intervals: Sequence[AnchorInterval],
     calibration: np.ndarray, transform: Any, bridge: torch.nn.Module,
     predictor: torch.nn.Module, thresholds: Mapping[str, Any],
-    config: Mapping[str, Any], temporary: Path,
+    config: Mapping[str, Any], temporary: Path, *,
+    performance: PerformanceRecorder | None = None,
+    transfer_ledger: TransferLedger | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray], dict[str, Any]]:
     height, width = load_dpvo_domain(records[0].rgb_path, calibration)[0].shape[:2]
     anchor_paths = {
@@ -387,6 +393,7 @@ def _run_strict_replay(
         intervals=intervals, transform=transform, calibration=calibration,
         config=config, temporary=temporary, bridge=bridge, predictor=predictor,
         transport_calibration=thresholds, profiler=profiler, predict_hidden=True,
+        performance=performance, transfer_ledger=transfer_ledger,
     )
     temporary.mkdir(parents=True, exist_ok=False)
     warmup = warmup_dpvo_frontend(
@@ -423,6 +430,10 @@ def _run_strict_replay(
         "additional_h2_components": ["v_jepa_encoder", "predictor", "frozen_h1_bridge"],
         "worker_online_stats_reset_after_warmup": True,
     }
+    if performance is not None:
+        online_profile["predictor_fine_profile"] = performance.payload()
+    if transfer_ledger is not None:
+        online_profile["transfer_ipc"] = transfer_ledger.payload()
     return runtime, arrays, online_profile
 
 
@@ -438,9 +449,12 @@ def _run_sequence(
     anchor_paths = {row.identity.key: row.rgb_path for row in records
                     if roles[row.identity.key] == "anchor"}
     identities = [row.identity for row in records]
+    predictor_performance = PerformanceRecorder(enable_cuda=True)
+    transfer_ledger = TransferLedger()
     predicted_runtime, predicted_arrays, online_profile = _run_strict_replay(
         records, roles, intervals, calibration, transform, bridge, predictor,
         thresholds, config, temporary / "strict_online",
+        performance=predictor_performance, transfer_ledger=transfer_ledger,
     )
     # Only after strict deployment is complete may raw/oracle reference stores exist.
     all_online = [OnlineFrame(row.identity, row.rgb_path) for row in records]
@@ -612,7 +626,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
     training_source_files = tuple(Path(__file__).with_name(name) for name in (
         "run_h2.py", "h2_training.py", "predictor.py",
         "transport.py", "jepa_fmap.py", "jepa_runtime.py", "jepa_worker.py",
-        "oracle_packet.py", "protocol.py", "schema.py",
+        "oracle_packet.py", "protocol.py", "schema.py", "efficiency_profiling.py",
     ))
     evaluation_source_files = training_source_files + tuple(
         Path(__file__).with_name(name) for name in (
@@ -639,69 +653,106 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         checkpoint_path = staged_root / "predictor.pt"
         index = empty_index("h2_prediction", requested)
 
-        bootstrap = materialize_schedule(training_records, calibration, config)
-        training = _predictor_training_details(
-            training_records, int(bootstrap["bootstrap_end_candidate_index"]),
-            calibration, config, training_base,
+        with PersistentPerformanceAudit(
+            "h2_prediction", "canonical_predictor_training",
+            components=("predictor_bridge_training_main_process",),
+        ) as training_performance:
+            with training_performance.phase("schedule_and_split"):
+                bootstrap = materialize_schedule(training_records, calibration, config)
+                training = _predictor_training_details(
+                    training_records, int(bootstrap["bootstrap_end_candidate_index"]),
+                    calibration, config, training_base,
+                )
+                development = (
+                    *training["split"]["train"], *training["split"]["validation"],
+                )
+                training_temp = temporary / "predictor_training"
+            with training_performance.phase("development_jepa_extraction"):
+                dev_store, dev_extraction = extract_block5_store(
+                    training_records, _unique_identities(development), calibration,
+                    config, training_temp, training["transform"],
+                )
+            with training_performance.phase("train_only_threshold_calibration"):
+                mask = torch.from_numpy(
+                    coordinate_masks(training["transform"])["valid_token_mask"]
+                ).cuda()
+                thresholds = calibrate_train_only_thresholds(
+                    training["split"]["train"], dev_store,
+                    training["transform"], mask,
+                )
+            with training_performance.phase("development_correspondence_precompute"):
+                robust_dev, robust_dev_meta = build_robust_correspondence_store(
+                    development, dev_store, training["transform"], mask, thresholds,
+                )
+            with training_performance.phase("tiny_overfit"):
+                tiny = tiny_overfit(
+                    dev_store, training["split"]["train"], training["transform"],
+                    mask, config, robust_dev,
+                )
+            with training_performance.phase("predictor_training"):
+                training_batch_performance = PerformanceRecorder(enable_cuda=True)
+                validation_batch_performance = PerformanceRecorder(enable_cuda=True)
+                predictor, training_summary = train_predictor(
+                    dev_store, training["split"], training["transform"], mask,
+                    config, robust_dev, profiler=training_batch_performance,
+                    validation_profiler=validation_batch_performance,
+                )
+            with training_performance.phase("checkpoint_save_and_validation"):
+                lineage = dict(training["lineage"])
+                lineage["train_only_calibration_sha256"] = thresholds["calibration_sha256"]
+                lineage["training_lineage_sha256"] = canonical_sha256(lineage)
+                checkpoint = _save_predictor(
+                    checkpoint_path, predictor, config, thresholds, lineage,
+                )
+                _validate_fresh_predictor(checkpoint_path, config, lineage)
+                dev_store.close()
+                test_temp = temporary / "predictor_test"
+            with training_performance.phase("test_jepa_extraction"):
+                test_store, test_extraction = extract_block5_store(
+                    training_records, _unique_identities(training["split"]["test"]),
+                    calibration, config, test_temp, training["transform"],
+                )
+            with training_performance.phase("test_true_fmap_extraction"):
+                test_teacher_store, test_teacher_extraction = extract_true_fmap_store(
+                    training_records, _hidden_identities(training["split"]["test"]),
+                    calibration, config, test_temp / "test_teacher",
+                    training["transform"],
+                )
+                test_teacher = RestrictedFeatureView(
+                    test_teacher_store,
+                    {item.key for item in _hidden_identities(training["split"]["test"])},
+                    "h2_test_true_fmap_teacher",
+                )
+            with training_performance.phase("test_correspondence_precompute"):
+                robust_test, robust_test_meta = build_robust_correspondence_store(
+                    training["split"]["test"], test_store, training["transform"],
+                    mask, thresholds,
+                )
+            with training_performance.phase("held_out_representation"):
+                held_out = held_out_representation(
+                    training["split"]["test"], test_store, training["transform"],
+                    mask, robust_test, predictor, bridge, test_teacher,
+                )
+                test_teacher_usage = test_teacher.usage_payload()
+                test_teacher_store.close(); test_store.close()
+                stores_closed = all(
+                    store.closed for store in (dev_store, test_store, test_teacher_store)
+                )
+                if not stores_closed:
+                    raise RuntimeError(
+                        "all H2 training/reference stores must close before deployment"
+                    )
+        training_performance_payload = training_performance.payload()
+        add_cuda_worker_mapping(
+            training_performance_payload, dev_extraction["jepa"],
         )
-        development = (*training["split"]["train"], *training["split"]["validation"])
-        training_temp = temporary / "predictor_training"
-        dev_store, dev_extraction = extract_block5_store(
-            training_records, _unique_identities(development), calibration,
-            config, training_temp, training["transform"],
+        training_performance_payload["training_throughput"] = {
+            "training_batches": training_batch_performance.payload(),
+            "validation_batches": validation_batch_performance.payload(),
+        }
+        training_performance_payload["diagnosis"] = performance_diagnosis(
+            training_performance_payload
         )
-        mask = torch.from_numpy(
-            coordinate_masks(training["transform"])["valid_token_mask"]
-        ).cuda()
-        thresholds = calibrate_train_only_thresholds(
-            training["split"]["train"], dev_store, training["transform"], mask,
-        )
-        robust_dev, robust_dev_meta = build_robust_correspondence_store(
-            development, dev_store, training["transform"], mask, thresholds,
-        )
-        tiny = tiny_overfit(
-            dev_store, training["split"]["train"], training["transform"],
-            mask, config, robust_dev,
-        )
-        predictor, training_summary = train_predictor(
-            dev_store, training["split"], training["transform"], mask,
-            config, robust_dev,
-        )
-        lineage = dict(training["lineage"])
-        lineage["train_only_calibration_sha256"] = thresholds["calibration_sha256"]
-        lineage["training_lineage_sha256"] = canonical_sha256(lineage)
-        checkpoint = _save_predictor(
-            checkpoint_path, predictor, config, thresholds, lineage,
-        )
-        _validate_fresh_predictor(checkpoint_path, config, lineage)
-        dev_store.close()
-        test_temp = temporary / "predictor_test"
-        test_store, test_extraction = extract_block5_store(
-            training_records, _unique_identities(training["split"]["test"]),
-            calibration, config, test_temp, training["transform"],
-        )
-        test_teacher_store, test_teacher_extraction = extract_true_fmap_store(
-            training_records, _hidden_identities(training["split"]["test"]),
-            calibration, config, test_temp / "test_teacher", training["transform"],
-        )
-        test_teacher = RestrictedFeatureView(
-            test_teacher_store,
-            {item.key for item in _hidden_identities(training["split"]["test"])},
-            "h2_test_true_fmap_teacher",
-        )
-        robust_test, robust_test_meta = build_robust_correspondence_store(
-            training["split"]["test"], test_store, training["transform"],
-            mask, thresholds,
-        )
-        held_out = held_out_representation(
-            training["split"]["test"], test_store, training["transform"],
-            mask, robust_test, predictor, bridge, test_teacher,
-        )
-        test_teacher_usage = test_teacher.usage_payload()
-        test_teacher_store.close(); test_store.close()
-        stores_closed = all(store.closed for store in (dev_store, test_store, test_teacher_store))
-        if not stores_closed:
-            raise RuntimeError("all H2 training/reference stores must close before deployment")
         training_record = {
             "sequence": TRAINING_SEQUENCE, "lineage": lineage,
             "schedule": training["schedule"], "split": training["split_payload"],
@@ -724,6 +775,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             "development_correspondence": robust_dev_meta,
             "test_correspondence": robust_test_meta,
             "stores_closed_before_deployment": stores_closed,
+            "performance_diagnostics": training_performance_payload,
         }
         del test_teacher
         del test_teacher_store
@@ -769,11 +821,36 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             sequence_temp = temporary / f"sequence_work_{sequence}"
             sequence_temp.mkdir()
             output = staged_root / "sequences" / sequence
-            result = _run_sequence(
-                evaluation["records"], evaluation["roles"], evaluation["intervals"],
-                evaluation["schedule"], calibration, transform_eval, bridge_eval,
-                predictor, thresholds, config, sequence_temp, output,
-            )
+            with PersistentPerformanceAudit(
+                "h2_prediction", f"sequence:{sequence}",
+                components=("dpvo_predictor_bridge_main_process",),
+            ) as performance:
+                with performance.phase("sequence_evaluation_and_artifact_generation"):
+                    result = _run_sequence(
+                        evaluation["records"], evaluation["roles"],
+                        evaluation["intervals"], evaluation["schedule"], calibration,
+                        transform_eval, bridge_eval, predictor, thresholds, config,
+                        sequence_temp, output,
+                    )
+            performance_payload = performance.payload()
+            performance_payload["condition_runtime"] = condition_runtime_diagnostics(result)
+            worker_usage = result["conditions"]["predicted_jepa_hidden"]["runtime"][
+                "provider_usage"
+            ]
+            add_cuda_worker_mapping(performance_payload, {
+                "worker_pid": worker_usage.get("jepa_worker_pid"),
+                "logical_cuda_ordinal": worker_usage.get(
+                    "jepa_worker_logical_cuda_ordinal", 0,
+                ),
+            })
+            performance_payload["strict_h2_predictor"] = result["efficiency"][
+                "h2_stage_profile"
+            ].get("predictor_fine_profile")
+            performance_payload["strict_h2_transfer_ipc"] = result["efficiency"][
+                "h2_stage_profile"
+            ].get("transfer_ipc")
+            performance_payload["diagnosis"] = performance_diagnosis(performance_payload)
+            result["performance_diagnostics"] = performance_payload
             result["coordinate_transform"] = geometry_eval
             result["effective_population"] = evaluation["effective_population"]
             lineage = complete_lineage(base, evaluation["schedule"]["schedule_sha256"])
@@ -809,6 +886,12 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         "fresh_sequences": list(requested),
         "checkpoint_training": "fresh",
         "run_policy": "fresh_current_canonical_replace",
+        "performance_diagnostics": {
+            "persistent": True,
+            "sequence_result_field": "result.performance_diagnostics",
+            "training_field": "canonical_checkpoint.training.performance_diagnostics",
+            "aggregate_summary": "SUMMARY_H2.md",
+        },
     }
 
 

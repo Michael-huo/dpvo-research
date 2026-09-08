@@ -191,6 +191,56 @@ python -m research.src.phase1_feasibility.run_h2 \
     --sequences MH_01_easy MH_03_medium MH_05_difficult
 ```
 
+三条常规 fresh runner 会把性能诊断与 canonical 结果一起持久化：每个 sequence 的
+`results.json` 包含独立的 `result.performance_diagnostics`；H1/H2 的训练诊断同时保存在
+`INDEX.json -> canonical_checkpoint.training.performance_diagnostics`。sequence 和 aggregate
+summary 会显示简要 wall time、逐卡利用率以及 H2 predictor 的 CPU/CUDA outer totals。
+这些字段固定标记为 diagnostic-only，不进入评价指标、科学 gate、checkpoint tensor、
+模型输入或方法 lineage 决策。H2 还在常规 strict replay 中记录 predictor exclusive
+fine stages和transfer/IPC；H1/H2 training记录data/H2D、forward/loss、backward、
+optimizer/scaler及独立 synchronization wait。
+
+### H2 performance-only audit
+
+硬件利用率和瓶颈审计使用独立 runner。它只读 canonical bridge、predictor 和
+DPVO checkpoint，不执行科学评价、不保存训练状态，也不会写入
+`research/results/phase1-feasibility/`。建议先运行 CPU smoke，再由服务器操作者手动
+运行 GPU benchmark：
+
+```bash
+python -m research.src.phase1_feasibility.benchmark_h2_efficiency smoke
+
+python -m research.src.phase1_feasibility.benchmark_h2_efficiency online \
+    --intervals 4 --sample-ms 200 --output /tmp/h2-efficiency-smoke
+
+python -m research.src.phase1_feasibility.benchmark_h2_efficiency online \
+    --intervals all --sample-ms 200 --output /tmp/h2-efficiency-online-full
+
+python -m research.src.phase1_feasibility.benchmark_h2_efficiency training \
+    --one-epoch --sample-ms 200 --output /tmp/h2-efficiency-training-epoch
+```
+
+Nsight 仅用于短跑。以下命令与服务器现有 Nsight Systems 2023.1 和 Nsight
+Compute 2023.1 CLI 参数兼容，输出必须保留在非 canonical 路径：
+
+```bash
+nsys profile --trace=cuda,nvtx,osrt --sample=none \
+    --trace-fork-before-exec=true --cuda-memory-usage=true \
+    --force-overwrite=true --output=/tmp/h2-efficiency-nsys \
+    python -m research.src.phase1_feasibility.benchmark_h2_efficiency online \
+    --intervals 4 --output /tmp/h2-efficiency-nsys-run
+
+ncu --set full --target-processes all --nvtx \
+    --nvtx-include "h2_efficiency::neural_residual_predictor_forward" \
+    --force-overwrite --export /tmp/h2-efficiency-ncu \
+    python -m research.src.phase1_feasibility.benchmark_h2_efficiency online \
+    --intervals 1 --output /tmp/h2-efficiency-ncu-run
+```
+
+报告中的 `compute-only pipeline` 对齐现有尽快 replay；`sensor-paced pipeline`
+只额外加入真实 frame/anchor availability cadence。后者不包含 RGB 编码、网络队列、
+上行传输或网络抖动，不能解释为完整 edge-cloud latency。
+
 ## Artifact 与执行策略
 
 Canonical outputs 位于 `research/results/phase1-feasibility/{h0_state,h1_interface,h2_prediction}/`。现阶段采用 fresh current-canonical replace：H0 每次 fresh 执行 requested sequences；H1 每次 fresh 训练 bridge 并 fresh 评估；H2 验证当前 H1 bridge 后 fresh 训练 predictor 并 fresh 评估。

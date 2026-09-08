@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import contextlib
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -98,19 +99,25 @@ def _batches(values: Sequence[AnchorInterval], size: int, seed: int | None = Non
 
 
 def _transport_batch(intervals: Sequence[AnchorInterval], store: Any, transform: Any,
-                     mask: torch.Tensor, robust: RobustCorrespondenceStore
+                     mask: torch.Tensor, robust: RobustCorrespondenceStore, *,
+                     profiler: Any | None = None,
                      ) -> tuple[TransportResult, torch.Tensor, torch.Tensor, torch.Tensor]:
-    j0, j1, target, alpha, delta = [], [], [], [], []
-    for interval in intervals:
-        left = _field(store, interval.anchor0, transform, mask.device)
-        right = _field(store, interval.anchor1, transform, mask.device)
-        for query in interval.hidden:
-            j0.append(left); j1.append(right); target.append(_field(store, query.identity, transform, mask.device))
-            alpha.append(query.alpha); delta.append(query.delta_t_seconds)
-    j0t, j1t, targett = torch.stack(j0), torch.stack(j1), torch.stack(target)
-    alphat = torch.tensor(alpha, device=mask.device); deltat = torch.tensor(delta, device=mask.device)
-    correspondence = robust.batch(intervals, mask.device, repeat_queries=True)
-    return robust_transport_interpolation(j0t, j1t, alphat, correspondence, mask), targett, alphat, deltat
+    scope = (contextlib.nullcontext() if profiler is None
+             else profiler.stage("batch_data_memmap_h2d"))
+    with scope:
+        j0, j1, target, alpha, delta = [], [], [], [], []
+        for interval in intervals:
+            left = _field(store, interval.anchor0, transform, mask.device)
+            right = _field(store, interval.anchor1, transform, mask.device)
+            for query in interval.hidden:
+                j0.append(left); j1.append(right); target.append(_field(store, query.identity, transform, mask.device))
+                alpha.append(query.alpha); delta.append(query.delta_t_seconds)
+        j0t, j1t, targett = torch.stack(j0), torch.stack(j1), torch.stack(target)
+        alphat = torch.tensor(alpha, device=mask.device); deltat = torch.tensor(delta, device=mask.device)
+        correspondence = robust.batch(intervals, mask.device, repeat_queries=True)
+    return robust_transport_interpolation(
+        j0t, j1t, alphat, correspondence, mask, profiler=profiler,
+    ), targett, alphat, deltat
 
 
 def _new_predictor(config: Mapping[str, Any]) -> RobustTransportBlock5Predictor:
@@ -162,19 +169,32 @@ def tiny_overfit(store: CompactFeatureStore, intervals: Sequence[AnchorInterval]
 
 @torch.no_grad()
 def _validation(model: torch.nn.Module, intervals: Sequence[AnchorInterval], store: Any,
-                transform: Any, mask: torch.Tensor, robust: RobustCorrespondenceStore) -> dict[str, float]:
+                transform: Any, mask: torch.Tensor, robust: RobustCorrespondenceStore,
+                profiler: Any | None = None) -> dict[str, float]:
     totals = {key: 0. for key in ("total", "cosine", "mse", "smooth_l1", "norm_ratio")}; count = 0; model.eval()
     for batch in _batches(intervals, 2):
-        transported, target, alpha, delta = _transport_batch(batch, store, transform, mask, robust)
-        metrics = prediction_loss(_predict(model, transported, alpha, delta), target, mask)
-        for key in totals: totals[key] += float(metrics[key]) * len(target)
+        if profiler is not None: profiler.begin_outer()
+        transported, target, alpha, delta = _transport_batch(
+            batch, store, transform, mask, robust, profiler=profiler,
+        )
+        scope = (contextlib.nullcontext() if profiler is None
+                 else profiler.stage("validation_forward_loss"))
+        with scope:
+            metrics = prediction_loss(_predict(model, transported, alpha, delta), target, mask)
+        scope = (contextlib.nullcontext() if profiler is None
+                 else profiler.stage("synchronization_wait", cuda=False))
+        with scope:
+            for key in totals: totals[key] += float(metrics[key]) * len(target)
         count += len(target)
+        if profiler is not None: profiler.finish_outer()
     return {key: value/count for key, value in totals.items()} | {"hidden_query_count": count}
 
 
 def train_predictor(store: CompactFeatureStore, split: Mapping[str, Sequence[AnchorInterval]],
                     transform: Any, mask: torch.Tensor, config: Mapping[str, Any],
-                    robust: RobustCorrespondenceStore) -> tuple[torch.nn.Module, dict[str, Any]]:
+                    robust: RobustCorrespondenceStore, *, profiler: Any | None = None,
+                    validation_profiler: Any | None = None,
+                    ) -> tuple[torch.nn.Module, dict[str, Any]]:
     _seed_everything(1234); model = _new_predictor(config).cuda().train()
     sample, _, alpha, delta = _transport_batch(split["train"][:1], store, transform, mask, robust)
     if not torch.equal(_predict(model, sample, alpha, delta), sample.field): raise RuntimeError("zero initialization changed")
@@ -184,12 +204,33 @@ def train_predictor(store: CompactFeatureStore, split: Mapping[str, Sequence[Anc
     for epoch in range(30):
         model.train(); total = 0.; count = 0
         for batch in _batches(split["train"], 2, 1234+epoch):
-            transported, target, alpha, delta = _transport_batch(batch, store, transform, mask, robust)
+            if profiler is not None: profiler.begin_outer()
+            transported, target, alpha, delta = _transport_batch(
+                batch, store, transform, mask, robust, profiler=profiler,
+            )
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=True): loss = prediction_loss(_predict(model, transported, alpha, delta), target, mask)["total"]
-            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
-            total += float(loss.detach()) * len(target); count += len(target)
-        validation = _validation(model, split["validation"], store, transform, mask, robust)
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("forward_loss"))
+            with scope:
+                with torch.cuda.amp.autocast(enabled=True):
+                    loss = prediction_loss(
+                        _predict(model, transported, alpha, delta), target, mask,
+                    )["total"]
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("backward"))
+            with scope: scaler.scale(loss).backward()
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("optimizer_scaler"))
+            with scope: scaler.step(optimizer); scaler.update()
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("synchronization_wait", cuda=False))
+            with scope: total += float(loss.detach()) * len(target)
+            count += len(target)
+            if profiler is not None: profiler.finish_outer()
+        validation = _validation(
+            model, split["validation"], store, transform, mask, robust,
+            profiler=validation_profiler,
+        )
         history.append({"epoch": epoch+1, "train_total": total/count, "validation_total": validation["total"]})
         if validation["total"] < best_value:
             best_value, best_epoch = validation["total"], epoch+1
