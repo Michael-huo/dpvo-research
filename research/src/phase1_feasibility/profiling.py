@@ -33,6 +33,24 @@ class OnlineProfiler:
     })
     context_wait_ms: list[float] = field(default_factory=list)
     effective_hidden_delay_ms: list[float] = field(default_factory=list)
+    stage_c_cpu_ms: dict[str, list[float]] = field(default_factory=lambda: {
+        name: [] for name in (
+            "stage_c_queue_wait", "stage_c_transfer_wait", "bridge_compute",
+            "native_frontend_compute", "dpvo_graph_compute", "dpvo_sync_wait",
+            "stage_c_python_other",
+        )
+    })
+    stage_c_cuda_ms: dict[str, list[float]] = field(default_factory=lambda: {
+        name: [] for name in (
+            "stage_c_transfer_wait", "bridge_compute", "native_frontend_compute",
+            "dpvo_graph_compute", "stage_c_python_other",
+        )
+    })
+    stage_c_queue_detail_ms: dict[str, list[float]] = field(default_factory=lambda: {
+        "consume_queue_wait": [], "prediction_ready_wait": [],
+        "worker_flush_wait": [],
+    })
+    stage_c_matched_wall_ms: float | None = None
 
     def add(self, stage: str, milliseconds: float) -> None:
         if stage not in self.samples:
@@ -42,6 +60,49 @@ class OnlineProfiler:
             raise ValueError("latency must be finite and non-negative")
         self.samples[stage].append(value)
 
+    @staticmethod
+    def _validated_ms(milliseconds: float) -> float:
+        value = float(milliseconds)
+        if not np.isfinite(value) or value < 0:
+            raise ValueError("latency must be finite and non-negative")
+        return value
+
+    def add_stage_c_cpu(self, category: str, milliseconds: float, *,
+                        queue_detail: str | None = None) -> None:
+        if category not in self.stage_c_cpu_ms:
+            raise KeyError(category)
+        value = self._validated_ms(milliseconds)
+        self.stage_c_cpu_ms[category].append(value)
+        if queue_detail is not None:
+            if category != "stage_c_queue_wait" or queue_detail not in self.stage_c_queue_detail_ms:
+                raise KeyError(queue_detail)
+            self.stage_c_queue_detail_ms[queue_detail].append(value)
+
+    def add_stage_c_cuda(self, category: str, milliseconds: float) -> None:
+        if category not in self.stage_c_cuda_ms:
+            raise KeyError(category)
+        self.stage_c_cuda_ms[category].append(self._validated_ms(milliseconds))
+
+    def finalize_stage_c(self, matched_wall_ms: float) -> None:
+        if self.stage_c_matched_wall_ms is not None:
+            raise RuntimeError("Stage C timing was finalized twice")
+        total = self._validated_ms(matched_wall_ms)
+        # Explicit packet conversion/control samples already live in
+        # stage_c_python_other.  Include them before assigning the remaining
+        # uninstrumented consumer-thread wall to that same category.
+        accounted = sum(sum(values) for values in self.stage_c_cpu_ms.values())
+        # Every explicit phase runs on the Stage C consumer thread.  Small negative
+        # residuals can only be timer resolution error; larger values mean phases
+        # overlapped or escaped the matched boundary.
+        residual = total - accounted
+        if residual < -0.1:
+            raise RuntimeError(
+                f"Stage C CPU timing does not reconcile: wall={total}, "
+                f"accounted={accounted}"
+            )
+        self.stage_c_cpu_ms["stage_c_python_other"].append(max(0.0, residual))
+        self.stage_c_matched_wall_ms = total
+
     @property
     def profiled_stage_subtotal_ms(self) -> float:
         return float(sum(sum(values) for values in self.samples.values()))
@@ -49,6 +110,17 @@ class OnlineProfiler:
     def payload(self, *, peak_online_vram_bytes: int) -> dict[str, Any]:
         stages = {name: distribution_ms(values) for name, values in self.samples.items()}
         cloud = sum(float(row["total_ms"]) for row in stages.values())
+        cpu = {
+            name: distribution_ms(values)
+            for name, values in self.stage_c_cpu_ms.items()
+        }
+        cuda = {
+            name: distribution_ms(values)
+            for name, values in self.stage_c_cuda_ms.items()
+        }
+        explicit_cpu = sum(
+            float(row["total_ms"]) for row in cpu.values()
+        )
         return {
             "schema": "h2_stage_profile_v2",
             "timing_scope": "profiled_online_stage_subtotal_not_wall_clock",
@@ -65,6 +137,45 @@ class OnlineProfiler:
             "effective_hidden_delay_method": (
                 "context_wait_plus_profiled_cloud_critical_path_excluding_artifact_io"
             ),
+            "stage_c_timing": {
+                "schema": "h2_stage_c_timing_v1",
+                "cpu_wall_exclusive": cpu,
+                "cuda_event": cuda,
+                "queue_wait_breakdown": {
+                    name: distribution_ms(values)
+                    for name, values in self.stage_c_queue_detail_ms.items()
+                },
+                "matched_wall_ms": self.stage_c_matched_wall_ms,
+                "exclusive_cpu_total_ms": explicit_cpu,
+                "reconciliation_error_ms": (
+                    None if self.stage_c_matched_wall_ms is None else
+                    self.stage_c_matched_wall_ms - explicit_cpu
+                ),
+                "cpu_and_cuda_domains_must_not_be_added": True,
+                "cpu_category_definitions": {
+                    "stage_c_queue_wait": (
+                        "consumer dequeue, prediction-ready, and final worker flush waits"
+                    ),
+                    "stage_c_transfer_wait": (
+                        "CPU staging plus H2D submission and completion wait"
+                    ),
+                    "bridge_compute": "bridge call wall on the Stage C consumer",
+                    "native_frontend_compute": (
+                        "native anchor frontend call wall on the Stage C process"
+                    ),
+                    "dpvo_graph_compute": (
+                        "CPU call wall for slam.track_packet and terminate after input ready"
+                    ),
+                    "dpvo_sync_wait": "explicit CUDA synchronization wait outside graph calls",
+                    "stage_c_python_other": (
+                        "packet conversion, control logic, and reconciled residual wall"
+                    ),
+                },
+                "dpvo_graph_compute_definition": (
+                    "CUDA events around slam.track_packet and terminate only; "
+                    "packet conversion and synchronization excluded"
+                ),
+            },
             "peak_online_vram_bytes": int(peak_online_vram_bytes),
         }
 
@@ -128,6 +239,10 @@ def graph_workload_payload(runtime: Mapping[str, Any]) -> dict[str, Any]:
         "final_active_factor_count": int(runtime["final_active_factor_count"]),
         "dpvo_graph_total_ms": total,
         "dpvo_graph_mean_ms_per_processed_observation": total / processed,
+        "dpvo_graph_timing_definition": runtime.get(
+            "dpvo_graph_runtime_definition",
+            "legacy timing definition unavailable",
+        ),
     }
 
 

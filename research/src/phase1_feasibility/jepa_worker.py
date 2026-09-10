@@ -33,6 +33,14 @@ def _emit(payload: dict[str, Any]) -> None:
 def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     import torch
 
+    settings = config.get("worker_settings")
+    if settings is None:
+        raise RuntimeError("V-JEPA worker runtime settings are missing")
+    from research.src.phase1_feasibility.execution_runtime import (
+        apply_runtime, runtime_provenance,
+    )
+    apply_runtime(settings)
+
     if not torch.cuda.is_available():
         raise RuntimeError("Exp6 V-JEPA worker requires CUDA")
     expected_python = Path(config["runtime"]["jepa_python"]).resolve()
@@ -57,7 +65,7 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     device = torch.device("cuda:0")
     encoder = load_phase2_encoder(device).requires_grad_(False).eval()
     encoder.out_layers = [5]
-    return torch, encoder, {
+    provenance = {
         "vjepa_git_commit": commit,
         "vjepa_git_dirty": bool(_git(repo, "status", "--short")),
         "checkpoint_sha256": _sha256(checkpoint),
@@ -67,6 +75,11 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
         "cuda_device_name": torch.cuda.get_device_properties(0).name,
     }
+    provenance["runtime"] = runtime_provenance(
+        settings, component="v_jepa_encoder", model=encoder,
+        amp=True, autocast_dtype="bfloat16",
+    )
+    return torch, encoder, provenance
 
 
 def worker(config: dict[str, Any]) -> int:

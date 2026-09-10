@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import time
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -23,6 +24,8 @@ from .jepa_fmap import (
 from .jepa_runtime import JepaSidecar, load_dpvo_domain, load_fnet, state_dict_sha256, teacher_fmap
 from .oracle_packet import FMapZeroContextPacket, _derive_frontend_state
 from .protocol import FrameIdentity, canonical_sha256, repo_path, sha256_file
+
+from .training_runtime import h1_tensor_batch
 
 TRAINING_SEQUENCE = "MH_01_easy"
 
@@ -119,11 +122,11 @@ def _evaluate_bridge(
         if profiler is not None: profiler.begin_outer()
         target = teacher_rows[start:start + batch_size]
         source = token_rows[start:start + batch_size]
-        scope = (contextlib.nullcontext() if profiler is None
-                 else profiler.stage("batch_data_memmap_h2d"))
+        stage = "resident_batch_gather" if hasattr(store, "tensor_batch") else "batch_data_memmap_h2d"
+        scope = contextlib.nullcontext() if profiler is None else profiler.stage(stage)
         with scope:
-            tokens = torch.from_numpy(np.asarray(store.block5[source], np.float32)).cuda()
-            teacher = torch.from_numpy(np.asarray(store.teacher[target], np.float32)).cuda()
+            tokens = h1_tensor_batch(store, "block5", source)
+            teacher = h1_tensor_batch(store, "teacher", target)
         scope = (contextlib.nullcontext() if profiler is None
                  else profiler.stage("validation_forward_loss"))
         with scope:
@@ -184,6 +187,7 @@ def train_bridge(
     order_hashes: list[list[str]] = []
     best_value, best_epoch = float("inf"), 0
     epochs_per_pass = int(bridge["epochs_per_pass"])
+    started = time.perf_counter()
     for pass_index in range(int(bridge["passes"])):
         if pass_index:
             # Reproduce the successful second-stage lineage exactly: the
@@ -198,6 +202,7 @@ def train_bridge(
         scaler = torch.cuda.amp.GradScaler(enabled=bool(bridge["amp"]))
         pass_hashes = []
         for local_epoch in range(epochs_per_pass):
+            epoch_started = time.perf_counter()
             batches = list(_batch_indices(train_rows, batch_size, seed + local_epoch))
             identity_order = [store.identity_keys[row] for rows in batches for row in rows]
             pass_hashes.append(canonical_sha256(identity_order))
@@ -205,11 +210,11 @@ def train_bridge(
             model.train()
             for rows in batches:
                 if profiler is not None: profiler.begin_outer()
-                scope = (contextlib.nullcontext() if profiler is None
-                         else profiler.stage("batch_data_memmap_h2d"))
+                stage = "resident_batch_gather" if hasattr(store, "tensor_batch") else "batch_data_memmap_h2d"
+                scope = contextlib.nullcontext() if profiler is None else profiler.stage(stage)
                 with scope:
-                    tokens = torch.from_numpy(np.asarray(store.block5[rows], np.float32)).cuda()
-                    teacher = torch.from_numpy(np.asarray(store.teacher[rows], np.float32)).cuda()
+                    tokens = h1_tensor_batch(store, "block5", rows)
+                    teacher = h1_tensor_batch(store, "teacher", rows)
                 optimizer.zero_grad(set_to_none=True)
                 scope = (contextlib.nullcontext() if profiler is None
                          else profiler.stage("forward_loss"))
@@ -241,6 +246,7 @@ def train_bridge(
                 "epoch_in_pass": local_epoch + 1,
                 "training_total": training_total / len(train_rows),
                 "validation": validation, "validation_total": value,
+                "epoch_wall_seconds": time.perf_counter() - epoch_started,
             })
         order_hashes.append(pass_hashes)
         del optimizer, scaler
@@ -292,9 +298,11 @@ def train_bridge(
         "optimizer_reset_between_passes": True, "grad_scaler_reset_between_passes": True,
         "batch_order_repeated_between_passes": True,
         "batch_order_sha256_by_epoch": order_hashes[0],
+        "history": history,
         "first": history[0], "first_pass_final": history[epochs_per_pass - 1],
         "best": history[best_epoch - 1],
         "best_epoch": best_epoch, "final": history[-1],
+        "elapsed_seconds": time.perf_counter() - started,
         "checkpoint_sha256": sha256_file(checkpoint_path),
         "state_dict_sha256": state_dict_sha256(state),
     }

@@ -1,13 +1,7 @@
-"""GPU worker and minimal research-only DPVO wrappers for final Experiment 3."""
+"""DPVO construction and visual-state wrappers used by formal Phase 1 runners."""
 from __future__ import annotations
 
-import argparse
-import csv
-import json
 import random
-import time
-import traceback
-from pathlib import Path
 from typing import Any
 
 import cv2
@@ -16,29 +10,8 @@ import torch
 import torch.nn.functional as F
 
 from .oracle_packet import (
-    NativeFeaturePacket, OracleFMap, extract_native_packet, extract_oracle_fmap,
+    NativeFeaturePacket, OracleFMap,
 )
-
-
-WORKER_PROGRESS: dict[str, Any] = {}
-
-
-def _json_ready(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(key): _json_ready(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple, set)):
-        return [_json_ready(item) for item in value]
-    if isinstance(value, np.ndarray):
-        return value.tolist()
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
-
-
-def _write_json(path: str | Path, value: Any) -> None:
-    destination = Path(path)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    destination.write_text(json.dumps(_json_ready(value), indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
 def _seed_everything(seed: int) -> None:
@@ -46,26 +19,6 @@ def _seed_everything(seed: int) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
-
-
-def _records(config: dict[str, Any]) -> list[dict[str, Any]]:
-    rows: dict[int, str] = {}
-    with Path(config["paths"]["data_csv"]).open(encoding="utf-8") as handle:
-        for row in csv.reader(line for line in handle if not line.startswith("#")):
-            if row:
-                rows[int(row[0])] = row[1]
-    images = sorted(Path(config["paths"]["image_dir"]).glob("*.png"))
-    exp = config["experiment"]
-    images = images[int(exp["skip"])::int(exp["stride"])][:int(exp["processed_frames"])]
-    result = []
-    for index, image in enumerate(images):
-        timestamp = int(image.stem)
-        if rows.get(timestamp) != image.name:
-            raise ValueError(f"EuRoC filename/data.csv mismatch: {image.name}")
-        result.append({"candidate_index": index, "timestamp_ns": timestamp, "image_path": str(image)})
-    if len(result) != int(exp["processed_frames"]):
-        raise RuntimeError(f"expected {exp['processed_frames']} records, found {len(result)}")
-    return result
 
 
 def _load_frame(record: dict[str, Any], calibration: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
@@ -326,153 +279,3 @@ def _runtime_classes() -> dict[str, Any]:
 
 def _make_slam(cls: Any, config: dict[str, Any], first_image: torch.Tensor) -> Any:
     return cls(_dpvo_config(config), config["paths"]["checkpoint"], ht=int(first_image.shape[1]), wd=int(first_image.shape[2]), viz=False)
-
-
-def _new_peak_state(mode: str) -> dict[str, int]:
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    state = {"peak_active_graph_nodes": 0, "peak_active_factor_count": 0, "last_candidate_index": -1}
-    WORKER_PROGRESS.clear()
-    WORKER_PROGRESS.update({"mode": mode, **state, "peak_gpu_vram_bytes": int(torch.cuda.max_memory_allocated())})
-    return state
-
-
-def _observe_runtime(slam: Any, peaks: dict[str, int], candidate_index: int) -> None:
-    peaks["peak_active_graph_nodes"] = max(peaks["peak_active_graph_nodes"], int(slam.n))
-    peaks["peak_active_factor_count"] = max(peaks["peak_active_factor_count"], int(slam.pg.ii.numel()))
-    peaks["last_candidate_index"] = int(candidate_index)
-    WORKER_PROGRESS.update(peaks)
-    WORKER_PROGRESS["peak_gpu_vram_bytes"] = int(torch.cuda.max_memory_allocated())
-
-
-def _finish_run(slam: Any, *, started: float, uploaded: list[int], accepted: list[int], candidates: int, peaks: dict[str, int]) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    active_before_terminate = int(slam.n)
-    poses, returned_timestamps = slam.terminate()
-    torch.cuda.synchronize()
-    expected = np.asarray(slam.tlist, dtype=np.uint64)
-    timestamps, pose_array = np.asarray(returned_timestamps, dtype=np.uint64), np.asarray(poses, dtype=np.float64)
-    timestamp_contract = len(timestamps) == len(expected) and np.array_equal(timestamps, expected)
-    valid_timestamps = bool(timestamp_contract and len(timestamps) > 0 and np.all(np.diff(timestamps.astype(np.int64)) > 0))
-    finite = bool(np.isfinite(pose_array).all())
-    if not finite or not valid_timestamps:
-        raise AssertionError("trajectory finite/timestamp contract failed")
-    return {
-        "tracking_completed": True, "processed_candidate_frames": int(candidates), "rgb_uploaded_frames": len(uploaded), "actual_rgb_upload_ratio": len(uploaded) / candidates,
-        "trajectory_pose_count": len(poses), "accepted_graph_input_count": len(accepted), "accepted_anchor_graph_count": len(accepted),
-        "active_graph_nodes_before_terminate": active_before_terminate, "active_graph_nodes_after_terminate": int(slam.n),
-        "uploaded_timestamps_ns": uploaded, "accepted_graph_timestamps_ns": accepted, "elapsed_seconds": time.perf_counter() - started,
-        "patches_per_frame": int(slam.M), "culling_policy": getattr(slam, "exp3_culling_policy", "upstream"), "finite_trajectory": finite,
-        "valid_timestamps": valid_timestamps, "timestamp_contract_exact": bool(timestamp_contract), "last_candidate_index": int(peaks["last_candidate_index"]),
-        "peak_active_graph_nodes": int(peaks["peak_active_graph_nodes"]), "peak_active_factor_count": int(peaks["peak_active_factor_count"]), "peak_gpu_vram_bytes": int(torch.cuda.max_memory_allocated()),
-    }, {"poses": pose_array, "timestamps_ns": timestamps}
-
-
-@torch.no_grad()
-def run_worker(config: dict[str, Any], mode: str, schedule: dict[str, Any] | None) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    if mode not in {"full_rgb", "sparse_rgb", "oracle_fmap"}:
-        raise ValueError(f"unsupported final Experiment 3 mode: {mode}")
-    classes, records = _runtime_classes(), _records(config)
-    calibration = np.loadtxt(config["paths"]["calibration"], delimiter=" ")
-    first_image, _ = _load_frame(records[0], calibration)
-    _seed_everything(int(config["experiment"]["seed"]))
-    started, uploaded, accepted, accepted_indices = time.perf_counter(), [], [], []
-    if mode == "full_rgb":
-        slam, peaks = _make_slam(classes["DPVO"], config, first_image), _new_peak_state(mode)
-        for record in records:
-            image, intrinsics = _load_frame(record, calibration)
-            before_n = int(slam.n)
-            slam(int(record["timestamp_ns"]), image, intrinsics)
-            uploaded.append(int(record["timestamp_ns"]))
-            if int(slam.n) > before_n:
-                accepted.append(int(record["timestamp_ns"]))
-            _observe_runtime(slam, peaks, int(record["candidate_index"]))
-        return _finish_run(slam, started=started, uploaded=uploaded, accepted=accepted, candidates=len(records), peaks=peaks)
-    if mode == "sparse_rgb":
-        slam, peaks = _make_slam(classes["NoCullRGBDPVO"], config, first_image), _new_peak_state(mode)
-        bootstrap_end: int | None = None
-        schedule_indices: list[int] = []
-        interval = int(config["experiment"]["post_bootstrap_anchor_interval"])
-        for record in records:
-            candidate = int(record["candidate_index"])
-            upload = bootstrap_end is None or (candidate - bootstrap_end - 1) % interval == 0
-            if not upload:
-                _observe_runtime(slam, peaks, candidate)
-                continue
-            image, intrinsics = _load_frame(record, calibration)
-            before_n = int(slam.n)
-            slam(int(record["timestamp_ns"]), image, intrinsics)
-            uploaded.append(int(record["timestamp_ns"])); schedule_indices.append(candidate)
-            if int(slam.n) > before_n:
-                accepted.append(int(record["timestamp_ns"])); accepted_indices.append(candidate)
-            if bootstrap_end is None and slam.is_initialized:
-                bootstrap_end = candidate
-            _observe_runtime(slam, peaks, candidate)
-        if bootstrap_end is None:
-            raise RuntimeError("Sparse RGB did not initialize")
-        result, arrays = _finish_run(slam, started=started, uploaded=uploaded, accepted=accepted, candidates=len(records), peaks=peaks)
-        result.update({"bootstrap_end_candidate_index": bootstrap_end, "bootstrap_condition": "motion-accepted graph n == 8", "scheduled_anchor_candidate_indices": schedule_indices, "scheduled_anchor_timestamps_ns": uploaded, "accepted_anchor_candidate_indices": accepted_indices})
-        return result, arrays
-    if schedule is None:
-        raise ValueError("oracle_fmap requires the immutable Sparse RGB schedule")
-    schedule_indices = [int(value) for value in schedule["candidate_indices"]]
-    schedule_set, expected_bootstrap_end = set(schedule_indices), int(schedule["bootstrap_end_candidate_index"])
-    slam, peaks = _make_slam(classes["OracleHybridDPVO"], config, first_image), _new_peak_state(mode)
-    actual_bootstrap_end: int | None = None
-    latent_timestamps: list[int] = []
-    for record in records:
-        candidate, timestamp = int(record["candidate_index"]), int(record["timestamp_ns"])
-        image, intrinsics = _load_frame(record, calibration)
-        if candidate in schedule_set:
-            if candidate > expected_bootstrap_end and not slam.is_initialized:
-                raise AssertionError("Oracle bootstrap diverged before Sparse schedule began")
-            packet = extract_native_packet(slam, image)
-            initialized_before = bool(slam.is_initialized)
-            accepted_now, _ = slam.track_packet(timestamp, intrinsics, packet=packet, kind="anchor")
-            uploaded.append(timestamp)
-            if accepted_now:
-                accepted.append(timestamp); accepted_indices.append(candidate)
-            if not initialized_before and slam.is_initialized:
-                actual_bootstrap_end = candidate
-            if candidate == expected_bootstrap_end and not slam.is_initialized:
-                raise AssertionError("Oracle bootstrap end does not match Sparse RGB")
-        else:
-            if not slam.is_initialized:
-                raise AssertionError("latent frame encountered before initialization")
-            latent_timestamps.append(timestamp)
-            accepted_now, _ = slam.track_packet(timestamp, intrinsics, oracle=extract_oracle_fmap(slam, image), kind="latent")
-            if not accepted_now:
-                raise AssertionError("post-bootstrap latent was not accepted")
-        _observe_runtime(slam, peaks, candidate)
-    if actual_bootstrap_end != expected_bootstrap_end:
-        raise AssertionError(f"Oracle bootstrap end mismatch: {actual_bootstrap_end} != {expected_bootstrap_end}")
-    diagnostics = slam.diagnostics()
-    result, arrays = _finish_run(slam, started=started, uploaded=uploaded, accepted=accepted, candidates=len(records), peaks=peaks)
-    result.update({"accepted_graph_input_count": len(accepted) + len(latent_timestamps), "bootstrap_end_candidate_index": actual_bootstrap_end, "shared_schedule_bootstrap_end_candidate_index": expected_bootstrap_end, "bootstrap_condition": "motion-accepted graph n == 8", "scheduled_anchor_candidate_indices": schedule_indices, "scheduled_anchor_timestamps_ns": uploaded, "accepted_anchor_candidate_indices": accepted_indices, "latent_timestamps_ns": latent_timestamps, "diagnostics": diagnostics, "placeholder_contract": {"slots_per_latent_frame": int(slam.M), "xy": "repeated 3x3 grid centered at optical center; independent of hidden RGB", "depth": "positive finite median from graph state, fallback 1.0", "gmap": "all zeros", "imap": "all zeros", "colors": "all zeros", "factor_eligible": False}})
-    return result, arrays
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--internal-worker", action="store_true")
-    parser.add_argument("--config-json", required=True)
-    parser.add_argument("--mode", required=True, choices=("full_rgb", "sparse_rgb", "oracle_fmap"))
-    parser.add_argument("--schedule-json")
-    parser.add_argument("--result-json", required=True)
-    parser.add_argument("--result-npz", required=True)
-    args = parser.parse_args()
-    if not args.internal_worker:
-        raise SystemExit("runtime is internal; use the public H0/H1/H2 runners")
-    try:
-        config = json.loads(Path(args.config_json).read_text(encoding="utf-8"))
-        schedule = json.loads(Path(args.schedule_json).read_text(encoding="utf-8")) if args.schedule_json else None
-        result, arrays = run_worker(config, args.mode, schedule)
-        _write_json(args.result_json, {"status": "ok", "mode": args.mode, **result})
-        np.savez_compressed(args.result_npz, **arrays)
-        return 0
-    except BaseException as error:
-        _write_json(args.result_json, {"status": "error", "mode": args.mode, "error": repr(error), "traceback": traceback.format_exc(), "progress": dict(WORKER_PROGRESS)})
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

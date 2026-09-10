@@ -106,7 +106,8 @@ def load_compatible_bridge(
                     if key != "training_lineage_sha256"}
     if lineage.get("training_lineage_sha256") != canonical_sha256(lineage_body):
         raise RuntimeError("canonical H1 bridge lineage integrity failed; run run_h1 first")
-    if lineage.get("training_input") != dict(expected_training_input):
+    from .scientific_lineage import compatible_training_input
+    if not compatible_training_input(lineage.get("training_input", {}), expected_training_input):
         raise RuntimeError(
             "canonical H1 bridge is incompatible with current H1 config/source/protocol; "
             "run run_h1 first"

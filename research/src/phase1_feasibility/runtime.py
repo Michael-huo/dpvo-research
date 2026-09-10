@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import contextlib
+import gc
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -178,6 +179,7 @@ def warmup_dpvo_frontend(record: Any, calibration: np.ndarray,
     extract_frontend_packet(slam, image, record.identity, seed)
     torch.cuda.synchronize()
     del slam
+    gc.collect()
     torch.cuda.empty_cache()
     return {
         "rule": "one_representative_forward_per_independent_online_component",
@@ -389,6 +391,8 @@ def run_formal_mode(
     metrics = {
         "mode": mode,
         "condition_name": condition_name or mode,
+        "model_training": bool(slam.network.training),
+        "gradient_enabled": bool(torch.is_grad_enabled()),
         "input_candidate_count": len(frames),
         "processed_observation_count": int(slam.counter),
         "accepted_node_count_before_culling_sum": accepted_count,
@@ -510,6 +514,8 @@ def run_packet_observations(
         first_nonfinite = {"candidate_index": None, "stage": "terminate_trajectory"}
     metrics = {
         "condition_name": condition_name,
+        "model_training": bool(slam.network.training),
+        "gradient_enabled": bool(torch.is_grad_enabled()),
         "processed_observation_count": processed,
         "final_node_count_before_terminate": final_nodes,
         "final_patch_count_before_terminate": final_patches,
@@ -567,10 +573,36 @@ def run_deployment_observations(
     hidden_timestamps: set[int] = set()
     previous_timestamp = -1
     first_nonfinite: dict[str, Any] | None = None
+    # Execution-only early frontend cache: exposes no graph state to provider.
+    early_frontend = {}
+    if worker_barrier is not None and hasattr(worker_barrier, "attach_anchor_frontend"):
+        from types import SimpleNamespace
+        frontend = SimpleNamespace(network=slam.network, cfg=slam.cfg, M=slam.M)
+        def prepare_anchor(observation):
+            if (not isinstance(observation, AnchorRGBObservation)
+                    or expected_roles.get(observation.identity.key) != "anchor"):
+                raise PermissionError("early frontend accepts uploaded anchors only")
+            key = observation.identity.key
+            if key in early_frontend or key in native_frontend_keys:
+                raise RuntimeError("native anchor frontend computed twice")
+            cpu_started = time.perf_counter()
+            start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            early_frontend[key] = extract_frontend_packet(frontend, observation.image, observation.identity, seed)
+            end.record(); end.synchronize()
+            cuda_ms = float(start.elapsed_time(end))
+            profiler.add("native_dpvo_frontend", cuda_ms)
+            profiler.add_stage_c_cpu(
+                "native_frontend_compute",
+                (time.perf_counter() - cpu_started) * 1000.0,
+            )
+            profiler.add_stage_c_cuda("native_frontend_compute", cuda_ms)
+            native_frontend_keys.add(key)
+        worker_barrier.attach_anchor_frontend(prepare_anchor)
     ready_ack = worker_barrier.prepare_online() if worker_barrier is not None else None
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-    started = time.perf_counter()
+    matched_started = time.perf_counter()
     for observation in observations:
         if not isinstance(observation, (AnchorRGBObservation, PacketObservation)):
             raise TypeError("deployment iterable yielded an unauthorized observation type")
@@ -586,12 +618,24 @@ def run_deployment_observations(
         if role == "anchor":
             if not isinstance(observation, AnchorRGBObservation):
                 raise RuntimeError("scheduled anchor lacks native RGB observation")
-            start_event = torch.cuda.Event(enable_timing=True)
-            end_event = torch.cuda.Event(enable_timing=True)
-            start_event.record()
-            packet = extract_frontend_packet(slam, observation.image, identity, seed)
-            end_event.record(); end_event.synchronize()
-            profiler.add("native_dpvo_frontend", float(start_event.elapsed_time(end_event)))
+            if identity.key in early_frontend:
+                packet = early_frontend.pop(identity.key)
+            else:
+                start_event = torch.cuda.Event(enable_timing=True)
+                end_event = torch.cuda.Event(enable_timing=True)
+                frontend_cpu_started = time.perf_counter()
+                start_event.record()
+                packet = extract_frontend_packet(slam, observation.image, identity, seed)
+                end_event.record(); end_event.synchronize()
+                frontend_cuda_ms = float(start_event.elapsed_time(end_event))
+                profiler.add("native_dpvo_frontend", frontend_cuda_ms)
+                profiler.add_stage_c_cpu(
+                    "native_frontend_compute",
+                    (time.perf_counter() - frontend_cpu_started) * 1000.0,
+                )
+                profiler.add_stage_c_cuda(
+                    "native_frontend_compute", frontend_cuda_ms,
+                )
             intrinsics = observation.intrinsics
             native_frontend_keys.add(identity.key)
             kind = "anchor"
@@ -603,19 +647,47 @@ def run_deployment_observations(
             slam.exp6_hidden_timestamps.add(int(identity.timestamp_ns))
             hidden_timestamps.add(int(identity.timestamp_ns))
             kind = "hidden"
+        sync_started = time.perf_counter()
         torch.cuda.synchronize()
-        graph_started = time.perf_counter()
+        profiler.add_stage_c_cpu(
+            "dpvo_sync_wait", (time.perf_counter() - sync_started) * 1000.0,
+        )
+        conversion_start = torch.cuda.Event(enable_timing=True)
+        conversion_end = torch.cuda.Event(enable_timing=True)
+        conversion_cpu_started = time.perf_counter()
+        conversion_start.record()
         native_packet = packet_to_native(
             packet, identity=identity, experiment_seed=seed,
             patches_per_image=int(slam.M), patch_size=int(slam.P),
             context_dim=int(slam.DIM),
         )
+        conversion_end.record()
+        profiler.add_stage_c_cpu(
+            "stage_c_python_other",
+            (time.perf_counter() - conversion_cpu_started) * 1000.0,
+        )
+        graph_start = torch.cuda.Event(enable_timing=True)
+        graph_end = torch.cuda.Event(enable_timing=True)
+        graph_cpu_started = time.perf_counter()
+        graph_start.record()
         slam.track_packet(
             int(identity.timestamp_ns), intrinsics, packet=native_packet, kind=kind,
         )
+        graph_end.record()
+        graph_cpu_ms = (time.perf_counter() - graph_cpu_started) * 1000.0
+        profiler.add_stage_c_cpu(
+            "dpvo_graph_compute", graph_cpu_ms,
+        )
+        sync_started = time.perf_counter()
         torch.cuda.synchronize()
-        graph_ms = (time.perf_counter() - graph_started) * 1000.0
-        profiler.add("dpvo_graph_runtime", graph_ms)
+        profiler.add_stage_c_cpu(
+            "dpvo_sync_wait", (time.perf_counter() - sync_started) * 1000.0,
+        )
+        conversion_cuda_ms = float(conversion_start.elapsed_time(conversion_end))
+        graph_cuda_ms = float(graph_start.elapsed_time(graph_end))
+        profiler.add_stage_c_cuda("stage_c_python_other", conversion_cuda_ms)
+        profiler.add_stage_c_cuda("dpvo_graph_compute", graph_cuda_ms)
+        profiler.add("dpvo_graph_runtime", graph_cuda_ms)
         processed_keys.append(identity.key); processed_set.add(identity.key)
         if first_nonfinite is None and not _state_is_finite(slam):
             first_nonfinite = {
@@ -623,7 +695,7 @@ def run_deployment_observations(
                 "stage": "post_native_anchor_or_hidden_packet",
             }
         if on_tracked is not None:
-            on_tracked(observation, graph_ms)
+            on_tracked(observation, graph_cuda_ms)
         del packet, native_packet
     if processed_keys != expected_keys:
         missing = sorted(set(expected_keys) - processed_set)
@@ -637,23 +709,45 @@ def run_deployment_observations(
     final_nodes = int(slam.n)
     final_patches = int(slam.m)
     final_active_factors = int(slam.pg.ii.numel())
+    sync_started = time.perf_counter()
     torch.cuda.synchronize()
-    terminate_started = time.perf_counter()
-    poses, timestamps = slam.terminate()
-    torch.cuda.synchronize()
-    profiler.add(
-        "dpvo_graph_runtime",
-        (time.perf_counter() - terminate_started) * 1000.0,
+    profiler.add_stage_c_cpu(
+        "dpvo_sync_wait", (time.perf_counter() - sync_started) * 1000.0,
     )
-    flush_ack = worker_barrier.flush_online() if worker_barrier is not None else None
+    terminate_start = torch.cuda.Event(enable_timing=True)
+    terminate_end = torch.cuda.Event(enable_timing=True)
+    terminate_cpu_started = time.perf_counter()
+    terminate_start.record()
+    poses, timestamps = slam.terminate()
+    terminate_end.record()
+    terminate_cpu_ms = (time.perf_counter() - terminate_cpu_started) * 1000.0
+    profiler.add_stage_c_cpu(
+        "dpvo_graph_compute", terminate_cpu_ms,
+    )
+    sync_started = time.perf_counter()
     torch.cuda.synchronize()
-    elapsed_seconds = float(time.perf_counter() - started)
+    profiler.add_stage_c_cpu(
+        "dpvo_sync_wait", (time.perf_counter() - sync_started) * 1000.0,
+    )
+    terminate_cuda_ms = float(terminate_start.elapsed_time(terminate_end))
+    profiler.add_stage_c_cuda("dpvo_graph_compute", terminate_cuda_ms)
+    profiler.add("dpvo_graph_runtime", terminate_cuda_ms)
+    flush_ack = worker_barrier.flush_online() if worker_barrier is not None else None
+    sync_started = time.perf_counter()
+    torch.cuda.synchronize()
+    profiler.add_stage_c_cpu(
+        "dpvo_sync_wait", (time.perf_counter() - sync_started) * 1000.0,
+    )
+    elapsed_seconds = float(time.perf_counter() - matched_started)
+    profiler.finalize_stage_c(elapsed_seconds * 1000.0)
     pose_array = np.asarray(poses, dtype=np.float64)
     timestamp_array = np.asarray(timestamps, dtype=np.uint64)
     if first_nonfinite is None and not np.isfinite(pose_array).all():
         first_nonfinite = {"candidate_index": None, "stage": "terminate_trajectory"}
     metrics = {
         "condition_name": condition_name,
+        "model_training": bool(slam.network.training),
+        "gradient_enabled": bool(torch.is_grad_enabled()),
         "processed_observation_count": len(processed_keys),
         "final_node_count_before_terminate": final_nodes,
         "final_patch_count_before_terminate": final_patches,
@@ -681,6 +775,20 @@ def run_deployment_observations(
         "dpvo_graph_runtime_mean_ms_per_processed_observation": (
             float(sum(profiler.samples["dpvo_graph_runtime"])) / len(processed_keys)
         ),
+        "dpvo_graph_runtime_definition": (
+            "CUDA event span bounded immediately around slam.track_packet and "
+            "terminate; queue wait, transfer, packet conversion, and outer "
+            "synchronization are excluded; host dispatch gaps inside those calls "
+            "remain part of the span"
+        ),
+        "dpvo_graph_runtime_legacy_definition": (
+            "older artifacts used CPU wall from before packet_to_native through "
+            "slam.track_packet and the following CUDA synchronize, plus terminate; "
+            "those values are not comparable to this pure CUDA-event field"
+        ),
+        "stage_c_timing": profiler.payload(
+            peak_online_vram_bytes=int(torch.cuda.max_memory_allocated())
+        )["stage_c_timing"],
         "cross_process_timing_barrier": {
             "worker_present": worker_barrier is not None,
             "online_ready_ack": ready_ack,

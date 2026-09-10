@@ -1,16 +1,14 @@
-"""Performance-only instrumentation for the frozen H2 implementation.
+"""Execution instrumentation used by the formal Phase 1 runners.
 
 This module deliberately owns no scientific configuration, model, checkpoint,
-evaluation, or publication logic.  It provides small timing/accounting helpers
-used by the standalone H2 efficiency benchmark.
+evaluation, or publication logic. It provides timing, transfer, and telemetry
+helpers used by the H0/H1/H2 runners and their summaries.
 """
 
 from __future__ import annotations
 
 import contextlib
 import csv
-import hashlib
-import json
 import os
 import re
 import subprocess
@@ -18,17 +16,14 @@ import threading
 import time
 from collections import defaultdict
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
 import numpy as np
 import torch
 
 from .profiling import distribution_ms
-from .protocol import REPO_ROOT
 
 
-CANONICAL_RESULTS_ROOT = REPO_ROOT / "research/results/phase1-feasibility"
 PREDICTOR_STAGES = (
     "endpoint_descriptor_matching",
     "bidirectional_topk_correspondence",
@@ -40,31 +35,6 @@ PREDICTOR_STAGES = (
     "neural_residual_predictor_forward",
     "predictor_output_assembly",
 )
-
-
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def canonical_artifact_snapshot(root: Path = CANONICAL_RESULTS_ROOT) -> dict[str, str]:
-    if not root.exists():
-        return {}
-    return {
-        str(path.relative_to(root)): _sha256(path)
-        for path in sorted(root.rglob("*")) if path.is_file()
-    }
-
-
-def validate_output_path(path: str | Path) -> Path:
-    resolved = Path(path).expanduser().resolve()
-    canonical = CANONICAL_RESULTS_ROOT.resolve()
-    if resolved == canonical or canonical in resolved.parents:
-        raise ValueError("efficiency benchmark output may not be inside canonical results")
-    return resolved
 
 
 @dataclass
@@ -315,17 +285,20 @@ class NvidiaSmiSampler:
     def stop(self) -> None:
         if self.process is None:
             return
-        self.process.terminate()
         try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.kill(); self.process.wait(timeout=5)
-        if self.thread is not None:
-            self.thread.join(timeout=5)
-        if self.process.stderr is not None:
-            stderr = self.process.stderr.read().strip()
-            if stderr and not self.rows:
-                self.error = stderr
+            self.process.terminate()
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.kill(); self.process.wait(timeout=5)
+            if self.thread is not None:
+                self.thread.join(timeout=5)
+            if self.process.stderr is not None:
+                stderr = self.process.stderr.read().strip()
+                if stderr and not self.rows:
+                    self.error = stderr
+        except Exception as error:
+            self.error = f"{type(error).__name__}: {error}"
 
     def payload(self) -> dict[str, Any]:
         by_uuid: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -496,18 +469,20 @@ def add_cuda_worker_mapping(
 ) -> None:
     """Attach a sidecar's real PID and inherited logical cuda:0 mapping."""
     logical_index = int(worker.get("logical_cuda_ordinal", 0))
+    physical_index = worker.get("physical_device")
     topology = payload.get("devices", {}).get("topology", {})
     mapping = next((
         row for row in topology.get("logical_devices", [])
-        if row.get("logical_index") == logical_index
+        if (row.get("physical_index") == physical_index
+            if physical_index is not None else row.get("logical_index") == logical_index)
     ), {})
     payload["devices"]["components"][str(component)] = {
         "component": str(component),
-        "pid": worker.get("worker_pid"),
+        "pid": worker.get("worker_pid", worker.get("pid")),
         "logical_index": logical_index,
         "cuda_visible_devices": worker.get("cuda_visible_devices"),
         "name": worker.get("cuda_device_name", mapping.get("name")),
-        "mapping_basis": "worker hardcodes cuda:0 and inherits visibility",
+        "mapping_basis": "explicit physical worker device with logical cuda:0",
         **{key: mapping.get(key) for key in (
             "physical_index", "uuid", "pci_bus_id",
         )},
@@ -684,8 +659,11 @@ def gpu_topology_audit() -> dict[str, Any]:
                     pass
     logical_devices: list[dict[str, Any]] = []
     cuda_error = None
+    cuda_available = False
+    count = 0
     try:
-        count = torch.cuda.device_count()
+        cuda_available = bool(torch.cuda.is_available())
+        count = int(torch.cuda.device_count())
         resolved = {
             row["logical_index"]: row
             for row in logical_physical_mapping(count, physical_devices)
@@ -727,8 +705,8 @@ def gpu_topology_audit() -> dict[str, Any]:
                              )})
     return {
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "torch_cuda_available": bool(torch.cuda.is_available()),
-        "torch_device_count": int(torch.cuda.device_count()),
+        "torch_cuda_available": cuda_available,
+        "torch_device_count": count,
         "nvidia_smi_inventory": inventory,
         "physical_devices": physical_devices,
         "logical_devices": logical_devices,
@@ -748,8 +726,14 @@ def current_cuda_device(component: str, *, pid: int | None = None) -> dict[str, 
     }
     if not torch.cuda.is_available():
         return result | {"available": False, "error": "torch.cuda.is_available() is false"}
-    logical = int(torch.cuda.current_device())
-    properties = torch.cuda.get_device_properties(logical)
+    try:
+        logical = int(torch.cuda.current_device())
+        properties = torch.cuda.get_device_properties(logical)
+    except Exception as error:
+        return result | {
+            "available": True,
+            "error": f"{type(error).__name__}: {error}",
+        }
     return result | {
         "available": True, "logical_index": logical, "name": properties.name,
         "total_memory_bytes": int(properties.total_memory),
@@ -763,164 +747,20 @@ def gpu_process_snapshot() -> dict[str, Any]:
         "--format=csv,noheader,nounits",
     ))
     rows = []
+    parse_errors = []
     if value:
         for line in value.splitlines():
-            fields = [item.strip() for item in next(csv.reader([line]))]
-            if len(fields) == 4:
-                try:
+            try:
+                fields = [item.strip() for item in next(csv.reader([line]))]
+                if len(fields) == 4:
                     memory: int | None = int(fields[3])
-                except ValueError:
-                    memory = None
-                rows.append({"pid": int(fields[0]), "gpu_uuid": fields[1],
-                             "process_name": fields[2], "used_gpu_memory_mib": memory})
-    return {"rows": rows, "error": error}
-
-
-def pairwise_copy_benchmark(
-    tensor_specs: Mapping[str, tuple[Sequence[int], torch.dtype]], *, repeats: int = 10,
-) -> dict[str, Any]:
-    """Measure representative peer or pinned-host-staged transfers only."""
-    if not torch.cuda.is_available() or torch.cuda.device_count() < 2:
-        return {"available": False, "reason": "at least two visible CUDA devices are required",
-                "pairs": []}
-    pairs = []
-    for source in range(torch.cuda.device_count()):
-        for destination in range(torch.cuda.device_count()):
-            if source == destination:
-                continue
-            peer = bool(torch.cuda.can_device_access_peer(source, destination))
-            measurements = {}
-            for name, (shape, dtype) in tensor_specs.items():
-                with torch.cuda.device(source):
-                    source_tensor = torch.zeros(tuple(shape), device=f"cuda:{source}", dtype=dtype)
-                bytes_count = source_tensor.numel() * source_tensor.element_size()
-                if peer:
-                    with torch.cuda.device(destination):
-                        destination_tensor = torch.empty(
-                            tuple(shape), device=f"cuda:{destination}", dtype=dtype,
-                        )
-                        destination_tensor.copy_(source_tensor)
-                        torch.cuda.synchronize(destination)
-                        samples = []
-                        for _ in range(int(repeats)):
-                            start = torch.cuda.Event(enable_timing=True)
-                            end = torch.cuda.Event(enable_timing=True)
-                            start.record(); destination_tensor.copy_(source_tensor); end.record()
-                            end.synchronize(); samples.append(float(start.elapsed_time(end)))
-                    measurements[name] = {
-                        "path": "direct_device_copy", "bytes": int(bytes_count),
-                        "cuda_copy_ms": distribution_ms(samples),
-                        "bandwidth_gbps_from_mean": (
-                            bytes_count / (float(np.mean(samples)) / 1000.0) / 1e9
-                            if samples and float(np.mean(samples)) > 0 else None
-                        ),
-                    }
-                    del destination_tensor
-                else:
-                    host = torch.empty(tuple(shape), dtype=dtype, pin_memory=True)
-                    with torch.cuda.device(destination):
-                        destination_tensor = torch.empty(
-                            tuple(shape), device=f"cuda:{destination}", dtype=dtype,
-                        )
-                    d2h, h2d, wall = [], [], []
-                    for _ in range(int(repeats)):
-                        wall_started = time.perf_counter()
-                        with torch.cuda.device(source):
-                            start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
-                            start.record(); host.copy_(source_tensor, non_blocking=True); end.record()
-                            end.synchronize(); d2h.append(float(start.elapsed_time(end)))
-                        with torch.cuda.device(destination):
-                            start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
-                            start.record(); destination_tensor.copy_(host, non_blocking=True); end.record()
-                            end.synchronize(); h2d.append(float(start.elapsed_time(end)))
-                        wall.append((time.perf_counter() - wall_started) * 1000.0)
-                    measurements[name] = {
-                        "path": "pinned_host_staging", "bytes": int(bytes_count),
-                        "d2h_cuda_ms": distribution_ms(d2h),
-                        "h2d_cuda_ms": distribution_ms(h2d),
-                        "cpu_wall_ms": distribution_ms(wall),
-                    }
-                    del host, destination_tensor
-                del source_tensor
-            pairs.append({"source": source, "destination": destination,
-                          "can_access_peer": peer, "measurements": measurements})
-    return {"available": True, "repeats": int(repeats), "pairs": pairs}
-
-
-def simulate_pipeline(
-    intervals: Sequence[Mapping[str, float]], *, sensor_paced: bool,
-    startup: Mapping[str, float] | None = None, drain_ms: float = 0.0,
-) -> dict[str, Any]:
-    """Simulate the frozen dependency DAG on three independent resources."""
-    startup = dict(startup or {})
-    gpu0 = float(startup.get("gpu0_ms", 0.0))
-    gpu1 = float(startup.get("gpu1_ms", 0.0))
-    gpu2 = float(startup.get("gpu2_ms", 0.0))
-    events = []
-    resource = {"gpu0_encode_ms": gpu0, "gpu1_predict_bridge_transfer_ms": gpu1,
-                "gpu2_dpvo_ms": gpu2 + float(drain_ms)}
-    for index, row in enumerate(intervals):
-        arrival = float(row.get("anchor_available_ms", 0.0)) if sensor_paced else 0.0
-        encode = float(row["encode_ms"])
-        predict = float(row["predict_ms"]) + float(row.get("bridge_ms", 0.0)) \
-            + float(row.get("transfer_ms", 0.0))
-        dpvo = float(row["dpvo_ms"])
-        encode_start = max(arrival, gpu0); encode_ready = encode_start + encode
-        predict_start = max(encode_ready, gpu1); predict_ready = predict_start + predict
-        dpvo_start = max(predict_ready, gpu2); dpvo_ready = dpvo_start + dpvo
-        gpu0, gpu1, gpu2 = encode_ready, predict_ready, dpvo_ready
-        resource["gpu0_encode_ms"] += encode
-        resource["gpu1_predict_bridge_transfer_ms"] += predict
-        resource["gpu2_dpvo_ms"] += dpvo
-        events.append({"interval": index, "anchor_available_ms": arrival,
-                       "encode_ready_ms": encode_ready, "predict_ready_ms": predict_ready,
-                       "dpvo_ready_ms": dpvo_ready})
-    makespan = float((gpu2 if intervals else max(gpu0, gpu1, gpu2)) + float(drain_ms))
-    resource_bound = float(max(resource.values(), default=0.0))
-    return {
-        "sensor_paced": bool(sensor_paced), "interval_count": len(intervals),
-        "startup_ms": startup, "drain_ms": float(drain_ms),
-        "makespan_ms": makespan, "dependency_critical_path_lower_bound_ms": makespan,
-        "per_device_resource_totals_ms": resource,
-        "per_device_resource_lower_bound_ms": resource_bound,
-        "bound_scope": (
-            "current measured kernels and proposed one-GPU-per-stage mapping; "
-            "not an RTX4090 hardware or H2 algorithmic lower bound"
-        ),
-        "events": events,
-        "excludes": ["rgb_encoding", "network_queue", "uplink_transmission",
-                     "packet_loss", "network_jitter"],
-    }
-
-
-def bootstrap_pipeline(
-    intervals: Sequence[Mapping[str, float]], *, sensor_paced: bool,
-    startup: Mapping[str, float] | None = None, drain_ms: float = 0.0,
-    repetitions: int = 1000, seed: int = 1234,
-) -> dict[str, Any]:
-    if not intervals:
-        raise ValueError("pipeline bootstrap requires interval samples")
-    rng = np.random.default_rng(int(seed)); values = []
-    availability = [float(row.get("anchor_available_ms", 0.0)) for row in intervals]
-    for _ in range(int(repetitions)):
-        indices = rng.integers(0, len(intervals), size=len(intervals))
-        sampled = []
-        for position, index in enumerate(indices):
-            row = dict(intervals[int(index)])
-            if sensor_paced:
-                row["anchor_available_ms"] = availability[position]
-            sampled.append(row)
-        values.append(simulate_pipeline(
-            sampled, sensor_paced=sensor_paced, startup=startup, drain_ms=drain_ms,
-        )["makespan_ms"])
-    result = scalar_distribution(values)
-    return {"repetitions": int(repetitions), "seed": int(seed),
-            "makespan_ms": result}
-
-
-def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True,
-                                    allow_nan=False) + "\n", encoding="utf-8")
-    temporary.replace(path)
+                    rows.append({"pid": int(fields[0]), "gpu_uuid": fields[1],
+                                 "process_name": fields[2],
+                                 "used_gpu_memory_mib": memory})
+            except (csv.Error, ValueError) as parse_error:
+                parse_errors.append(
+                    f"{type(parse_error).__name__}: {parse_error}: {line!r}"
+                )
+    errors = [value for value in (error, *parse_errors) if value]
+    return {"rows": rows, "error": "; ".join(errors) or None,
+            "telemetry_only": True}

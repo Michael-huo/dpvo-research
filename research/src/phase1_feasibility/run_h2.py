@@ -4,11 +4,13 @@ from __future__ import annotations
 
 import argparse
 import copy
+import dataclasses
 import io
 import json
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -27,8 +29,8 @@ from .efficiency_profiling import (
     PerformanceRecorder, PersistentPerformanceAudit, TransferLedger,
     add_cuda_worker_mapping, condition_runtime_diagnostics, performance_diagnosis,
 )
-from .h2_deployment import DelayedDeploymentProvider
-from .jepa_fmap import build_bridge, coordinate_masks, tokens_to_field
+from .h2_pipeline import CanonicalH2Pipeline
+from .jepa_fmap import build_bridge, coordinate_masks
 from .jepa_runtime import (CompactFeatureStore, RestrictedFeatureView, extract_block5_store,
                            extract_true_fmap_store, load_dpvo_domain,
                            sequence_geometry)
@@ -44,28 +46,39 @@ from .protocol import (REPO_ROOT, SUPPORTED_SEQUENCES, atomic_write_bytes,
                        canonical_sha256, load_sequence_records,
                        post_bootstrap_ratio_roles, ratio_schedule_payload,
                        repo_path, sha256_file)
-from .h2_training import (_field, _hidden_identities, _plot_feature_diagnostics,
+from .h2_training import (_field, _hidden_identities,
                           build_robust_correspondence_store,
                           calibrate_train_only_thresholds, held_out_representation,
                           tiny_overfit, train_predictor)
 from .transport import robust_protocol_metadata
-from .runtime import (OnlineFrame, PacketObservation, materialize_schedule,
-                      run_deployment_observations, run_formal_mode,
-                      run_packet_observations,
-                      sanitize_full_oracle_frames, warmup_dpvo_frontend)
+from .runtime import (PacketObservation, materialize_schedule,
+                      run_deployment_observations, warmup_dpvo_frontend)
 from .schema import VISUAL_STATE_CONTRACT_SHA256, condition_metadata
 from .registry import (
     base_lineage, complete_lineage, empty_index, publish_current_canonical,
     sequence_entry, validate_module_manifest, write_registry_and_summary,
     write_sequence_metadata,
 )
+from .execution_runtime import (
+    FormalExecution, cpu_numa_layout,
+    execution_provenance, initialize_formal_main_process,
+    release_cuda_training_state,
+    require_lifecycle_cleanup, runtime_provenance, fixed_cpu_profile,
+)
+from .parallel_runtime import (
+    correspondence_parallel, extract_parallel, run_sequential_trajectory_jobs,
+)
+from .training_runtime import (
+    ResidentH2View, resident_correspondence, tensor_footprint,
+)
 
 DEFAULT_CONFIG = REPO_ROOT / "research/configs/phase1_feasibility_h2.yaml"
 TRAINING_SEQUENCE = "MH_01_easy"
 TRAINING_ANCHOR_RATIO = 0.2
 CONDITIONS = (
-    "full_rgb_reference", "sparse_rgb_reference", "anchor_jepa_only",
-    "oracle_jepa_hidden_reference", "predicted_jepa_hidden",
+    "full_rgb_reference", "sparse_rgb_reference",
+    "oracle_jepa_hidden_reference", "anchor_jepa_only",
+    "predicted_jepa_hidden",
 )
 
 
@@ -327,9 +340,12 @@ def _compact_runtime(row: Mapping[str, Any]) -> dict[str, Any]:
         "native_anchor_frontend_count", "dpvo_insertion_count",
         "candidate_consumed_exactly_once", "candidate_identity_order_sha256",
         "finite_trajectory", "tracking_success", "trajectory_pose_count",
+        "model_training", "gradient_enabled",
         "timestamp_contract_exact", "elapsed_seconds", "peak_gpu_vram_bytes",
         "final_active_factor_count", "dpvo_graph_runtime_total_ms",
         "dpvo_graph_runtime_mean_ms_per_processed_observation",
+        "dpvo_graph_runtime_definition", "dpvo_graph_runtime_legacy_definition",
+        "stage_c_timing",
         "cross_process_timing_barrier",
         "representation",
     )
@@ -381,6 +397,10 @@ def _run_strict_replay(
     config: Mapping[str, Any], temporary: Path, *,
     performance: PerformanceRecorder | None = None,
     transfer_ledger: TransferLedger | None = None,
+    predictor_checkpoint: Path,
+    predictor_state_hash: str,
+    execution: FormalExecution | None = None,
+    cpu_profile: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray], dict[str, Any]]:
     height, width = load_dpvo_domain(records[0].rgb_path, calibration)[0].shape[:2]
     anchor_paths = {
@@ -388,12 +408,15 @@ def _run_strict_replay(
         if roles[row.identity.key] == "anchor"
     }
     profiler = OnlineProfiler()
-    provider = DelayedDeploymentProvider(
+    provider = CanonicalH2Pipeline(
         anchor_paths=anchor_paths, identities=[row.identity for row in records],
         intervals=intervals, transform=transform, calibration=calibration,
         config=config, temporary=temporary, bridge=bridge, predictor=predictor,
         transport_calibration=thresholds, profiler=profiler, predict_hidden=True,
         performance=performance, transfer_ledger=transfer_ledger,
+        predictor_checkpoint=predictor_checkpoint,
+        predictor_state_sha256=predictor_state_hash,
+        execution=execution or FormalExecution(), cpu_profile=cpu_profile,
     )
     temporary.mkdir(parents=True, exist_ok=False)
     warmup = warmup_dpvo_frontend(
@@ -409,12 +432,43 @@ def _run_strict_replay(
         )
     usage = provider.usage_payload()
     runtime["provider_usage"] = usage
+    transfer_boundaries = {
+        "stage_c": usage.get("stage_c_transfer"),
+        "encoder": usage.get("workers", {}).get("encoder", {}).get("transfer"),
+        "predictor": usage.get("workers", {}).get("predictor", {}).get("transfer"),
+    }
+    if (execution or FormalExecution()).verify_transfers:
+        for boundary, payload in transfer_boundaries.items():
+            verification = (payload or {}).get("payload_verification", {})
+            if not verification.get("all_exact"):
+                raise RuntimeError(f"{boundary} D2H/H2D payload verification is not exact")
     if not usage["anchor_encoded_exactly_once"]:
         raise RuntimeError("strict replay did not encode every anchor exactly once")
     if not usage["candidate_yielded_exactly_once"]:
         raise RuntimeError("strict replay did not yield every candidate exactly once")
+    if not usage["hidden_consumed_exactly_once"]:
+        raise RuntimeError("strict replay did not consume every hidden observation exactly once")
+    if (usage["contains_hidden_rgb_or_path_capability"]
+            or usage["contains_hidden_reference_or_groundtruth_capability"]):
+        raise PermissionError("strict replay acquired a forbidden hidden/reference capability")
     online_profile = profiler.payload(
         peak_online_vram_bytes=int(runtime["peak_gpu_vram_bytes"]),
+    )
+    online_profile["pipeline_transfers"] = {
+        "stage_c": usage.get("stage_c_transfer"),
+        "host_shared_memory": usage.get("host_shared_memory_transfer"),
+        "encoder": usage.get("workers", {}).get("encoder", {}).get("transfer"),
+        "predictor": usage.get("workers", {}).get("predictor", {}).get("transfer"),
+    }
+    if (execution or FormalExecution()).decision_trace:
+        online_profile["correspondence_decision_traces"] = usage.get(
+            "correspondence_decision_traces", []
+        )
+        online_profile["numerical_acceptance"] = usage.get("numerical_acceptance")
+    online_profile["pipeline_wall_segments"] = usage.get("pipeline_wall_segments")
+    online_profile["anchor_completion_latency"] = usage.get("anchor_completion_latency")
+    online_profile["producer_queue_backpressure"] = usage.get(
+        "producer_queue_backpressure"
     )
     online_profile["peak_online_vram_main_process_bytes"] = int(
         runtime["peak_gpu_vram_bytes"]
@@ -422,9 +476,17 @@ def _run_strict_replay(
     online_profile["peak_online_vram_jepa_worker_bytes"] = int(
         provider.jepa_peak_online_vram_bytes
     )
+    online_profile["peak_online_vram_predictor_worker_bytes"] = int(
+        provider.worker_diagnostics["predictor"]["peak_vram_bytes"]
+    )
     online_profile["peak_online_vram_combined_process_sum_bytes"] = (
         online_profile["peak_online_vram_main_process_bytes"]
         + online_profile["peak_online_vram_jepa_worker_bytes"]
+        + online_profile["peak_online_vram_predictor_worker_bytes"]
+    )
+    online_profile["stage_c_runtime"] = runtime_provenance(
+        provider.settings, component="stage_c_native_frontend_bridge_dpvo",
+        model=bridge, amp=False,
     )
     online_profile["warmup"] = warmup | {
         "additional_h2_components": ["v_jepa_encoder", "predictor", "frozen_h1_bridge"],
@@ -440,70 +502,35 @@ def _run_strict_replay(
 def _run_sequence(
     records: Sequence[Any], roles: Mapping[str, str], intervals: Sequence[AnchorInterval],
     schedule: Mapping[str, Any], calibration: np.ndarray, transform: Any,
-    bridge: torch.nn.Module, predictor: torch.nn.Module,
     thresholds: Mapping[str, Any], config: Mapping[str, Any], temporary: Path,
-    output: Path,
+    output: Path, *, predictor_checkpoint: Path,
+    condition_rows: Sequence[Mapping[str, Any]],
+    trajectory_execution: Mapping[str, Any],
 ) -> dict[str, Any]:
     sequence = records[0].identity.sequence
     height, width = load_dpvo_domain(records[0].rgb_path, calibration)[0].shape[:2]
     anchor_paths = {row.identity.key: row.rgb_path for row in records
                     if roles[row.identity.key] == "anchor"}
     identities = [row.identity for row in records]
-    predictor_performance = PerformanceRecorder(enable_cuda=True)
-    transfer_ledger = TransferLedger()
-    predicted_runtime, predicted_arrays, online_profile = _run_strict_replay(
-        records, roles, intervals, calibration, transform, bridge, predictor,
-        thresholds, config, temporary / "strict_online",
-        performance=predictor_performance, transfer_ledger=transfer_ledger,
-    )
-    # Only after strict deployment is complete may raw/oracle reference stores exist.
-    all_online = [OnlineFrame(row.identity, row.rgb_path) for row in records]
-    packet_online = sanitize_full_oracle_frames(records, roles)
-    all_anchor = {row.identity.key: "anchor" for row in records}
-    full_warmup = warmup_dpvo_frontend(
-        records[0], calibration, config, packet_runtime=False,
-    )
-    full_runtime, full_arrays = run_formal_mode(
-        "matched_full_rgb", all_online, calibration, config, roles=all_anchor,
-        condition_name="full_rgb_reference",
-        matched_timing=True, profile_graph_runtime=True, collect_graph_trace=False,
-    )
-    sparse_warmup = warmup_dpvo_frontend(
-        records[0], calibration, config, packet_runtime=False,
-    )
-    sparse_runtime, sparse_arrays = run_formal_mode(
-        "sparse_rgb", packet_online, calibration, config, roles=roles,
-        condition_name="sparse_rgb_reference",
-        matched_timing=True, profile_graph_runtime=True, collect_graph_trace=False,
-    )
-    reference_temp = temporary / "offline_reference"
-    reference_temp.mkdir()
-    all_store, all_extraction = extract_block5_store(
-        records, identities, calibration, config, reference_temp, transform,
-    )
-    anchor_runtime, anchor_arrays = run_packet_observations(
-        _store_observations(identities, roles, all_store, transform, bridge, include_hidden=False),
-        calibration, config, image_height=height, image_width=width,
-        condition_name="anchor_jepa_only",
-    )
-    oracle_runtime, oracle_arrays = run_packet_observations(
-        _store_observations(identities, roles, all_store, transform, bridge, include_hidden=True),
-        calibration, config, image_height=height, image_width=width,
-        condition_name="oracle_jepa_hidden_reference",
-    )
-    hidden_identities = tuple(row.identity for row in records if roles[row.identity.key] == "hidden")
-    true_store, true_extraction = extract_true_fmap_store(
-        records, hidden_identities, calibration, config, reference_temp, transform,
-    )
-    mask = torch.from_numpy(coordinate_masks(transform)["valid_token_mask"]).cuda()
-    robust, robust_meta = build_robust_correspondence_store(
-        intervals, all_store, transform, mask, thresholds,
-    )
+    if not condition_rows:
+        raise RuntimeError("H2 formal trajectory results are missing")
+    by_condition = {row["condition"]: row for row in condition_rows}
+    full_row = by_condition["full_rgb_reference"]
+    sparse_row = by_condition["sparse_rgb_reference"]
+    anchor_row = by_condition["anchor_jepa_only"]
+    oracle_row = by_condition["oracle_jepa_hidden_reference"]
+    predicted_row = by_condition["predicted_jepa_hidden"]
+    full_runtime, full_arrays = full_row["runtime"], full_row["arrays"]
+    sparse_runtime, sparse_arrays = sparse_row["runtime"], sparse_row["arrays"]
+    full_warmup, sparse_warmup = full_row["warmup"], sparse_row["warmup"]
+    anchor_runtime, anchor_arrays = anchor_row["runtime"], anchor_row["arrays"]
+    oracle_runtime, oracle_arrays = oracle_row["runtime"], oracle_row["arrays"]
+    predicted_runtime = predicted_row["runtime"]
+    predicted_arrays = predicted_row["arrays"]
+    online_profile = predicted_row["online_profile"]
     output.mkdir(parents=True, exist_ok=False)
-    diagnostics = _plot_feature_diagnostics(
-        output / "feature_diagnostics.png", sequence, intervals, all_store, true_store,
-        transform, bridge, robust, predictor, config,
-    )
+    shutil.copy2(oracle_row["diagnostic_path"], output / "feature_diagnostics.png")
+    diagnostics = oracle_row["diagnostics"]
     runtimes = {
         "full_rgb_reference": full_runtime, "sparse_rgb_reference": sparse_runtime,
         "anchor_jepa_only": anchor_runtime,
@@ -537,6 +564,14 @@ def _run_sequence(
     conditions["predicted_jepa_hidden"]["runtime"]["provider_usage"] = (
         predicted_runtime["provider_usage"]
     )
+    for name, row in (
+        ("anchor_jepa_only", anchor_row),
+        ("oracle_jepa_hidden_reference", oracle_row),
+    ):
+        if row.get("condition_timing_scopes") is not None:
+            conditions[name]["execution_timing_scopes"] = row[
+                "condition_timing_scopes"
+            ]
     np.savez_compressed(output / "trajectories.npz", **trajectory_payload(
         records, roles, arrays, population, groundtruth,
     ))
@@ -570,7 +605,9 @@ def _run_sequence(
             "effective_candidate_identity_sha256": canonical_sha256(
                 [identity.key for identity in identities]
             ),
-            "measurement_order": ["h2", "full_rgb", "sparse_rgb"],
+            "measurement_order": list(CONDITIONS),
+            "control_condition_timing_concurrent": False,
+            "maximum_concurrent_dpvo_instances": 1,
             "timer": "time_perf_counter_with_cuda_synchronize_boundaries",
             "start": "after_model_load_component_warmup_worker_online_ready_and_main_cuda_sync",
             "stop": "after_dpvo_terminate_worker_flush_ack_and_main_cuda_sync",
@@ -597,8 +634,8 @@ def _run_sequence(
             "wall_time_must_be_interpreted_with_trajectory_quality_and_graph_workload;"
             "a_shorter_h2_runtime_is_not_automatically_a_compute_efficiency_improvement"
         ),
+        "trajectory_execution": trajectory_execution,
     }
-    all_store.close(); true_store.close(); shutil.rmtree(reference_temp)
     return {
         "evaluation_role": ("predictor_development_in_sequence_feasibility"
                             if sequence == TRAINING_SEQUENCE else "frozen_predictor_zero_shot"),
@@ -609,17 +646,23 @@ def _run_sequence(
         "conditions": conditions, "efficiency": efficiency,
         "feature_diagnostics": diagnostics,
         "offline_reference": {
-            "created_after_strict_deployment": True,
-            "block5_extraction": all_extraction,
-            "true_fmap_extraction": true_extraction,
-            "robust_correspondence": robust_meta,
+            "closed_before_strict_deployment": True,
+            "control_workers_released_before_strict_deployment": True,
+            "oracle_condition_timing_scopes": oracle_row.get(
+                "condition_timing_scopes"
+            ),
+            **oracle_row["offline_reference"],
         },
     }
 
 
 def run(sequences: Sequence[str]) -> dict[str, Any]:
+    command_started = time.perf_counter()
     config, config_path = load_config()
     requested = resolve_sequences(sequences, config["experiment"]["default_sequences"])
+    formal_runtime = initialize_formal_main_process(
+        required_logical_devices=(0, 1, 2),
+    )
     root = repo_path(config["paths"]["output_root"])
     root.parent.mkdir(parents=True, exist_ok=True)
     calibration = np.loadtxt(repo_path(config["paths"]["calibration"]), delimiter=" ")
@@ -652,15 +695,25 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         (staged_root / "sequences").mkdir(parents=True)
         checkpoint_path = staged_root / "predictor.pt"
         index = empty_index("h2_prediction", requested)
+        layout = cpu_numa_layout(formal_runtime["hardware"])
+        schedule_stage_c = fixed_cpu_profile(layout)["stage_c"]
+        schedule_rows, training_schedule_execution = run_sequential_trajectory_jobs(
+            [{"kind": "materialize_schedule", "records": training_records,
+              "calibration": calibration, "config": config,
+              "sequence": TRAINING_SEQUENCE}],
+            temporary / "h2_training_schedule", cpu_profile=schedule_stage_c,
+            hardware=formal_runtime["hardware"],
+        )
+        training_bootstrap = schedule_rows[0]["schedule"]
 
         with PersistentPerformanceAudit(
             "h2_prediction", "canonical_predictor_training",
             components=("predictor_bridge_training_main_process",),
         ) as training_performance:
             with training_performance.phase("schedule_and_split"):
-                bootstrap = materialize_schedule(training_records, calibration, config)
                 training = _predictor_training_details(
-                    training_records, int(bootstrap["bootstrap_end_candidate_index"]),
+                    training_records,
+                    int(training_bootstrap["bootstrap_end_candidate_index"]),
                     calibration, config, training_base,
                 )
                 development = (
@@ -668,9 +721,10 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 )
                 training_temp = temporary / "predictor_training"
             with training_performance.phase("development_jepa_extraction"):
-                dev_store, dev_extraction = extract_block5_store(
+                dev_store, dev_extraction = extract_parallel(
                     training_records, _unique_identities(development), calibration,
                     config, training_temp, training["transform"],
+                    devices=(0, 1, 2),
                 )
             with training_performance.phase("train_only_threshold_calibration"):
                 mask = torch.from_numpy(
@@ -681,22 +735,84 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                     training["transform"], mask,
                 )
             with training_performance.phase("development_correspondence_precompute"):
-                robust_dev, robust_dev_meta = build_robust_correspondence_store(
+                robust_dev, robust_dev_meta = correspondence_parallel(
                     development, dev_store, training["transform"], mask, thresholds,
+                    training_temp / "correspondence", devices=(0, 1, 2),
                 )
+            with training_performance.phase("resident_initialization"):
+                resident_dev = None
+                try:
+                    resident_dev = ResidentH2View(
+                        dev_store, development, device=torch.device("cuda:1"),
+                    )
+                    resident_robust = resident_correspondence(
+                        robust_dev, torch.device("cuda:1"),
+                    )
+                except torch.cuda.OutOfMemoryError as error:
+                    if resident_dev is not None:
+                        try:
+                            owner_cleanup = resident_dev.rows._release_owned(
+                                synchronize=True,
+                            )
+                        except BaseException as cleanup_error:
+                            owner_cleanup = {
+                                "resident_tensors_cleared": False,
+                                "errors": [
+                                    f"{type(cleanup_error).__name__}: {cleanup_error}",
+                                ],
+                            }
+                        setattr(
+                            error, "phase1_feature_resident_cleanup", owner_cleanup,
+                        )
+                    raise
+                torch.cuda.synchronize(torch.device("cuda:1"))
+                correspondence_footprint = tensor_footprint({
+                    f"interval_{interval_index}.{field}": getattr(row, field)
+                    for interval_index, row in resident_robust.rows.items()
+                    for field in row.__dataclass_fields__
+                })
             with training_performance.phase("tiny_overfit"):
                 tiny = tiny_overfit(
-                    dev_store, training["split"]["train"], training["transform"],
-                    mask, config, robust_dev,
+                    resident_dev, training["split"]["train"], training["transform"],
+                    mask, config, resident_robust,
                 )
             with training_performance.phase("predictor_training"):
                 training_batch_performance = PerformanceRecorder(enable_cuda=True)
                 validation_batch_performance = PerformanceRecorder(enable_cuda=True)
                 predictor, training_summary = train_predictor(
-                    dev_store, training["split"], training["transform"], mask,
-                    config, robust_dev, profiler=training_batch_performance,
+                    resident_dev, training["split"], training["transform"], mask,
+                    config, resident_robust, profiler=training_batch_performance,
                     validation_profiler=validation_batch_performance,
                 )
+            residency = dict(resident_dev.rows.diagnostics)
+            residency["full_development_residency"] = (
+                residency["resident_rows"] == residency["allowed_rows"]
+            )
+            residency["correspondence_resident"] = True
+            residency["correspondence_footprint"] = correspondence_footprint
+            residency["correspondence_resident_bytes"] = correspondence_footprint[
+                "unique_storage_bytes"
+            ]
+            try:
+                residency["allocated_after_bytes"] = int(
+                    torch.cuda.memory_allocated(torch.device("cuda:1"))
+                )
+                residency["reserved_after_bytes"] = int(
+                    torch.cuda.memory_reserved(torch.device("cuda:1"))
+                )
+                residency["memory_telemetry_error"] = None
+            except Exception as error:
+                residency["allocated_after_bytes"] = residency["allocated_before_bytes"]
+                residency["reserved_after_bytes"] = residency["reserved_before_bytes"]
+                residency["memory_telemetry_error"] = f"{type(error).__name__}: {error}"
+            residency["allocated_delta_bytes"] = (
+                residency["allocated_after_bytes"] - residency["allocated_before_bytes"]
+            )
+            residency["reserved_delta_bytes"] = (
+                residency["reserved_after_bytes"] - residency["reserved_before_bytes"]
+            )
+            resident_dev.close()
+            del resident_robust
             with training_performance.phase("checkpoint_save_and_validation"):
                 lineage = dict(training["lineage"])
                 lineage["train_only_calibration_sha256"] = thresholds["calibration_sha256"]
@@ -744,8 +860,26 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                     )
         training_performance_payload = training_performance.payload()
         add_cuda_worker_mapping(
-            training_performance_payload, dev_extraction["jepa"],
+            training_performance_payload, dev_extraction["workers"][0],
         )
+        training_performance_payload["formal_hardware"] = formal_runtime
+        training_performance_payload["training_runtime"] = runtime_provenance(
+            formal_runtime["runtime_settings"], component="h2_predictor_post_training",
+            model=predictor, amp=True,
+        )
+        training_performance_payload["execution_backend_provenance"] = execution_provenance()
+        training_performance_payload["residency"] = residency
+        training_performance_payload["efficiency"] = {
+            "domain": "research_throughput",
+            "parallel_preparation_seconds": dev_extraction["elapsed_seconds"],
+            "parallel_correspondence_seconds": robust_dev_meta["elapsed_seconds"],
+            "resident_training_wall_seconds": training_summary["elapsed_seconds"],
+            "resident_epoch_wall_seconds": [
+                row["epoch_wall_seconds"] for row in training_summary["history"]
+            ],
+            "formal_measurement": True,
+            "ddp": "not_implemented; resident path preserves canonical batch and optimizer semantics",
+        }
         training_performance_payload["training_throughput"] = {
             "training_batches": training_batch_performance.payload(),
             "validation_batches": validation_batch_performance.payload(),
@@ -776,15 +910,118 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             "test_correspondence": robust_test_meta,
             "stores_closed_before_deployment": stores_closed,
             "performance_diagnostics": training_performance_payload,
+            "execution_backend_provenance": execution_provenance(),
+            "formal_hardware": formal_runtime,
         }
         del test_teacher
         del test_teacher_store
         del dev_store, test_store
+        del robust_test, robust_dev
         predictor_sha256 = sha256_file(checkpoint_path)
         records_by_sequence: dict[str, Sequence[Any]] = {TRAINING_SEQUENCE: training_records}
+        evaluation_by_sequence = {}
+        bridge_state = {
+            name: value.detach().cpu().clone() for name, value in bridge.state_dict().items()
+        }
+        predictor_state = {
+            name: value.detach().cpu().clone() for name, value in predictor.state_dict().items()
+        }
+        bridge.cpu(); predictor.cpu(); del mask
+        del bridge, predictor, resident_dev
+        schedule_cleanup = release_cuda_training_state()
+        require_lifecycle_cleanup(schedule_cleanup)
+        nontraining_records = {
+            sequence: load_sequence_records(config, sequence)
+            for sequence in requested if sequence != TRAINING_SEQUENCE
+        }
+        if nontraining_records:
+            rows, evaluation_schedule_execution = run_sequential_trajectory_jobs(
+                [
+                    {"kind": "materialize_schedule", "records": records,
+                     "calibration": calibration, "config": config,
+                     "sequence": sequence}
+                    for sequence, records in nontraining_records.items()
+                ],
+                temporary / "h2_evaluation_schedules", cpu_profile=schedule_stage_c,
+                hardware=formal_runtime["hardware"],
+            )
+            evaluation_schedules = {row["sequence"]: row["schedule"] for row in rows}
+        else:
+            evaluation_schedule_execution = None
+            evaluation_schedules = {}
         for sequence in requested:
             if sequence not in records_by_sequence:
-                records_by_sequence[sequence] = load_sequence_records(config, sequence)
+                records_by_sequence[sequence] = nontraining_records[sequence]
+            records = records_by_sequence[sequence]
+            if sequence == TRAINING_SEQUENCE:
+                bootstrap_end = training["lineage"]["bootstrap_end_candidate_index"]
+            else:
+                bootstrap = evaluation_schedules[sequence]
+                bootstrap_end = int(bootstrap["bootstrap_end_candidate_index"])
+            evaluation = _evaluation_protocol(records, bootstrap_end, config)
+            transform_eval, geometry_eval = sequence_geometry(
+                evaluation["records"][0], calibration, config,
+            )
+            evaluation_by_sequence[sequence] = (
+                evaluation, transform_eval, geometry_eval,
+            )
+        cleanup_before_trajectories = release_cuda_training_state()
+        require_lifecycle_cleanup(cleanup_before_trajectories)
+        selected_profile = {
+            "schema": "phase1_h2_fixed_cpu_profile_v1",
+            "selection": "fixed_same_as_h0_h1",
+            "dynamic_calibration": False,
+            "components": fixed_cpu_profile(layout),
+        }
+        trajectory_tasks = []
+        for sequence in requested:
+            evaluation, transform_eval, _ = evaluation_by_sequence[sequence]
+            common = {
+                "records": evaluation["records"], "roles": evaluation["roles"],
+                "calibration": calibration, "config": config,
+            }
+            trajectory_tasks.extend((
+                {"kind": "formal_h2_full", **common},
+                {"kind": "formal_h2_sparse", **common},
+                {"kind": "formal_h2_representation_control", **common,
+                 "condition": "oracle_jepa_hidden_reference",
+                 "intervals": evaluation["intervals"], "transform": transform_eval,
+                 "thresholds": thresholds, "bridge_state": bridge_state,
+                 "predictor_state": predictor_state},
+                {"kind": "formal_h2_representation_control", **common,
+                 "condition": "anchor_jepa_only",
+                 "intervals": evaluation["intervals"], "transform": transform_eval,
+                 "thresholds": thresholds, "bridge_state": bridge_state,
+                 "predictor_state": predictor_state},
+                {"kind": "formal_h2_predicted", **common,
+                 "intervals": evaluation["intervals"], "transform": transform_eval,
+                 "thresholds": thresholds, "bridge_state": bridge_state,
+                 "predictor_state": predictor_state,
+                 "predictor_checkpoint": str(checkpoint_path),
+                 "predictor_state_hash": predictor_state_sha256(predictor_state),
+                 "pipeline_cpu_profile": selected_profile,
+                 "execution": dataclasses.asdict(FormalExecution())},
+            ))
+        with PersistentPerformanceAudit(
+            "h2_prediction", "sequential_trajectory_evaluation",
+            components=("formal_coordinator",),
+        ) as trajectory_performance:
+            with trajectory_performance.phase("sequential_gpu0_trajectories"):
+                trajectory_rows, trajectory_execution = run_sequential_trajectory_jobs(
+                    trajectory_tasks, temporary / "h2_trajectory_jobs",
+                    cpu_profile=selected_profile["components"]["stage_c"],
+                    hardware=formal_runtime["hardware"],
+                )
+        trajectory_performance_payload = trajectory_performance.payload()
+        trajectory_performance_payload["sequential_evaluation"] = trajectory_execution
+        trajectory_performance_payload["diagnosis"] = performance_diagnosis(
+            trajectory_performance_payload
+        )
+        trajectories_by_sequence = {sequence: [] for sequence in requested}
+        for row in trajectory_rows:
+            trajectories_by_sequence[row["sequence"]].append(row)
+        predicted_sequence_components = {}
+        for sequence in requested:
             records = records_by_sequence[sequence]
             base, provenance = base_lineage(
                 config, sequence, evaluation_source_files,
@@ -803,35 +1040,39 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                     "dpvo_checkpoint_sha256": provenance["config_protocol"]["dpvo_checkpoint_sha256"],
                     "vjepa_checkpoint_sha256": config["jepa"]["checkpoint_sha256"],
                 },
+                "execution_backend_provenance": execution_provenance(),
+                "formal_hardware": formal_runtime,
             }
-            if sequence == TRAINING_SEQUENCE:
-                bootstrap_end = training["lineage"]["bootstrap_end_candidate_index"]
-            else:
-                bootstrap = materialize_schedule(records, calibration, config)
-                bootstrap_end = int(bootstrap["bootstrap_end_candidate_index"])
-            evaluation = _evaluation_protocol(records, bootstrap_end, config)
-            transform_eval, geometry_eval = sequence_geometry(
-                evaluation["records"][0], calibration, config,
-            )
-            bridge_eval = build_bridge(
-                transform_eval, channels=int(config["bridge"]["hidden_channels"]),
-            ).cuda().eval()
-            bridge_eval.load_state_dict(bridge.state_dict(), strict=True)
-            bridge_eval.requires_grad_(False)
+            evaluation, transform_eval, geometry_eval = evaluation_by_sequence[sequence]
             sequence_temp = temporary / f"sequence_work_{sequence}"
             sequence_temp.mkdir()
             output = staged_root / "sequences" / sequence
             with PersistentPerformanceAudit(
                 "h2_prediction", f"sequence:{sequence}",
-                components=("dpvo_predictor_bridge_main_process",),
+                components=("artifact_assembly_main_process",),
             ) as performance:
                 with performance.phase("sequence_evaluation_and_artifact_generation"):
+                    sequence_started = time.perf_counter()
                     result = _run_sequence(
                         evaluation["records"], evaluation["roles"],
                         evaluation["intervals"], evaluation["schedule"], calibration,
-                        transform_eval, bridge_eval, predictor, thresholds, config,
+                        transform_eval, thresholds, config,
                         sequence_temp, output,
+                        predictor_checkpoint=checkpoint_path,
+                        condition_rows=trajectories_by_sequence[sequence],
+                        trajectory_execution=trajectory_execution,
                     )
+                    sequence_total_seconds = time.perf_counter() - sequence_started
+            online_seconds = float(
+                result["conditions"]["predicted_jepa_hidden"]["runtime"][
+                    "elapsed_seconds"
+                ]
+            )
+            predicted_sequence_components[sequence] = {
+                "online_pipeline_seconds": online_seconds,
+                "artifact_and_evaluation_seconds": sequence_total_seconds,
+                "total_seconds": sequence_total_seconds + online_seconds,
+            }
             performance_payload = performance.payload()
             performance_payload["condition_runtime"] = condition_runtime_diagnostics(result)
             worker_usage = result["conditions"]["predicted_jepa_hidden"]["runtime"][
@@ -839,6 +1080,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             ]
             add_cuda_worker_mapping(performance_payload, {
                 "worker_pid": worker_usage.get("jepa_worker_pid"),
+                "physical_device": 2,
                 "logical_cuda_ordinal": worker_usage.get(
                     "jepa_worker_logical_cuda_ordinal", 0,
                 ),
@@ -850,6 +1092,8 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 "h2_stage_profile"
             ].get("transfer_ipc")
             performance_payload["diagnosis"] = performance_diagnosis(performance_payload)
+            performance_payload["execution_backend_provenance"] = execution_provenance()
+            performance_payload["formal_hardware"] = formal_runtime
             result["performance_diagnostics"] = performance_payload
             result["coordinate_transform"] = geometry_eval
             result["effective_population"] = evaluation["effective_population"]
@@ -861,22 +1105,76 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 output, "h2_prediction", lineage,
                 bootstrap_end_candidate_index=result["schedule"]["bootstrap_end_candidate_index"],
             )
-            del bridge_eval
-            torch.cuda.empty_cache()
 
         index["canonical_checkpoint"] = {
             "file": "predictor.pt", "file_sha256": sha256_file(checkpoint_path),
-            "state_dict_sha256": predictor_state_sha256(predictor.state_dict()),
+            "state_dict_sha256": predictor_state_sha256(predictor_state),
             "training_lineage_sha256": checkpoint["training_lineage"]["training_lineage_sha256"],
             "h1_bridge_sha256": bridge_meta["file_sha256"],
             "training": training_record,
+        }
+        predicted_seconds = sum(
+            float(json.loads(
+                (staged_root / "sequences" / sequence / "results.json").read_text()
+            )["result"]["conditions"]["predicted_jepa_hidden"]["runtime"]["elapsed_seconds"])
+            for sequence in requested
+        )
+        component_estimate = {
+            "parallel_development_extraction_seconds": dev_extraction["elapsed_seconds"],
+            "parallel_correspondence_seconds": robust_dev_meta["elapsed_seconds"],
+            "resident_predictor_training_seconds": training_summary["elapsed_seconds"],
+            "sequential_trajectory_makespan_seconds": trajectory_execution["makespan_seconds"],
+            "schedule_materialization_seconds": float(
+                training_schedule_execution["makespan_seconds"]
+            ) + float(
+                (evaluation_schedule_execution or {}).get("makespan_seconds", 0.0)
+            ),
+            "artifact_and_evaluation_seconds": sum(
+                row["artifact_and_evaluation_seconds"]
+                for row in predicted_sequence_components.values()
+            ),
+        }
+        measured_training_scope = float(
+            training_performance_payload.get("cpu_wall", {})
+            .get("outer", {}).get("total_ms", 0.0)
+        ) / 1000.0
+        component_estimate["other_training_validation_and_test_seconds"] = max(
+            0.0,
+            measured_training_scope
+            - float(dev_extraction["elapsed_seconds"])
+            - float(robust_dev_meta["elapsed_seconds"])
+            - float(training_summary["elapsed_seconds"]),
+        )
+        component_estimate["estimated_formal_wall_seconds"] = sum(
+            float(value) for value in component_estimate.values()
+        )
+        total_makespan = time.perf_counter() - command_started
+        index["execution"] = {
+            "schema": "phase1_formal_execution_summary_v1",
+            "hardware": formal_runtime,
+            "provenance": execution_provenance(),
+            "parallel_preparation": dev_extraction,
+            "parallel_correspondence": robust_dev_meta,
+            "training_schedule_materialization": training_schedule_execution,
+            "evaluation_schedule_materialization": evaluation_schedule_execution,
+            "cleanup_before_evaluation_schedules": schedule_cleanup,
+            "sequential_trajectory_execution": trajectory_execution,
+            "trajectory_performance": trajectory_performance_payload,
+            "residency": residency,
+            "cpu_numa_profile": selected_profile,
+            "cleanup_before_trajectories": cleanup_before_trajectories,
+            "predicted_jepa_sequence_policy": "sequential_exclusive_three_gpu_pipeline",
+            "predicted_jepa_total_seconds": predicted_seconds,
+            "predicted_jepa_sequence_components": predicted_sequence_components,
+            "formal_h2_component_wall_estimate": component_estimate,
+            "total_makespan_seconds": total_makespan,
+            "domain": "research_and_online_deployment_reported_separately",
         }
         write_registry_and_summary(staged_root, "h2_prediction", index)
         validate_module_manifest(staged_root, "h2_prediction", index)
         if sha256_file(repo_path(config["paths"]["h1_bridge"])) != bridge_meta["file_sha256"]:
             raise RuntimeError("canonical H1 bridge changed during H2 run; run run_h2 again")
         publish_current_canonical(staged_root, root)
-        del predictor, bridge
         torch.cuda.empty_cache()
     return {
         "status": "complete",

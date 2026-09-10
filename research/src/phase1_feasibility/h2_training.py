@@ -29,7 +29,8 @@ from .transport import (
 )
 
 def _field(store: Any, identity: FrameIdentity, transform: Any, device: torch.device) -> torch.Tensor:
-    tokens = torch.from_numpy(store.get(identity)).to(device)
+    tokens = (store.get_tensor(identity).to(device) if hasattr(store, "get_tensor")
+              else torch.from_numpy(store.get(identity)).to(device))
     return tokens_to_field(tokens[None], transform)[0]
 
 
@@ -86,7 +87,9 @@ def build_robust_correspondence_store(intervals: Sequence[AnchorInterval], store
     for interval in intervals:
         j0 = _field(store, interval.anchor0, transform, mask.device)[None]
         j1 = _field(store, interval.anchor1, transform, mask.device)[None]
-        result.put(interval, estimate_robust_correspondence(j0, j1, mask, calibration))
+        result.put(interval, estimate_robust_correspondence(
+            j0, j1, mask, calibration,
+        ))
     return result, {"interval_count": len(intervals), "endpoint_only": True,
                     "contains_hidden_target": False, "elapsed_seconds": time.perf_counter()-started,
                     "protocol": robust_protocol_metadata(calibration)}
@@ -102,8 +105,8 @@ def _transport_batch(intervals: Sequence[AnchorInterval], store: Any, transform:
                      mask: torch.Tensor, robust: RobustCorrespondenceStore, *,
                      profiler: Any | None = None,
                      ) -> tuple[TransportResult, torch.Tensor, torch.Tensor, torch.Tensor]:
-    scope = (contextlib.nullcontext() if profiler is None
-             else profiler.stage("batch_data_memmap_h2d"))
+    stage = "resident_batch_gather" if hasattr(store, "get_tensor") else "batch_data_memmap_h2d"
+    scope = contextlib.nullcontext() if profiler is None else profiler.stage(stage)
     with scope:
         j0, j1, target, alpha, delta = [], [], [], [], []
         for interval in intervals:
@@ -202,6 +205,7 @@ def train_predictor(store: CompactFeatureStore, split: Mapping[str, Sequence[Anc
     scaler = torch.cuda.amp.GradScaler(enabled=True); best, best_value, best_epoch = None, float("inf"), -1
     history = []; started = time.perf_counter(); torch.cuda.reset_peak_memory_stats()
     for epoch in range(30):
+        epoch_started = time.perf_counter()
         model.train(); total = 0.; count = 0
         for batch in _batches(split["train"], 2, 1234+epoch):
             if profiler is not None: profiler.begin_outer()
@@ -231,15 +235,19 @@ def train_predictor(store: CompactFeatureStore, split: Mapping[str, Sequence[Anc
             model, split["validation"], store, transform, mask, robust,
             profiler=validation_profiler,
         )
-        history.append({"epoch": epoch+1, "train_total": total/count, "validation_total": validation["total"]})
+        history.append({"epoch": epoch+1, "train_total": total/count,
+                        "validation_total": validation["total"],
+                        "epoch_wall_seconds": time.perf_counter()-epoch_started})
         if validation["total"] < best_value:
             best_value, best_epoch = validation["total"], epoch+1
             best = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     if best is None: raise RuntimeError("no validation checkpoint selected")
     model.load_state_dict(best); model.requires_grad_(False).eval()
-    return model, {"best_epoch": best_epoch, "best_validation_total": best_value, "history": history,
+    summary = {"best_epoch": best_epoch, "best_validation_total": best_value, "history": history,
         "elapsed_seconds": time.perf_counter()-started, "peak_gpu_vram_bytes": int(torch.cuda.max_memory_allocated()),
         "test_was_read_during_training_or_selection": False}
+    del optimizer, scaler, best, sample, alpha, delta
+    return model, summary
 
 
 class MetricAccumulator:

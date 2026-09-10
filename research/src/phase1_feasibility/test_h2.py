@@ -13,6 +13,7 @@ import numpy as np
 import torch
 
 from . import h2_deployment
+from . import run_h2
 from .h2_deployment import DelayedDeploymentProvider
 from .jepa_runtime import CompactFeatureStore, JepaSidecar, RestrictedFeatureView
 from .oracle_packet import FMapZeroContextPacket
@@ -97,6 +98,30 @@ class H2ContractTest(unittest.TestCase):
                         "dpvo_graph_runtime": {"total_ms": 4000.0},
                     },
                     "context_wait_ms": {"mean_ms": 250.0, "p95_ms": 400.0},
+                    "stage_c_timing": {
+                        "cpu_wall_exclusive": {
+                            name: {"total_ms": float(index + 1) * 10.0}
+                            for index, name in enumerate((
+                                "stage_c_queue_wait", "stage_c_transfer_wait",
+                                "bridge_compute", "native_frontend_compute",
+                                "dpvo_graph_compute", "dpvo_sync_wait",
+                                "stage_c_python_other",
+                            ))
+                        },
+                        "cuda_event": {
+                            "bridge_compute": {"total_ms": 30.0},
+                            "native_frontend_compute": {"total_ms": 40.0},
+                            "dpvo_graph_compute": {"total_ms": 50.0},
+                        },
+                        "queue_wait_breakdown": {
+                            "prediction_ready_wait": {"total_ms": 1.0},
+                            "consume_queue_wait": {"total_ms": 2.0},
+                            "worker_flush_wait": {"total_ms": 3.0},
+                        },
+                    },
+                    "producer_queue_backpressure": {
+                        "total_ms": 4.0, "p95_ms": 2.0,
+                    },
                 },
                 "break_even_uplink_bandwidth": {
                     "status": "finite", "break_even_uplink_bandwidth_mbps": 8.0,
@@ -207,8 +232,9 @@ class H2ContractTest(unittest.TestCase):
 
     def test_h2_metadata_is_delayed_and_only_prediction_is_strict(self) -> None:
         self.assertEqual(CONDITIONS, (
-            "full_rgb_reference", "sparse_rgb_reference", "anchor_jepa_only",
-            "oracle_jepa_hidden_reference", "predicted_jepa_hidden",
+            "full_rgb_reference", "sparse_rgb_reference",
+            "oracle_jepa_hidden_reference", "anchor_jepa_only",
+            "predicted_jepa_hidden",
         ))
         metadata = _metadata()
         strict = [name for name, value in metadata.items() if value["strict_deployment"]]
@@ -263,6 +289,8 @@ class H2ContractTest(unittest.TestCase):
         self.assertIn("Full RGB 10.000 s; H2 12.000 s", summary)
         self.assertIn("JEPA encoder 1.000 s; predictor 2.000 s", summary)
         self.assertIn("context wait mean 250.00 ms; P95 400.00 ms", summary)
+        self.assertIn("DPVO graph CUDA-event span 4.000 s", summary)
+        self.assertIn("Producer queue backpressure: 4.00 ms total", summary)
         self.assertIn("8.000 Mbps", summary)
 
     def test_sequence_summary_is_atomic_and_contains_no_low_frequency_details(self) -> None:
@@ -338,6 +366,53 @@ class H2ContractTest(unittest.TestCase):
         self.assertEqual(payload["profiled_stage_subtotal_ms"], 3.0)
         self.assertEqual(payload["context_wait_ms"]["total_ms"], 300.0)
 
+    def test_stage_c_cpu_categories_reconcile_and_cuda_is_separate(self) -> None:
+        profiler = OnlineProfiler()
+        samples = {
+            "stage_c_queue_wait": 2.0,
+            "stage_c_transfer_wait": 3.0,
+            "bridge_compute": 5.0,
+            "native_frontend_compute": 7.0,
+            "dpvo_graph_compute": 11.0,
+            "dpvo_sync_wait": 13.0,
+            "stage_c_python_other": 17.0,
+        }
+        for category, value in samples.items():
+            profiler.add_stage_c_cpu(category, value)
+        profiler.add_stage_c_cuda("dpvo_graph_compute", 101.0)
+        profiler.finalize_stage_c(100.0)
+        timing = profiler.payload(peak_online_vram_bytes=0)["stage_c_timing"]
+        self.assertAlmostEqual(timing["exclusive_cpu_total_ms"], 100.0)
+        self.assertAlmostEqual(timing["reconciliation_error_ms"], 0.0)
+        self.assertAlmostEqual(
+            timing["cpu_wall_exclusive"]["stage_c_python_other"]["total_ms"],
+            59.0,
+        )
+        self.assertEqual(
+            timing["cuda_event"]["dpvo_graph_compute"]["total_ms"], 101.0,
+        )
+        self.assertTrue(timing["cpu_and_cuda_domains_must_not_be_added"])
+
+    def test_formal_h2_uses_fixed_cpu_profiles(self) -> None:
+        source = inspect.getsource(run_h2.run)
+        self.assertIn('"selection": "fixed_same_as_h0_h1"', source)
+        self.assertIn('"dynamic_calibration": False', source)
+        self.assertIn('"components": fixed_cpu_profile(layout)', source)
+        self.assertIn(
+            'cpu_profile=selected_profile["components"]["stage_c"]', source,
+        )
+
+    def test_dpvo_timing_excludes_packet_conversion_and_explicit_sync(self) -> None:
+        source = inspect.getsource(run_deployment_observations)
+        conversion = source.index("native_packet = packet_to_native")
+        graph = source.index("slam.track_packet")
+        self.assertLess(conversion, graph)
+        self.assertIn('"stage_c_python_other"', source[conversion - 500:graph])
+        self.assertIn('"dpvo_graph_compute"', source[graph:graph + 800])
+        self.assertIn('"dpvo_sync_wait"', source[graph:graph + 1200])
+        self.assertIn("CUDA event span bounded immediately", source)
+        self.assertIn("host dispatch gaps inside those calls", source)
+
     def test_sidecar_online_ready_and_flush_handshakes(self) -> None:
         sidecar = JepaSidecar.__new__(JepaSidecar)
         sidecar.process = SimpleNamespace(stdin=io.StringIO())
@@ -357,7 +432,7 @@ class H2ContractTest(unittest.TestCase):
     def test_cross_process_timer_barrier_order_is_explicit(self) -> None:
         source = inspect.getsource(run_deployment_observations)
         self.assertLess(source.index("worker_barrier.prepare_online"),
-                        source.index("started = time.perf_counter()"))
+                        source.index("matched_started = time.perf_counter()"))
         self.assertLess(source.index("worker_barrier.flush_online"),
                         source.index("elapsed_seconds = float"))
         self.assertIn("main_cuda_synchronized_after_worker_flush_before_stop", source)
@@ -507,9 +582,11 @@ class H2ContractTest(unittest.TestCase):
         self.assertIn('"fmap_target": "offline_true_fmap_teacher"', held_out_source)
 
         sequence_source = inspect.getsource(run_h2._run_sequence)
-        self.assertLess(sequence_source.index("predicted_runtime, predicted_arrays"),
-                        sequence_source.index("true_store, true_extraction"))
-        self.assertIn('"created_after_strict_deployment": True', sequence_source)
+        run_source = inspect.getsource(run_h2.run)
+        self.assertIn('"closed_before_strict_deployment": True', sequence_source)
+        self.assertNotIn("run_formal_jobs(", sequence_source)
+        self.assertIn("run_sequential_trajectory_jobs(", run_source)
+        self.assertIn('"maximum_concurrent_dpvo_instances": 1', sequence_source)
 
     def test_checkpoint_recipe_and_h1_bridge_lineage_remain_canonical(self) -> None:
         from . import run_h2
@@ -523,6 +600,92 @@ class H2ContractTest(unittest.TestCase):
         weights = torch.tensor([1.0, 2.0, 3.0])
         expected = weights.sum().square() / (weights.square().sum() + 1e-6)
         self.assertTrue(torch.allclose(effective_sample_count(weights), expected))
+
+    def test_formal_h2_uses_residency_parallel_precompute_and_canonical_pipeline(self) -> None:
+        from . import run_h2
+        source = inspect.getsource(run_h2.run)
+        self.assertIn("extract_parallel(", source)
+        self.assertIn("correspondence_parallel(", source)
+        self.assertIn("ResidentH2View(", source)
+        replay = inspect.getsource(run_h2._run_strict_replay)
+        self.assertIn("CanonicalH2Pipeline(", replay)
+        self.assertNotIn("DelayedDeploymentProvider(", replay)
+
+    def test_formal_h2_mapping_and_trace_defaults_are_canonical(self) -> None:
+        from dataclasses import asdict
+        from .execution_runtime import FormalExecution, fixed_cpu_profile
+        execution = FormalExecution()
+        self.assertEqual(
+            (execution.encoder_device, execution.predictor_device,
+             execution.consumer_device),
+            ("2", "1", "0"),
+        )
+        self.assertEqual(FormalExecution(**asdict(execution)), execution)
+        self.assertFalse(execution.verify_transfers)
+        self.assertFalse(execution.decision_trace)
+        layout = {
+            "stage_c": {"device": 0, "numa_node": 0, "cpus": [0, 1, 2, 3]},
+            "predictor": {"device": 1, "numa_node": 1, "cpus": [4, 5]},
+            "encoder": {"device": 2, "numa_node": 1, "cpus": [6, 7, 8]},
+        }
+        components = fixed_cpu_profile(layout)
+        for name, threads in (("stage_c", 4), ("predictor", 1), ("encoder", 1)):
+            with self.subTest(component=name):
+                self.assertEqual(components[name], {
+                    **layout[name], "intraop_threads": threads, "interop_threads": 1,
+                    "omp_num_threads": threads, "mkl_num_threads": threads,
+                })
+        sets = [set(components[name]["cpus"])
+                for name in ("stage_c", "predictor", "encoder")]
+        self.assertFalse(sets[0] & sets[1])
+        self.assertFalse(sets[0] & sets[2])
+        self.assertFalse(sets[1] & sets[2])
+
+    def test_h2_formal_trajectory_order_is_sequence_major_and_serial(self) -> None:
+        from . import run_h2
+        source = inspect.getsource(run_h2.run)
+        positions = [source.index(f'"condition": "{name}"')
+                     for name in ("oracle_jepa_hidden_reference", "anchor_jepa_only")]
+        self.assertLess(*positions)
+        self.assertIn('"kind": "formal_h2_full"', source)
+        self.assertIn('"kind": "formal_h2_sparse"', source)
+        self.assertIn('"kind": "formal_h2_predicted"', source)
+        self.assertNotIn("ThreadPoolExecutor", source)
+
+    def test_correspondence_decision_trace_has_exact_discrete_contract(self) -> None:
+        from .transport import (
+            decision_trace_payload, estimate_robust_correspondence,
+            robust_transport_interpolation,
+        )
+        torch.manual_seed(9)
+        left = torch.randn(1, 8, 4, 4)
+        right = left + 0.01 * torch.randn_like(left)
+        mask = torch.ones(4, 4, dtype=torch.bool)
+        calibration = {
+            "max_displacement_chebyshev_tokens": 4,
+            "similarity_min": -1.0,
+            "margin_min": -1.0,
+            "margin_scale": 1.0,
+            "cycle_max_tokens": 100.0,
+        }
+        trace = {}
+        correspondence = estimate_robust_correspondence(
+            left, right, mask, calibration, decision_trace=trace,
+        )
+        robust_transport_interpolation(
+            left, right, torch.tensor([0.5]), correspondence, mask,
+            decision_trace=trace,
+        )
+        payload = decision_trace_payload(trace)
+        fields = payload["fields"]
+        for name in (
+            "selected_top2_indices_0_to_1", "selected_top2_indices_1_to_0",
+            "candidate_mask_0", "candidate_mask_1", "accepted_mask_0",
+            "accepted_mask_1", "global_fallback_0", "global_fallback_1",
+            "local_fallback_0", "local_fallback_1", "transport_fallback_mask",
+        ):
+            self.assertIn(name, fields)
+            self.assertEqual(len(fields[name]["sha256"]), 64)
 
 
 if __name__ == "__main__":

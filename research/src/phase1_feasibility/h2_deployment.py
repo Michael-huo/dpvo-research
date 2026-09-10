@@ -174,7 +174,10 @@ class DelayedDeploymentProvider:
         fmap, elapsed = cuda_call_ms(
             lambda: self.bridge(field.flatten(2).transpose(1, 2)),
         )
+        bridge_cpu_ms = (time.perf_counter() - started) * 1000.0
         self.profiler.add("bridge", elapsed)
+        self.profiler.add_stage_c_cpu("bridge_compute", bridge_cpu_ms)
+        self.profiler.add_stage_c_cuda("bridge_compute", elapsed)
         packet_started = time.perf_counter()
         packet = FMapZeroContextPacket(fmap[:, None])
         if self.transfer_ledger is not None:

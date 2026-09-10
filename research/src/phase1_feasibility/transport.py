@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
@@ -119,7 +120,9 @@ def _top2_direction(similarity: torch.Tensor, valid: torch.Tensor,
 def sparse_candidate_statistics(j0: torch.Tensor, j1: torch.Tensor,
                                 valid_mask: torch.Tensor,
                                 max_displacement: int | None = None, *,
-                                profiler: Any | None = None) -> dict[str, torch.Tensor]:
+                                profiler: Any | None = None,
+                                decision_trace: dict[str, Any] | None = None,
+                                ) -> dict[str, torch.Tensor]:
     if j0.shape != j1.shape or j0.ndim != 4:
         raise ValueError("candidate statistics require equal [B,C,H,W] fields")
     batch, _, height, width = j0.shape
@@ -147,6 +150,11 @@ def sparse_candidate_statistics(j0: torch.Tensor, j1: torch.Tensor,
                 "similarity_peak": peak, "peak_margin": margin, "cycle_error": cycle}
     with _profile_stage(profiler, "bidirectional_topk_correspondence"):
         rows0, rows1 = directed(forward, reverse), directed(reverse, forward)
+    if decision_trace is not None:
+        decision_trace["selected_top2_indices_0_to_1"] = forward[0].detach()
+        decision_trace["selected_top2_indices_1_to_0"] = reverse[0].detach()
+        decision_trace["candidate_mask_0"] = rows0["candidate_mask"].detach()
+        decision_trace["candidate_mask_1"] = rows1["candidate_mask"].detach()
     return {f"{name}_0": value for name, value in rows0.items()} | {
         f"{name}_1": value for name, value in rows1.items()}
 
@@ -234,6 +242,7 @@ def effective_sample_count(weights: torch.Tensor) -> torch.Tensor:
 def _smooth_direction(statistics: Mapping[str, torch.Tensor], suffix: str,
                       valid_mask: torch.Tensor, calibration: Mapping[str, Any]
                       , *, profiler: Any | None = None
+                      , decision_trace: dict[str, Any] | None = None
                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     displacement = statistics[f"displacement_{suffix}"]
     batch, _, _ = displacement.shape; height, width = valid_mask.shape
@@ -253,12 +262,15 @@ def _smooth_direction(statistics: Mapping[str, torch.Tensor], suffix: str,
     dense_displacements, dense_confidences = [], []
     ys = _coarse_axis(height, displacement.device, displacement.dtype)
     xs = _coarse_axis(width, displacement.device, displacement.dtype)
+    global_fallback = []
+    local_fallback = []
     for row in range(batch):
         with _profile_stage(profiler, "global_affine_estimation"):
             mask = accepted[row] & (sparse_confidence[row] > 0)
             source, sparse_displacement = coords[mask], displacement[row, mask]
             confidence = sparse_confidence[row, mask]
             coefficient = _weighted_affine(source, source + sparse_displacement, confidence)
+            global_fallback.append(coefficient is None)
             if coefficient is None:
                 dense_displacements.append(torch.zeros((height, width, 2), device=displacement.device))
                 dense_confidences.append(torch.zeros((height, width), device=displacement.device))
@@ -268,10 +280,14 @@ def _smooth_direction(statistics: Mapping[str, torch.Tensor], suffix: str,
                 ) @ coefficient - coords
                 sparse_residual = sparse_displacement - affine_displacement[mask]
         if coefficient is None:
+            local_fallback.append(torch.ones(
+                (len(ys), len(xs)), device=displacement.device, dtype=torch.bool,
+            ))
             continue
         with _profile_stage(profiler, "coarse_residual_estimation"):
             coarse_residual = torch.zeros((len(ys), len(xs), 2), device=displacement.device)
             coarse_confidence = torch.zeros((len(ys), len(xs)), device=displacement.device)
+            local_row = torch.ones((len(ys), len(xs)), device=displacement.device, dtype=torch.bool)
             for iy, gy in enumerate(ys):
                 for ix, gx in enumerate(xs):
                     distance = source - torch.stack((gx, gy)); local = distance.abs().amax(dim=-1) <= COARSE_RADIUS
@@ -286,6 +302,7 @@ def _smooth_direction(statistics: Mapping[str, torch.Tensor], suffix: str,
                         )
                     if local_count < 3:
                         continue
+                    local_row[iy, ix] = False
                     base = confidence[local] * torch.exp(-distance[local].square().sum(dim=-1) / (2 * COARSE_SIGMA ** 2))
                     residual = sparse_residual[local]
                     estimate = (base[:, None] * residual).sum(0) / base.sum().clamp_min(EPSILON)
@@ -304,20 +321,37 @@ def _smooth_direction(statistics: Mapping[str, torch.Tensor], suffix: str,
             valid = valid_mask.to(device=dense.device, dtype=torch.bool)
             dense_displacements.append(torch.where(valid[..., None], dense, torch.zeros_like(dense)))
             dense_confidences.append(torch.where(valid, confidence_dense.clamp(0, 1), torch.zeros_like(confidence_dense)))
+            local_fallback.append(local_row)
+    if decision_trace is not None:
+        decision_trace[f"accepted_mask_{suffix}"] = accepted.detach()
+        decision_trace[f"global_fallback_{suffix}"] = torch.tensor(
+            global_fallback, device=displacement.device, dtype=torch.bool,
+        )
+        if local_fallback:
+            decision_trace[f"local_fallback_{suffix}"] = torch.stack(local_fallback)
+        else:
+            decision_trace[f"local_fallback_{suffix}"] = torch.ones(
+                (batch, len(ys), len(xs)), device=displacement.device, dtype=torch.bool,
+            )
     return torch.stack(dense_displacements), torch.stack(dense_confidences), accepted.reshape(batch, height, width)
 
 
 def estimate_robust_correspondence(j0: torch.Tensor, j1: torch.Tensor,
                                    valid_mask: torch.Tensor,
                                    calibration: Mapping[str, Any], *,
-                                   profiler: Any | None = None) -> RobustCorrespondence:
+                                   profiler: Any | None = None,
+                                   decision_trace: dict[str, Any] | None = None,
+                                   ) -> RobustCorrespondence:
     statistics = sparse_candidate_statistics(j0, j1, valid_mask,
-        int(calibration["max_displacement_chebyshev_tokens"]), profiler=profiler)
+        int(calibration["max_displacement_chebyshev_tokens"]), profiler=profiler,
+        decision_trace=decision_trace)
     displacement0, confidence0, sparse0 = _smooth_direction(
         statistics, "0", valid_mask, calibration, profiler=profiler,
+        decision_trace=decision_trace,
     )
     displacement1, confidence1, sparse1 = _smooth_direction(
         statistics, "1", valid_mask, calibration, profiler=profiler,
+        decision_trace=decision_trace,
     )
     with _profile_stage(profiler, "correspondence_query_assembly"):
         result = RobustCorrespondence(
@@ -367,7 +401,9 @@ def forward_soft_splat(raw_field: torch.Tensor, displacement: torch.Tensor,
 def robust_transport_interpolation(j0: torch.Tensor, j1: torch.Tensor, alpha: torch.Tensor,
                                    correspondence: RobustCorrespondence,
                                    valid_mask: torch.Tensor, *,
-                                   profiler: Any | None = None) -> TransportResult:
+                                   profiler: Any | None = None,
+                                   decision_trace: dict[str, Any] | None = None,
+                                   ) -> TransportResult:
     with _profile_stage(profiler, "soft_transport_warp"):
         batch = j0.shape[0]
         alpha = torch.as_tensor(alpha, device=j0.device, dtype=j0.dtype).reshape(batch)
@@ -379,6 +415,9 @@ def robust_transport_interpolation(j0: torch.Tensor, j1: torch.Tensor, alpha: to
         weight0 = (1-a) * warp0.coverage * warp0.confidence
         weight1 = a * warp1.coverage * warp1.confidence
         denominator = weight0 + weight1; linear = (1-a) * j0 + a * j1
+        fallback_mask = ~((denominator > EPSILON) & valid_mask.to(
+            device=j0.device, dtype=torch.bool,
+        )[None, None])
         transported = (weight0 * warp0.field + weight1 * warp1.field) / denominator.clamp_min(EPSILON)
         valid = valid_mask.to(device=j0.device, dtype=torch.bool)[None, None]
         transported = torch.where((denominator > EPSILON) & valid, transported, linear)
@@ -388,4 +427,25 @@ def robust_transport_interpolation(j0: torch.Tensor, j1: torch.Tensor, alpha: to
         fused_confidence = (weight0 + weight1) / base_coverage.clamp_min(EPSILON)
         result = TransportResult(transported, warp0, warp1, warp1.field-warp0.field,
                                  fused_confidence.clamp(0, 1))
+        if decision_trace is not None:
+            decision_trace["transport_fallback_mask"] = fallback_mask.detach()
+            decision_trace["alpha_zero_mask"] = (alpha == 0).detach()
+            decision_trace["alpha_one_mask"] = (alpha == 1).detach()
     return result
+
+
+def decision_trace_payload(trace: Mapping[str, Any]) -> dict[str, Any]:
+    """Hash machine-exact discrete decisions without retaining model inputs."""
+    rows = {}
+    for name, value in sorted(trace.items()):
+        tensor = torch.as_tensor(value).detach().cpu().contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(tensor.dtype).encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update(tensor.numpy().tobytes())
+        rows[name] = {
+            "shape": list(tensor.shape), "dtype": str(tensor.dtype),
+            "sha256": digest.hexdigest(),
+            "true_count": int(tensor.bool().sum()) if tensor.dtype == torch.bool else None,
+        }
+    return {"fields": rows, "field_count": len(rows)}

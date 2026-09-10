@@ -90,10 +90,16 @@ def sequence_geometry(record: Any, calibration: np.ndarray,
 
 class JepaSidecar:
     def __init__(self, config: Mapping[str, Any], temporary: Path) -> None:
+        from .execution_runtime import capture_runtime
+        worker_config = dict(config)
+        worker_config["worker_settings"] = worker_config.get(
+            "worker_settings",
+            capture_runtime(int(config.get("experiment", {}).get("seed", 1234))),
+        )
         self.config_path = temporary / "jepa_worker_config.json"
-        atomic_write_json(self.config_path, config)
+        atomic_write_json(self.config_path, worker_config)
         self.process = subprocess.Popen(
-            [str(config["runtime"]["jepa_python"]), "-m",
+            [str(worker_config["runtime"]["jepa_python"]), "-m",
              "research.src.phase1_feasibility.jepa_worker",
              "--config", str(self.config_path)],
             cwd=REPO_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,

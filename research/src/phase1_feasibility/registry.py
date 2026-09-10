@@ -122,10 +122,16 @@ def base_lineage(
     dataset = dataset_fingerprint(config, sequence)
     protocol = config_protocol_fingerprint(config)
     sources = source_fingerprint(source_paths)
+    source_names = {Path(p).name for p in source_paths}
+    scientific = None
+    if "run_h1.py" in source_names or "run_h2.py" in source_names:
+        from .scientific_lineage import scientific_fingerprint
+        scientific = scientific_fingerprint("h2" if "run_h2.py" in source_names else "h1")
+        sources["scientific_dependencies"] = scientific
     lineage = {
         "dataset_sha256": dataset["dataset_sha256"],
         "config_protocol_sha256": protocol["config_protocol_sha256"],
-        "source_sha256": sources["source_sha256"],
+        "source_sha256": (scientific or sources)["source_sha256"],
         "schedule_sha256": None,
         "h0_state_contract_sha256": h0_contract_sha256,
         "h1_bridge_sha256": h1_bridge_sha256,
@@ -253,6 +259,52 @@ def _performance_summary_lines(
              f"{_fixed(float(outer.get('total_ms', 0.0)) / 1000.0, 3)} s."]
     if gpu_rows:
         lines.append("- GPU utilization: " + "; ".join(gpu_rows) + ".")
+    residency = performance.get("residency")
+    if isinstance(residency, Mapping):
+        lines.append(
+            "- Training residency: "
+            f"{_count(residency.get('resident_rows'))}/"
+            f"{_count(residency.get('allowed_rows'))} rows, "
+            f"{_fixed(float(residency.get('resident_bytes', 0)) / 2**30, 3)} GiB, "
+            f"initialization {_fixed(residency.get('initialization_seconds'), 3)} s; "
+            f"remaining batch H2D {_fixed(residency.get('batch_h2d_seconds'), 6)} s."
+        )
+        lines.append(
+            "- Resident VRAM delta: allocated "
+            f"{_fixed(float(residency.get('allocated_delta_bytes', 0)) / 2**30, 3)} GiB; "
+            "reserved "
+            f"{_fixed(float(residency.get('reserved_delta_bytes', 0)) / 2**30, 3)} GiB."
+        )
+        if residency.get("correspondence_resident"):
+            lines.append(
+                "- H2 correspondence residency: enabled, "
+                f"{_fixed(float(residency.get('correspondence_resident_bytes', 0)) / 2**30, 3)} GiB."
+            )
+    efficiency = performance.get("efficiency")
+    if isinstance(efficiency, Mapping):
+        lines.append(
+            "- Training pipeline: parallel preparation "
+            f"{_fixed(efficiency.get('parallel_preparation_seconds'), 3)} s; "
+            f"resident training {_fixed(efficiency.get('resident_training_wall_seconds'), 3)} s."
+        )
+        if efficiency.get("parallel_correspondence_seconds") is not None:
+            lines.append(
+                "- Multi-GPU correspondence precompute: "
+                f"{_fixed(efficiency.get('parallel_correspondence_seconds'), 3)} s."
+            )
+    scheduler = performance.get("sequential_evaluation")
+    if isinstance(scheduler, Mapping):
+        assignments = ", ".join(
+            f"job{index}({row.get('sequence', '?')}/"
+            f"{row.get('condition') or row.get('kind', '?')})"
+            f"→GPU{row.get('physical_device')}"
+            for index, row in enumerate(scheduler.get("jobs", ()))
+        )
+        lines.append(
+            f"- Canonical sequential evaluation: {scheduler.get('job_count', 0)} GPU0 jobs; "
+            f"makespan {_fixed(scheduler.get('makespan_seconds'), 3)} s"
+            + (f"; {assignments}." if assignments else ".")
+        )
     strict = performance.get("strict_h2_predictor")
     if strict:
         cpu_outer = strict.get("cpu", {}).get("outer", {}).get("total_ms")
@@ -295,6 +347,10 @@ def _result_summary_lines(module: str, result: Mapping[str, Any]) -> list[str]:
         transmission = efficiency["transmission"]
         wall = efficiency["matched_online_wall_clock"]
         stages = efficiency["h2_stage_profile"]["stages"]
+        stage_c_timing = efficiency["h2_stage_profile"].get("stage_c_timing", {})
+        stage_c_cpu = stage_c_timing.get("cpu_wall_exclusive", {})
+        stage_c_cuda = stage_c_timing.get("cuda_event", {})
+        queue_breakdown = stage_c_timing.get("queue_wait_breakdown", {})
         context = efficiency["h2_stage_profile"]["context_wait_ms"]
         break_even = efficiency["break_even_uplink_bandwidth"]
         bandwidth = break_even["break_even_uplink_bandwidth_mbps"]
@@ -314,12 +370,92 @@ def _result_summary_lines(module: str, result: Mapping[str, Any]) -> list[str]:
             "- H2 stage totals: JEPA encoder "
             f"{_fixed(stages['jepa_encoder']['total_ms'] / 1000.0, 3)} s; predictor "
             f"{_fixed(stages['jepa_predictor']['total_ms'] / 1000.0, 3)} s; bridge "
-            f"{_fixed(stages['bridge']['total_ms'] / 1000.0, 3)} s; DPVO graph/runtime "
+            f"{_fixed(stages['bridge']['total_ms'] / 1000.0, 3)} s; DPVO graph CUDA-event span "
             f"{_fixed(stages['dpvo_graph_runtime']['total_ms'] / 1000.0, 3)} s",
             "- Latency: context wait mean "
             f"{_fixed(context['mean_ms'], 2)} ms; P95 {_fixed(context['p95_ms'], 2)} ms",
             f"- System: break-even uplink bandwidth {bandwidth_text}",
         ))
+        if stage_c_cpu:
+            lines.append(
+                "- Stage C exclusive CPU wall: queue "
+                f"{_fixed(stage_c_cpu['stage_c_queue_wait']['total_ms'] / 1000.0, 3)} s; "
+                "transfer "
+                f"{_fixed(stage_c_cpu['stage_c_transfer_wait']['total_ms'] / 1000.0, 3)} s; "
+                "bridge "
+                f"{_fixed(stage_c_cpu['bridge_compute']['total_ms'] / 1000.0, 3)} s; "
+                "native frontend "
+                f"{_fixed(stage_c_cpu['native_frontend_compute']['total_ms'] / 1000.0, 3)} s; "
+                "DPVO call/launch "
+                f"{_fixed(stage_c_cpu['dpvo_graph_compute']['total_ms'] / 1000.0, 3)} s; "
+                "DPVO sync "
+                f"{_fixed(stage_c_cpu['dpvo_sync_wait']['total_ms'] / 1000.0, 3)} s; "
+                "Python/control "
+                f"{_fixed(stage_c_cpu['stage_c_python_other']['total_ms'] / 1000.0, 3)} s."
+            )
+            lines.append(
+                "- Stage C CUDA events (separate time domain): bridge "
+                f"{_fixed(stage_c_cuda['bridge_compute']['total_ms'] / 1000.0, 3)} s; "
+                "native frontend "
+                f"{_fixed(stage_c_cuda['native_frontend_compute']['total_ms'] / 1000.0, 3)} s; "
+                "DPVO graph CUDA-event span "
+                f"{_fixed(stage_c_cuda['dpvo_graph_compute']['total_ms'] / 1000.0, 3)} s."
+            )
+            lines.append(
+                "- Stage C queue detail: prediction-ready "
+                f"{_fixed(queue_breakdown.get('prediction_ready_wait', {}).get('total_ms'), 2)} ms; "
+                "consumer dequeue "
+                f"{_fixed(queue_breakdown.get('consume_queue_wait', {}).get('total_ms'), 2)} ms; "
+                "worker flush "
+                f"{_fixed(queue_breakdown.get('worker_flush_wait', {}).get('total_ms'), 2)} ms."
+            )
+            backpressure = efficiency["h2_stage_profile"].get(
+                "producer_queue_backpressure", {}
+            )
+            lines.append(
+                "- Producer queue backpressure: "
+                f"{_fixed(backpressure.get('total_ms'), 2)} ms total; P95 "
+                f"{_fixed(backpressure.get('p95_ms'), 2)} ms."
+            )
+        acceptance = efficiency["h2_stage_profile"].get("numerical_acceptance")
+        if isinstance(acceptance, Mapping):
+            lines.append(
+                "- Three-GPU numerical acceptance: "
+                f"{'passed' if acceptance.get('accepted') else 'failed'}; "
+                "identity exact "
+                f"{acceptance.get('identity_exact')}; "
+                "correspondence decisions exact "
+                f"{acceptance.get('correspondence_decisions_exact')}."
+            )
+            for boundary in (
+                "anchor_jepa", "predictor_jepa", "bridge_fmap", "packet_payload",
+            ):
+                row = acceptance.get("continuous", {}).get(boundary, {})
+                lines.append(
+                    f"  - `{boundary}`: max_abs {_fixed(row.get('max_abs'), 9)}, "
+                    f"MSE {_fixed(row.get('MSE'), 12)}, normalized MSE "
+                    f"{_fixed(row.get('normalized_MSE'), 12)}, cosine "
+                    f"{_fixed(row.get('cosine'), 12)}."
+                )
+        stage_profile = efficiency["h2_stage_profile"]
+        segments = stage_profile.get("pipeline_wall_segments", {})
+        if segments:
+            lines.append(
+                "- Pipeline wall: fill "
+                f"{_fixed(float(segments.get('fill_ms', 0.0)) / 1000.0, 3)} s; "
+                "steady "
+                f"{_fixed(float(segments.get('steady_ms', 0.0)) / 1000.0, 3)} s; "
+                "drain "
+                f"{_fixed(float(segments.get('drain_ms', 0.0)) / 1000.0, 3)} s."
+            )
+        lines.append(
+            "- Peak VRAM by process: GPU2 V-JEPA "
+            f"{_fixed(float(stage_profile.get('peak_online_vram_jepa_worker_bytes', 0)) / 2**30, 3)} GiB; "
+            "GPU1 predictor "
+            f"{_fixed(float(stage_profile.get('peak_online_vram_predictor_worker_bytes', 0)) / 2**30, 3)} GiB; "
+            "GPU0 frontend/bridge/DPVO "
+            f"{_fixed(float(stage_profile.get('peak_online_vram_main_process_bytes', 0)) / 2**30, 3)} GiB."
+        )
     lines.extend(_performance_summary_lines(result.get("performance_diagnostics")))
     return lines
 
@@ -365,6 +501,100 @@ def render_aggregate_summary(root: Path, module: str, index: Mapping[str, Any]) 
         ))
         if lines and lines[-1] != "":
             lines.append("")
+    execution = index.get("execution")
+    if isinstance(execution, Mapping):
+        lines.extend(("## Formal execution", ""))
+        lines.append(
+            "- Execution implementation is provenance-only and excluded from scientific "
+            "checkpoint compatibility."
+        )
+        if execution.get("total_makespan_seconds") is not None:
+            lines.append(
+                "- Formal command makespan: "
+                f"{_fixed(execution.get('total_makespan_seconds'), 3)} s."
+            )
+        if execution.get("estimated") is True:
+            lines.append("- Full three-sequence wall time remains an estimate until this command completes.")
+        mapping = execution.get("hardware", {}).get("hardware", {}).get("mapping")
+        if mapping:
+            lines.append(
+                "- GPU mapping: preparation GPU0/1/2; standalone trajectories GPU0; "
+                "H2 Predicted JEPA "
+                "GPU2 V-JEPA, GPU1 predictor, GPU0 native frontend/bridge/DPVO."
+            )
+        scheduler = execution.get("sequential_evaluation") or execution.get(
+            "sequential_trajectory_execution"
+        )
+        if isinstance(scheduler, Mapping):
+            lines.append(
+                f"- Sequential GPU0 trajectory makespan: "
+                f"{_fixed(scheduler.get('makespan_seconds'), 3)} s for "
+                f"{scheduler.get('job_count', 0)} jobs; maximum concurrent DPVO instances 1."
+            )
+        preparation = execution.get("parallel_preparation")
+        if isinstance(preparation, Mapping):
+            lines.append(
+                "- Multi-GPU preparation: "
+                f"{_fixed(preparation.get('elapsed_seconds'), 3)} s; "
+                f"ordered payload hash `{preparation.get('ordered_content_sha256', 'n/a')}`."
+            )
+        evaluation_preparation = execution.get("evaluation_preparation")
+        if isinstance(evaluation_preparation, Mapping):
+            lines.append(
+                "- H1 evaluation preparation: "
+                + "; ".join(
+                    f"{sequence} {_fixed(row.get('elapsed_seconds'), 3)} s"
+                    for sequence, row in evaluation_preparation.items()
+                ) + "."
+            )
+        correspondence = execution.get("parallel_correspondence")
+        if isinstance(correspondence, Mapping):
+            lines.append(
+                "- Multi-GPU correspondence precompute: "
+                f"{_fixed(correspondence.get('elapsed_seconds'), 3)} s; "
+                f"ordered payload hash `{correspondence.get('ordered_content_sha256', 'n/a')}`."
+            )
+        cpu_profile = execution.get("cpu_numa_profile")
+        if isinstance(cpu_profile, Mapping):
+            components = cpu_profile.get("components", {})
+            stage_c = components.get("stage_c", {})
+            predictor = components.get("predictor", {})
+            encoder = components.get("encoder", {})
+            lines.append(
+                "- H2 CPU/NUMA profile: "
+                f"`{cpu_profile.get('selection')}`; dynamic calibration "
+                f"{cpu_profile.get('dynamic_calibration')}; "
+                "GPU0 Stage C OMP/MKL/intra/inter "
+                f"{stage_c.get('omp_num_threads')}/{stage_c.get('mkl_num_threads')}/"
+                f"{stage_c.get('intraop_threads')}/{stage_c.get('interop_threads')}; "
+                "GPU1 predictor "
+                f"{predictor.get('omp_num_threads')}/{predictor.get('mkl_num_threads')}/"
+                f"{predictor.get('intraop_threads')}/{predictor.get('interop_threads')}; "
+                "GPU2 V-JEPA "
+                f"{encoder.get('omp_num_threads')}/{encoder.get('mkl_num_threads')}/"
+                f"{encoder.get('intraop_threads')}/{encoder.get('interop_threads')}."
+            )
+        if execution.get("predicted_jepa_sequence_policy"):
+            lines.append(
+                "- H2 Predicted JEPA sequences use the same exclusive three-GPU pipeline "
+                f"sequentially; online wall total {_fixed(execution.get('predicted_jepa_total_seconds'), 3)} s."
+            )
+        estimate = execution.get("formal_h2_component_wall_estimate")
+        if isinstance(estimate, Mapping):
+            lines.append(
+                "- H2 component wall estimate: "
+                f"{_fixed(estimate.get('estimated_formal_wall_seconds'), 3)} s "
+                "(parallel preparation + resident training + sequential GPU0 controls/"
+                "three-GPU Predicted JEPA + artifact/evaluation work)."
+            )
+        lines.append("")
+        control_performance = execution.get("trajectory_performance")
+        if isinstance(control_performance, Mapping):
+            lines.extend(_performance_summary_lines(
+                control_performance, title="Sequential trajectory performance",
+            ))
+            if lines and lines[-1] != "":
+                lines.append("")
     return "\n".join(lines)
 
 
