@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import time
@@ -32,6 +33,14 @@ def _emit(payload: dict[str, Any]) -> None:
 def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     import torch
 
+    settings = config.get("worker_settings")
+    if settings is None:
+        raise RuntimeError("V-JEPA worker runtime settings are missing")
+    from research.src.phase1_feasibility.execution_runtime import (
+        apply_runtime, runtime_provenance,
+    )
+    apply_runtime(settings)
+
     if not torch.cuda.is_available():
         raise RuntimeError("Exp6 V-JEPA worker requires CUDA")
     expected_python = Path(config["runtime"]["jepa_python"]).resolve()
@@ -56,12 +65,21 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     device = torch.device("cuda:0")
     encoder = load_phase2_encoder(device).requires_grad_(False).eval()
     encoder.out_layers = [5]
-    return torch, encoder, {
+    provenance = {
         "vjepa_git_commit": commit,
         "vjepa_git_dirty": bool(_git(repo, "status", "--short")),
         "checkpoint_sha256": _sha256(checkpoint),
         "layers_zero_based": [5],
+        "worker_pid": int(os.getpid()),
+        "logical_cuda_ordinal": 0,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "cuda_device_name": torch.cuda.get_device_properties(0).name,
     }
+    provenance["runtime"] = runtime_provenance(
+        settings, component="v_jepa_encoder", model=encoder,
+        amp=True, autocast_dtype="bfloat16",
+    )
+    return torch, encoder, provenance
 
 
 def worker(config: dict[str, Any]) -> int:
@@ -78,6 +96,22 @@ def worker(config: dict[str, Any]) -> int:
         if action == "close":
             _emit({"status": "closed"})
             return 0
+        if action == "prepare_online":
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+            _emit({
+                "status": "online_ready", "request_id": request.get("request_id"),
+                "worker_cuda_synchronized": True, "worker_peak_memory_reset": True,
+            })
+            continue
+        if action == "flush_online":
+            torch.cuda.synchronize()
+            _emit({
+                "status": "online_flushed", "request_id": request.get("request_id"),
+                "worker_cuda_synchronized": True,
+                "peak_gpu_memory_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+            })
+            continue
         if action != "extract":
             raise ValueError(f"unsupported worker action: {action}")
         source = np.load(request["input_npy"], mmap_mode="r")

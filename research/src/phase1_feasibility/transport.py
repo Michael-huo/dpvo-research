@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
+import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
@@ -18,6 +21,11 @@ COARSE_SIGMA = 4.0
 HUBER_DELTA = 1.5
 AFFINE_RIDGE = 1e-4
 MIN_GLOBAL_MATCHES = 12
+
+
+def _profile_stage(profiler: Any | None, name: str) -> Any:
+    """Return an exclusive performance-only scope without changing default calls."""
+    return contextlib.nullcontext() if profiler is None else profiler.stage(name)
 
 
 @dataclass(frozen=True)
@@ -111,16 +119,23 @@ def _top2_direction(similarity: torch.Tensor, valid: torch.Tensor,
 
 def sparse_candidate_statistics(j0: torch.Tensor, j1: torch.Tensor,
                                 valid_mask: torch.Tensor,
-                                max_displacement: int | None = None) -> dict[str, torch.Tensor]:
+                                max_displacement: int | None = None, *,
+                                profiler: Any | None = None,
+                                decision_trace: dict[str, Any] | None = None,
+                                ) -> dict[str, torch.Tensor]:
     if j0.shape != j1.shape or j0.ndim != 4:
         raise ValueError("candidate statistics require equal [B,C,H,W] fields")
     batch, _, height, width = j0.shape
-    valid = valid_mask.to(device=j0.device, dtype=torch.bool).reshape(-1)
-    coords = token_coordinates(height, width, device=j0.device)
-    similarity = torch.einsum("bnc,bmc->bnm", normalized_descriptors(j0), normalized_descriptors(j1))
-    forward = _top2_direction(similarity, valid, coords, max_displacement)
-    reverse = _top2_direction(similarity.transpose(1, 2), valid, coords, max_displacement)
-    source_indices = torch.arange(height * width, device=j0.device)[None, :, None]
+    with _profile_stage(profiler, "endpoint_descriptor_matching"):
+        valid = valid_mask.to(device=j0.device, dtype=torch.bool).reshape(-1)
+        coords = token_coordinates(height, width, device=j0.device)
+        similarity = torch.einsum(
+            "bnc,bmc->bnm", normalized_descriptors(j0), normalized_descriptors(j1),
+        )
+    with _profile_stage(profiler, "bidirectional_topk_correspondence"):
+        forward = _top2_direction(similarity, valid, coords, max_displacement)
+        reverse = _top2_direction(similarity.transpose(1, 2), valid, coords, max_displacement)
+        source_indices = torch.arange(height * width, device=j0.device)[None, :, None]
 
     def directed(primary: tuple[torch.Tensor, ...], opposite: tuple[torch.Tensor, ...]
                  ) -> dict[str, torch.Tensor]:
@@ -133,7 +148,13 @@ def sparse_candidate_statistics(j0: torch.Tensor, j1: torch.Tensor,
                 "destination": destination, "displacement": displacement,
                 "chebyshev_displacement": displacement.abs().amax(dim=-1),
                 "similarity_peak": peak, "peak_margin": margin, "cycle_error": cycle}
-    rows0, rows1 = directed(forward, reverse), directed(reverse, forward)
+    with _profile_stage(profiler, "bidirectional_topk_correspondence"):
+        rows0, rows1 = directed(forward, reverse), directed(reverse, forward)
+    if decision_trace is not None:
+        decision_trace["selected_top2_indices_0_to_1"] = forward[0].detach()
+        decision_trace["selected_top2_indices_1_to_0"] = reverse[0].detach()
+        decision_trace["candidate_mask_0"] = rows0["candidate_mask"].detach()
+        decision_trace["candidate_mask_1"] = rows1["candidate_mask"].detach()
     return {f"{name}_0": value for name, value in rows0.items()} | {
         f"{name}_1": value for name, value in rows1.items()}
 
@@ -220,73 +241,126 @@ def effective_sample_count(weights: torch.Tensor) -> torch.Tensor:
 
 def _smooth_direction(statistics: Mapping[str, torch.Tensor], suffix: str,
                       valid_mask: torch.Tensor, calibration: Mapping[str, Any]
+                      , *, profiler: Any | None = None
+                      , decision_trace: dict[str, Any] | None = None
                       ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     displacement = statistics[f"displacement_{suffix}"]
     batch, _, _ = displacement.shape; height, width = valid_mask.shape
     coords = token_coordinates(height, width, device=displacement.device)
-    accepted = (statistics[f"candidate_mask_{suffix}"]
-                & (statistics[f"similarity_peak_{suffix}"] >= float(calibration["similarity_min"]))
-                & (statistics[f"peak_margin_{suffix}"] >= float(calibration["margin_min"]))
-                & (statistics[f"cycle_error_{suffix}"] <= float(calibration["cycle_max_tokens"]))
-                & (statistics[f"chebyshev_displacement_{suffix}"]
-                   <= int(calibration["max_displacement_chebyshev_tokens"])))
-    margin_confidence = ((statistics[f"peak_margin_{suffix}"] - float(calibration["margin_min"]))
-                         / (float(calibration["margin_scale"]) - float(calibration["margin_min"]))).clamp(0, 1)
-    cycle_confidence = torch.exp(-.5 * (statistics[f"cycle_error_{suffix}"] / CYCLE_SIGMA) ** 2)
-    sparse_confidence = torch.where(accepted, margin_confidence * cycle_confidence,
-                                    torch.zeros_like(margin_confidence))
+    with _profile_stage(profiler, "cycle_confidence_filtering"):
+        accepted = (statistics[f"candidate_mask_{suffix}"]
+                    & (statistics[f"similarity_peak_{suffix}"] >= float(calibration["similarity_min"]))
+                    & (statistics[f"peak_margin_{suffix}"] >= float(calibration["margin_min"]))
+                    & (statistics[f"cycle_error_{suffix}"] <= float(calibration["cycle_max_tokens"]))
+                    & (statistics[f"chebyshev_displacement_{suffix}"]
+                       <= int(calibration["max_displacement_chebyshev_tokens"])))
+        margin_confidence = ((statistics[f"peak_margin_{suffix}"] - float(calibration["margin_min"]))
+                             / (float(calibration["margin_scale"]) - float(calibration["margin_min"]))).clamp(0, 1)
+        cycle_confidence = torch.exp(-.5 * (statistics[f"cycle_error_{suffix}"] / CYCLE_SIGMA) ** 2)
+        sparse_confidence = torch.where(accepted, margin_confidence * cycle_confidence,
+                                        torch.zeros_like(margin_confidence))
     dense_displacements, dense_confidences = [], []
     ys = _coarse_axis(height, displacement.device, displacement.dtype)
     xs = _coarse_axis(width, displacement.device, displacement.dtype)
+    global_fallback = []
+    local_fallback = []
     for row in range(batch):
-        mask = accepted[row] & (sparse_confidence[row] > 0)
-        source, sparse_displacement = coords[mask], displacement[row, mask]
-        confidence = sparse_confidence[row, mask]
-        coefficient = _weighted_affine(source, source + sparse_displacement, confidence)
+        with _profile_stage(profiler, "global_affine_estimation"):
+            mask = accepted[row] & (sparse_confidence[row] > 0)
+            source, sparse_displacement = coords[mask], displacement[row, mask]
+            confidence = sparse_confidence[row, mask]
+            coefficient = _weighted_affine(source, source + sparse_displacement, confidence)
+            global_fallback.append(coefficient is None)
+            if coefficient is None:
+                dense_displacements.append(torch.zeros((height, width, 2), device=displacement.device))
+                dense_confidences.append(torch.zeros((height, width), device=displacement.device))
+            else:
+                affine_displacement = torch.cat(
+                    (coords, torch.ones_like(coords[:, :1])), dim=1,
+                ) @ coefficient - coords
+                sparse_residual = sparse_displacement - affine_displacement[mask]
         if coefficient is None:
-            dense_displacements.append(torch.zeros((height, width, 2), device=displacement.device))
-            dense_confidences.append(torch.zeros((height, width), device=displacement.device)); continue
-        affine_displacement = torch.cat((coords, torch.ones_like(coords[:, :1])), dim=1) @ coefficient - coords
-        sparse_residual = sparse_displacement - affine_displacement[mask]
-        coarse_residual = torch.zeros((len(ys), len(xs), 2), device=displacement.device)
-        coarse_confidence = torch.zeros((len(ys), len(xs)), device=displacement.device)
-        for iy, gy in enumerate(ys):
-            for ix, gx in enumerate(xs):
-                distance = source - torch.stack((gx, gy)); local = distance.abs().amax(dim=-1) <= COARSE_RADIUS
-                if int(local.sum()) < 3:
-                    continue
-                base = confidence[local] * torch.exp(-distance[local].square().sum(dim=-1) / (2 * COARSE_SIGMA ** 2))
-                residual = sparse_residual[local]
-                estimate = (base[:, None] * residual).sum(0) / base.sum().clamp_min(EPSILON)
-                robust = base
-                for _ in range(3):
-                    error = (residual - estimate).norm(dim=-1)
-                    robust = base * torch.clamp(HUBER_DELTA / error.clamp_min(EPSILON), max=1.)
-                    estimate = (robust[:, None] * residual).sum(0) / robust.sum().clamp_min(EPSILON)
-                n_eff = effective_sample_count(robust)
-                mean_confidence = (robust * confidence[local]).sum() / robust.sum().clamp_min(EPSILON)
-                coarse_residual[iy, ix] = estimate
-                coarse_confidence[iy, ix] = mean_confidence * torch.clamp(n_eff / 3., max=1.)
-        residual_dense = _bilinear_irregular(coarse_residual, ys, xs, height, width).reshape(-1, 2)
-        confidence_dense = _bilinear_irregular(coarse_confidence[..., None], ys, xs, height, width)[..., 0]
-        dense = (affine_displacement + residual_dense).reshape(height, width, 2)
-        valid = valid_mask.to(device=dense.device, dtype=torch.bool)
-        dense_displacements.append(torch.where(valid[..., None], dense, torch.zeros_like(dense)))
-        dense_confidences.append(torch.where(valid, confidence_dense.clamp(0, 1), torch.zeros_like(confidence_dense)))
+            local_fallback.append(torch.ones(
+                (len(ys), len(xs)), device=displacement.device, dtype=torch.bool,
+            ))
+            continue
+        with _profile_stage(profiler, "coarse_residual_estimation"):
+            coarse_residual = torch.zeros((len(ys), len(xs), 2), device=displacement.device)
+            coarse_confidence = torch.zeros((len(ys), len(xs)), device=displacement.device)
+            local_row = torch.ones((len(ys), len(xs)), device=displacement.device, dtype=torch.bool)
+            for iy, gy in enumerate(ys):
+                for ix, gx in enumerate(xs):
+                    distance = source - torch.stack((gx, gy)); local = distance.abs().amax(dim=-1) <= COARSE_RADIUS
+                    if profiler is None:
+                        local_count = int(local.sum())
+                    else:
+                        wait_started = time.perf_counter()
+                        local_count = int(local.sum())
+                        profiler.add_nested_wait_diagnostic(
+                            "coarse_local_count_gpu_to_cpu_sync",
+                            (time.perf_counter() - wait_started) * 1000.0,
+                        )
+                    if local_count < 3:
+                        continue
+                    local_row[iy, ix] = False
+                    base = confidence[local] * torch.exp(-distance[local].square().sum(dim=-1) / (2 * COARSE_SIGMA ** 2))
+                    residual = sparse_residual[local]
+                    estimate = (base[:, None] * residual).sum(0) / base.sum().clamp_min(EPSILON)
+                    robust = base
+                    for _ in range(3):
+                        error = (residual - estimate).norm(dim=-1)
+                        robust = base * torch.clamp(HUBER_DELTA / error.clamp_min(EPSILON), max=1.)
+                        estimate = (robust[:, None] * residual).sum(0) / robust.sum().clamp_min(EPSILON)
+                    n_eff = effective_sample_count(robust)
+                    mean_confidence = (robust * confidence[local]).sum() / robust.sum().clamp_min(EPSILON)
+                    coarse_residual[iy, ix] = estimate
+                    coarse_confidence[iy, ix] = mean_confidence * torch.clamp(n_eff / 3., max=1.)
+            residual_dense = _bilinear_irregular(coarse_residual, ys, xs, height, width).reshape(-1, 2)
+            confidence_dense = _bilinear_irregular(coarse_confidence[..., None], ys, xs, height, width)[..., 0]
+            dense = (affine_displacement + residual_dense).reshape(height, width, 2)
+            valid = valid_mask.to(device=dense.device, dtype=torch.bool)
+            dense_displacements.append(torch.where(valid[..., None], dense, torch.zeros_like(dense)))
+            dense_confidences.append(torch.where(valid, confidence_dense.clamp(0, 1), torch.zeros_like(confidence_dense)))
+            local_fallback.append(local_row)
+    if decision_trace is not None:
+        decision_trace[f"accepted_mask_{suffix}"] = accepted.detach()
+        decision_trace[f"global_fallback_{suffix}"] = torch.tensor(
+            global_fallback, device=displacement.device, dtype=torch.bool,
+        )
+        if local_fallback:
+            decision_trace[f"local_fallback_{suffix}"] = torch.stack(local_fallback)
+        else:
+            decision_trace[f"local_fallback_{suffix}"] = torch.ones(
+                (batch, len(ys), len(xs)), device=displacement.device, dtype=torch.bool,
+            )
     return torch.stack(dense_displacements), torch.stack(dense_confidences), accepted.reshape(batch, height, width)
 
 
 def estimate_robust_correspondence(j0: torch.Tensor, j1: torch.Tensor,
                                    valid_mask: torch.Tensor,
-                                   calibration: Mapping[str, Any]) -> RobustCorrespondence:
+                                   calibration: Mapping[str, Any], *,
+                                   profiler: Any | None = None,
+                                   decision_trace: dict[str, Any] | None = None,
+                                   ) -> RobustCorrespondence:
     statistics = sparse_candidate_statistics(j0, j1, valid_mask,
-        int(calibration["max_displacement_chebyshev_tokens"]))
-    displacement0, confidence0, sparse0 = _smooth_direction(statistics, "0", valid_mask, calibration)
-    displacement1, confidence1, sparse1 = _smooth_direction(statistics, "1", valid_mask, calibration)
-    return RobustCorrespondence(displacement0, displacement1, confidence0, confidence1,
-        sparse0, sparse1, statistics["similarity_peak_0"], statistics["similarity_peak_1"],
-        statistics["peak_margin_0"], statistics["peak_margin_1"],
-        statistics["cycle_error_0"], statistics["cycle_error_1"])
+        int(calibration["max_displacement_chebyshev_tokens"]), profiler=profiler,
+        decision_trace=decision_trace)
+    displacement0, confidence0, sparse0 = _smooth_direction(
+        statistics, "0", valid_mask, calibration, profiler=profiler,
+        decision_trace=decision_trace,
+    )
+    displacement1, confidence1, sparse1 = _smooth_direction(
+        statistics, "1", valid_mask, calibration, profiler=profiler,
+        decision_trace=decision_trace,
+    )
+    with _profile_stage(profiler, "correspondence_query_assembly"):
+        result = RobustCorrespondence(
+            displacement0, displacement1, confidence0, confidence1,
+            sparse0, sparse1, statistics["similarity_peak_0"], statistics["similarity_peak_1"],
+            statistics["peak_margin_0"], statistics["peak_margin_1"],
+            statistics["cycle_error_0"], statistics["cycle_error_1"],
+        )
+    return result
 
 
 def forward_soft_splat(raw_field: torch.Tensor, displacement: torch.Tensor,
@@ -326,23 +400,52 @@ def forward_soft_splat(raw_field: torch.Tensor, displacement: torch.Tensor,
 
 def robust_transport_interpolation(j0: torch.Tensor, j1: torch.Tensor, alpha: torch.Tensor,
                                    correspondence: RobustCorrespondence,
-                                   valid_mask: torch.Tensor) -> TransportResult:
-    batch = j0.shape[0]
-    alpha = torch.as_tensor(alpha, device=j0.device, dtype=j0.dtype).reshape(batch)
-    warp0 = forward_soft_splat(j0, correspondence.displacement_0_to_1,
-                               correspondence.confidence_0, alpha, valid_mask)
-    warp1 = forward_soft_splat(j1, correspondence.displacement_1_to_0,
-                               correspondence.confidence_1, 1-alpha, valid_mask)
-    a = alpha[:, None, None, None]
-    weight0 = (1-a) * warp0.coverage * warp0.confidence
-    weight1 = a * warp1.coverage * warp1.confidence
-    denominator = weight0 + weight1; linear = (1-a) * j0 + a * j1
-    transported = (weight0 * warp0.field + weight1 * warp1.field) / denominator.clamp_min(EPSILON)
-    valid = valid_mask.to(device=j0.device, dtype=torch.bool)[None, None]
-    transported = torch.where((denominator > EPSILON) & valid, transported, linear)
-    transported = torch.where((alpha == 0)[:, None, None, None], j0, transported)
-    transported = torch.where((alpha == 1)[:, None, None, None], j1, transported)
-    base_coverage = (1-a) * warp0.coverage + a * warp1.coverage
-    fused_confidence = (weight0 + weight1) / base_coverage.clamp_min(EPSILON)
-    return TransportResult(transported, warp0, warp1, warp1.field-warp0.field,
-                           fused_confidence.clamp(0, 1))
+                                   valid_mask: torch.Tensor, *,
+                                   profiler: Any | None = None,
+                                   decision_trace: dict[str, Any] | None = None,
+                                   ) -> TransportResult:
+    with _profile_stage(profiler, "soft_transport_warp"):
+        batch = j0.shape[0]
+        alpha = torch.as_tensor(alpha, device=j0.device, dtype=j0.dtype).reshape(batch)
+        warp0 = forward_soft_splat(j0, correspondence.displacement_0_to_1,
+                                   correspondence.confidence_0, alpha, valid_mask)
+        warp1 = forward_soft_splat(j1, correspondence.displacement_1_to_0,
+                                   correspondence.confidence_1, 1-alpha, valid_mask)
+        a = alpha[:, None, None, None]
+        weight0 = (1-a) * warp0.coverage * warp0.confidence
+        weight1 = a * warp1.coverage * warp1.confidence
+        denominator = weight0 + weight1; linear = (1-a) * j0 + a * j1
+        fallback_mask = ~((denominator > EPSILON) & valid_mask.to(
+            device=j0.device, dtype=torch.bool,
+        )[None, None])
+        transported = (weight0 * warp0.field + weight1 * warp1.field) / denominator.clamp_min(EPSILON)
+        valid = valid_mask.to(device=j0.device, dtype=torch.bool)[None, None]
+        transported = torch.where((denominator > EPSILON) & valid, transported, linear)
+        transported = torch.where((alpha == 0)[:, None, None, None], j0, transported)
+        transported = torch.where((alpha == 1)[:, None, None, None], j1, transported)
+        base_coverage = (1-a) * warp0.coverage + a * warp1.coverage
+        fused_confidence = (weight0 + weight1) / base_coverage.clamp_min(EPSILON)
+        result = TransportResult(transported, warp0, warp1, warp1.field-warp0.field,
+                                 fused_confidence.clamp(0, 1))
+        if decision_trace is not None:
+            decision_trace["transport_fallback_mask"] = fallback_mask.detach()
+            decision_trace["alpha_zero_mask"] = (alpha == 0).detach()
+            decision_trace["alpha_one_mask"] = (alpha == 1).detach()
+    return result
+
+
+def decision_trace_payload(trace: Mapping[str, Any]) -> dict[str, Any]:
+    """Hash machine-exact discrete decisions without retaining model inputs."""
+    rows = {}
+    for name, value in sorted(trace.items()):
+        tensor = torch.as_tensor(value).detach().cpu().contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(tensor.dtype).encode())
+        digest.update(str(tuple(tensor.shape)).encode())
+        digest.update(tensor.numpy().tobytes())
+        rows[name] = {
+            "shape": list(tensor.shape), "dtype": str(tensor.dtype),
+            "sha256": digest.hexdigest(),
+            "true_count": int(tensor.bool().sum()) if tensor.dtype == torch.bool else None,
+        }
+    return {"fields": rows, "field_count": len(rows)}

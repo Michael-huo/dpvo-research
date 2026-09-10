@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import time
+import contextlib
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
@@ -28,7 +29,8 @@ from .transport import (
 )
 
 def _field(store: Any, identity: FrameIdentity, transform: Any, device: torch.device) -> torch.Tensor:
-    tokens = torch.from_numpy(store.get(identity)).to(device)
+    tokens = (store.get_tensor(identity).to(device) if hasattr(store, "get_tensor")
+              else torch.from_numpy(store.get(identity)).to(device))
     return tokens_to_field(tokens[None], transform)[0]
 
 
@@ -85,7 +87,9 @@ def build_robust_correspondence_store(intervals: Sequence[AnchorInterval], store
     for interval in intervals:
         j0 = _field(store, interval.anchor0, transform, mask.device)[None]
         j1 = _field(store, interval.anchor1, transform, mask.device)[None]
-        result.put(interval, estimate_robust_correspondence(j0, j1, mask, calibration))
+        result.put(interval, estimate_robust_correspondence(
+            j0, j1, mask, calibration,
+        ))
     return result, {"interval_count": len(intervals), "endpoint_only": True,
                     "contains_hidden_target": False, "elapsed_seconds": time.perf_counter()-started,
                     "protocol": robust_protocol_metadata(calibration)}
@@ -98,19 +102,25 @@ def _batches(values: Sequence[AnchorInterval], size: int, seed: int | None = Non
 
 
 def _transport_batch(intervals: Sequence[AnchorInterval], store: Any, transform: Any,
-                     mask: torch.Tensor, robust: RobustCorrespondenceStore
+                     mask: torch.Tensor, robust: RobustCorrespondenceStore, *,
+                     profiler: Any | None = None,
                      ) -> tuple[TransportResult, torch.Tensor, torch.Tensor, torch.Tensor]:
-    j0, j1, target, alpha, delta = [], [], [], [], []
-    for interval in intervals:
-        left = _field(store, interval.anchor0, transform, mask.device)
-        right = _field(store, interval.anchor1, transform, mask.device)
-        for query in interval.hidden:
-            j0.append(left); j1.append(right); target.append(_field(store, query.identity, transform, mask.device))
-            alpha.append(query.alpha); delta.append(query.delta_t_seconds)
-    j0t, j1t, targett = torch.stack(j0), torch.stack(j1), torch.stack(target)
-    alphat = torch.tensor(alpha, device=mask.device); deltat = torch.tensor(delta, device=mask.device)
-    correspondence = robust.batch(intervals, mask.device, repeat_queries=True)
-    return robust_transport_interpolation(j0t, j1t, alphat, correspondence, mask), targett, alphat, deltat
+    stage = "resident_batch_gather" if hasattr(store, "get_tensor") else "batch_data_memmap_h2d"
+    scope = contextlib.nullcontext() if profiler is None else profiler.stage(stage)
+    with scope:
+        j0, j1, target, alpha, delta = [], [], [], [], []
+        for interval in intervals:
+            left = _field(store, interval.anchor0, transform, mask.device)
+            right = _field(store, interval.anchor1, transform, mask.device)
+            for query in interval.hidden:
+                j0.append(left); j1.append(right); target.append(_field(store, query.identity, transform, mask.device))
+                alpha.append(query.alpha); delta.append(query.delta_t_seconds)
+        j0t, j1t, targett = torch.stack(j0), torch.stack(j1), torch.stack(target)
+        alphat = torch.tensor(alpha, device=mask.device); deltat = torch.tensor(delta, device=mask.device)
+        correspondence = robust.batch(intervals, mask.device, repeat_queries=True)
+    return robust_transport_interpolation(
+        j0t, j1t, alphat, correspondence, mask, profiler=profiler,
+    ), targett, alphat, deltat
 
 
 def _new_predictor(config: Mapping[str, Any]) -> RobustTransportBlock5Predictor:
@@ -124,6 +134,18 @@ def _predict(model: torch.nn.Module, transported: TransportResult, alpha: torch.
              delta: torch.Tensor) -> torch.Tensor:
     return model(transported.field, transported.warped_difference, transported.warp0.coverage,
                  transported.warp1.coverage, transported.fused_confidence, alpha, delta)
+
+
+def _hidden_identities(intervals: Sequence[AnchorInterval]) -> tuple[FrameIdentity, ...]:
+    return tuple(query.identity for interval in intervals for query in interval.hidden)
+
+
+def _diagnostic_teacher_batch(intervals: Sequence[AnchorInterval], store: Any,
+                              device: torch.device) -> torch.Tensor:
+    return torch.stack([
+        torch.from_numpy(store.get(query.identity)).to(device=device, dtype=torch.float32)
+        for interval in intervals for query in interval.hidden
+    ])
 
 
 def tiny_overfit(store: CompactFeatureStore, intervals: Sequence[AnchorInterval], transform: Any,
@@ -150,19 +172,32 @@ def tiny_overfit(store: CompactFeatureStore, intervals: Sequence[AnchorInterval]
 
 @torch.no_grad()
 def _validation(model: torch.nn.Module, intervals: Sequence[AnchorInterval], store: Any,
-                transform: Any, mask: torch.Tensor, robust: RobustCorrespondenceStore) -> dict[str, float]:
+                transform: Any, mask: torch.Tensor, robust: RobustCorrespondenceStore,
+                profiler: Any | None = None) -> dict[str, float]:
     totals = {key: 0. for key in ("total", "cosine", "mse", "smooth_l1", "norm_ratio")}; count = 0; model.eval()
     for batch in _batches(intervals, 2):
-        transported, target, alpha, delta = _transport_batch(batch, store, transform, mask, robust)
-        metrics = prediction_loss(_predict(model, transported, alpha, delta), target, mask)
-        for key in totals: totals[key] += float(metrics[key]) * len(target)
+        if profiler is not None: profiler.begin_outer()
+        transported, target, alpha, delta = _transport_batch(
+            batch, store, transform, mask, robust, profiler=profiler,
+        )
+        scope = (contextlib.nullcontext() if profiler is None
+                 else profiler.stage("validation_forward_loss"))
+        with scope:
+            metrics = prediction_loss(_predict(model, transported, alpha, delta), target, mask)
+        scope = (contextlib.nullcontext() if profiler is None
+                 else profiler.stage("synchronization_wait", cuda=False))
+        with scope:
+            for key in totals: totals[key] += float(metrics[key]) * len(target)
         count += len(target)
+        if profiler is not None: profiler.finish_outer()
     return {key: value/count for key, value in totals.items()} | {"hidden_query_count": count}
 
 
 def train_predictor(store: CompactFeatureStore, split: Mapping[str, Sequence[AnchorInterval]],
                     transform: Any, mask: torch.Tensor, config: Mapping[str, Any],
-                    robust: RobustCorrespondenceStore) -> tuple[torch.nn.Module, dict[str, Any]]:
+                    robust: RobustCorrespondenceStore, *, profiler: Any | None = None,
+                    validation_profiler: Any | None = None,
+                    ) -> tuple[torch.nn.Module, dict[str, Any]]:
     _seed_everything(1234); model = _new_predictor(config).cuda().train()
     sample, _, alpha, delta = _transport_batch(split["train"][:1], store, transform, mask, robust)
     if not torch.equal(_predict(model, sample, alpha, delta), sample.field): raise RuntimeError("zero initialization changed")
@@ -170,23 +205,49 @@ def train_predictor(store: CompactFeatureStore, split: Mapping[str, Sequence[Anc
     scaler = torch.cuda.amp.GradScaler(enabled=True); best, best_value, best_epoch = None, float("inf"), -1
     history = []; started = time.perf_counter(); torch.cuda.reset_peak_memory_stats()
     for epoch in range(30):
+        epoch_started = time.perf_counter()
         model.train(); total = 0.; count = 0
         for batch in _batches(split["train"], 2, 1234+epoch):
-            transported, target, alpha, delta = _transport_batch(batch, store, transform, mask, robust)
+            if profiler is not None: profiler.begin_outer()
+            transported, target, alpha, delta = _transport_batch(
+                batch, store, transform, mask, robust, profiler=profiler,
+            )
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=True): loss = prediction_loss(_predict(model, transported, alpha, delta), target, mask)["total"]
-            scaler.scale(loss).backward(); scaler.step(optimizer); scaler.update()
-            total += float(loss.detach()) * len(target); count += len(target)
-        validation = _validation(model, split["validation"], store, transform, mask, robust)
-        history.append({"epoch": epoch+1, "train_total": total/count, "validation_total": validation["total"]})
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("forward_loss"))
+            with scope:
+                with torch.cuda.amp.autocast(enabled=True):
+                    loss = prediction_loss(
+                        _predict(model, transported, alpha, delta), target, mask,
+                    )["total"]
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("backward"))
+            with scope: scaler.scale(loss).backward()
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("optimizer_scaler"))
+            with scope: scaler.step(optimizer); scaler.update()
+            scope = (contextlib.nullcontext() if profiler is None
+                     else profiler.stage("synchronization_wait", cuda=False))
+            with scope: total += float(loss.detach()) * len(target)
+            count += len(target)
+            if profiler is not None: profiler.finish_outer()
+        validation = _validation(
+            model, split["validation"], store, transform, mask, robust,
+            profiler=validation_profiler,
+        )
+        history.append({"epoch": epoch+1, "train_total": total/count,
+                        "validation_total": validation["total"],
+                        "epoch_wall_seconds": time.perf_counter()-epoch_started})
         if validation["total"] < best_value:
             best_value, best_epoch = validation["total"], epoch+1
             best = {name: value.detach().cpu().clone() for name, value in model.state_dict().items()}
     if best is None: raise RuntimeError("no validation checkpoint selected")
     model.load_state_dict(best); model.requires_grad_(False).eval()
-    return model, {"best_epoch": best_epoch, "best_validation_total": best_value, "history": history,
+    summary = {"best_epoch": best_epoch, "best_validation_total": best_value, "history": history,
         "elapsed_seconds": time.perf_counter()-started, "peak_gpu_vram_bytes": int(torch.cuda.max_memory_allocated()),
         "test_was_read_during_training_or_selection": False}
+    del optimizer, scaler, best, sample, alpha, delta
+    return model, summary
 
 
 class MetricAccumulator:
@@ -204,19 +265,21 @@ class MetricAccumulator:
 @torch.no_grad()
 def held_out_representation(split_test: Sequence[AnchorInterval], store: CompactFeatureStore,
                             transform: Any, mask: torch.Tensor, robust: RobustCorrespondenceStore,
-                            predictor: torch.nn.Module, bridge: torch.nn.Module) -> dict[str, Any]:
+                            predictor: torch.nn.Module, bridge: torch.nn.Module,
+                            true_teacher: Any) -> dict[str, Any]:
     names = ("robust_transport", "predicted_jepa", "oracle_jepa"); token = {name: MetricAccumulator() for name in names}; fmap = {name: MetricAccumulator() for name in names}; gmap = {name: 0. for name in names}; count = 0
     fmap_mask = torch.from_numpy(coordinate_masks(transform)["fmap_valid_mask"]).cuda()
     for batch in _batches(split_test, 2):
         transported, target, alpha, delta = _transport_batch(batch, store, transform, mask, robust)
         fields = {names[0]: transported.field, names[1]: _predict(predictor, transported, alpha, delta), names[2]: target}
         for name, value in fields.items(): token[name].add(value, target, mask)
-        fmaps = {name: bridge(value.flatten(2).transpose(1,2)) for name,value in fields.items()}; oracle = fmaps[names[2]]
-        for name,value in fmaps.items(): fmap[name].add(value, oracle, fmap_mask)
+        fmaps = {name: bridge(value.flatten(2).transpose(1,2)) for name,value in fields.items()}
         queries = [query for interval in batch for query in interval.hidden]
+        teacher = _diagnostic_teacher_batch(batch, true_teacher, mask.device)
+        for name,value in fmaps.items(): fmap[name].add(value, teacher, fmap_mask)
         for row, query in enumerate(queries):
-            oracle_state,_ = _derive_frontend_state(
-                FMapZeroContextPacket(oracle[row:row+1,None]), query.identity, 1234,
+            teacher_state,_ = _derive_frontend_state(
+                FMapZeroContextPacket(teacher[row:row+1,None]), query.identity, 1234,
                 patches_per_image=96, patch_size=3, context_dim=384,
             )
             for name,value in fmaps.items():
@@ -224,12 +287,18 @@ def held_out_representation(split_test: Sequence[AnchorInterval], store: Compact
                     FMapZeroContextPacket(value[row:row+1,None]), query.identity, 1234,
                     patches_per_image=96, patch_size=3, context_dim=384,
                 )
-                gmap[name] += float(F.cosine_similarity(state.gmap.float().flatten(2), oracle_state.gmap.float().flatten(2), dim=2).mean())
+                gmap[name] += float(F.cosine_similarity(
+                    state.gmap.float().flatten(2), teacher_state.gmap.float().flatten(2), dim=2,
+                ).mean())
             count += 1
     return {"evaluation_role": "held_out_mh01_representation_test",
             "trajectory_generalization_claim": False,
             "gate1_block5": {name: row.payload() for name,row in token.items()},
-            "gate2_frozen_exp6_2": {name: row.payload() | {"derived_gmap_cosine": gmap[name]/count} for name,row in fmap.items()}}
+            "fmap_target": "offline_true_fmap_teacher",
+            "gate2_frozen_h1_bridge_vs_true_fmap": {
+                name: row.payload() | {"derived_gmap_cosine": gmap[name]/count}
+                for name,row in fmap.items()
+            }}
 
 
 def _shared_pca_rgb(fields: Sequence[np.ndarray], valid_mask: np.ndarray
@@ -346,5 +415,3 @@ def _plot_feature_diagnostics(path: Path, sequence: str, intervals: Sequence[Anc
         "oracle_hidden_rgb_usage":"offline_reference_extraction_only",
         "hidden_online_rgb_violation_count":0}
     return payload
-
-

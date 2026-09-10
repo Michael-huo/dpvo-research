@@ -1,158 +1,10 @@
-# RESEARCH
+# Phase 1 — Feasibility Analysis
 
-本文件用于记录基于 DPVO
-的后续研究工作，包括环境部署、实验复现、算法改进和实验结果分析。
+## 环境前提
 
-# 1. DPVO 环境部署与 Demo 复现
-
-## 1.1 环境部署
-
-说明：
-
-- 使用 Miniforge/Conda 管理环境；
-- Python 版本固定为 3.10；
-- DPVO 自定义 CUDA extension 编译需要 CUDA Toolkit 12.1；
-
-```bash
-export CUDA_HOME=/usr/local/cuda-12.1
-export PATH=$CUDA_HOME/bin:$PATH
-export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
-
-nvcc --version
-```
-
-- DPVO 使用源码安装，方便后续研究修改。
-
-```bash
-# Setup and Installation
-git clone --recursive https://github.com/Michael-huo/dpvo-research.git
-cd dpvo-research
-
-mamba env create -f research/environment.yml
-conda activate dpvo
-
-wget https://gitlab.com/libeigen/eigen/-/archive/3.4.0/eigen-3.4.0.zip
-unzip eigen-3.4.0.zip -d thirdparty
-
-pip install . --no-build-isolation
-
-# Recommended - Install the Pangolin Viewer
-./Pangolin/scripts/install_prerequisites.sh recommended
-mkdir Pangolin/build && cd Pangolin/build
-cmake ..
-make -j8
-sudo make install
-sudo ldconfig
-cd ../..
-pip install ./DPViewer --no-build-isolation
-rm -rf Pangolin/build
-
-# Classical Backend (optional)
-sudo apt-get install -y libopencv-dev
-cd DBoW2
-mkdir -p build && cd build
-cmake .. # tested with cmake 3.22.1 and gcc/cc 11.4.0 on Ubuntu
-make # tested with GNU Make 4.3
-sudo make install
-cd ../..
-pip install ./DPRetrieval
-rm -rf DBoW2/build
-```
-
-## 1.2 下载运行 Demo 所需文件
-
-### EuRoC 数据集
-
-例如：
-
-```text
-research/assets/datasets/euroc/MH_01_easy/
-```
-
-### 网络权重和其他配置文件
-
-- DPVO 模型：`dpvo-research/dpvo.pth`
-- ORB Vocabulary：`dpvo-research/ORBvoc.txt`
-- DPV-SLAM 长程回环相关权重：
-
-```text
-~/.cache/torch/hub/checkpoints/
-├── depth-save.pth
-└── disk_lightglue_v0-1_arxiv.pth
-```
-
-## 1.3 运行 Demo
-
-DPVO 的 `demo.py` 可直接处理图像序列或视频文件。基本调用格式如下：
-
-```bash
-python demo.py \
-    --imagedir=<图像目录或视频文件> \
-    --calib=<相机标定文件> \
-    [其他选项]
-```
-
-常用参数：
-
-- `--imagedir`：输入图像目录或视频文件路径。
-- `--calib`：相机内参文件路径。
-- `--stride`：输入帧采样间隔，例如 `--stride=2` 表示每隔 2 帧处理一次。
-- `--viz`：启动 DPViewer，实时显示相机轨迹与三维重建结果。
-- `--plot`：运行结束后保存轨迹图。
-- `--save_trajectory`：将估计轨迹保存为 TUM 格式的 `.txt` 文件。
-- `--save_ply`：将重建点云保存为 `.ply` 文件。
-- `--save_colmap`：将轨迹和点云保存为 COLMAP 文本格式。
-
-### EuRoC 示例
-
-以 `MH_01_easy` 为例：
-
-```bash
-python demo.py \
-    --imagedir=research/assets/datasets/euroc/MH_01_easy/mav0/cam0/data \
-    --calib=calib/euroc.txt \
-    --stride=2 \
-    --plot \
-    --viz \
-    --save_trajectory
-```
-
-该命令使用 EuRoC 左目相机图像运行基础 DPVO，并启用实时可视化、轨迹绘制和轨迹保存。
-
-### 开启 DPV-SLAM 后端
-
-基础 `demo.py` 默认运行 DPVO 视觉里程计。若需要启用 DPV-SLAM 的 SLAM 后端和回环检测功能，在命令末尾增加：
-
-```bash
---opts LOOP_CLOSURE True
-```
-
-例如：
-
-```bash
-python demo.py \
-    --imagedir=research/assets/datasets/euroc/MH_01_easy/mav0/cam0/data \
-    --calib=calib/euroc.txt \
-    --stride=2 \
-    --plot \
-    --viz \
-    --save_trajectory \
-    --opts LOOP_CLOSURE True
-```
-
-### 开启 Classical Loop Closure
-
-若已经按照前文安装 DBoW2、DPRetrieval，并准备好 ORB Vocabulary 和 LightGlue 权重，可进一步启用 Classical Backend：
-
-```bash
---opts CLASSIC_LOOP_CLOSURE True
-```
-
-该后端主要用于处理较大的长程回环。基础实验中可优先使用 DPVO 或 DPV-SLAM，仅在需要测试大尺度回环时启用 Classical Backend。
-
-# 2. Phase 1 — Feasibility Analysis
-
-早期 Exp1–5/Exp6 探索中的有效结论已经提炼并整合进当前 H0/H1/H2；旧实现、命令和 artifacts 不再作为正式研究接口，历史细节可通过 Git history 追溯。
+使用 `research/environment.yml` 中的 DPVO 环境（Python 3.10），并安装项目的 CUDA extensions。
+扩展编译使用 CUDA Toolkit 12.1。运行前准备 EuRoC 数据、DPVO/V-JEPA 权重及正式 YAML 配置指定的路径。
+上游 DPVO 的安装、Demo 和可选后端说明见仓库 README；它们不属于 Phase 1 的正式研究入口。
 
 当前实现位于 `research/src/phase1_feasibility/`，正式配置位于 `research/configs/phase1_feasibility_h0.yaml`、`phase1_feasibility_h1.yaml` 和 `phase1_feasibility_h2.yaml`。三个 runner 不依赖旧实验源码、配置、checkpoint 或 results。
 
@@ -190,6 +42,25 @@ python -m research.src.phase1_feasibility.run_h2 --sequences MH_01_easy
 python -m research.src.phase1_feasibility.run_h2 \
     --sequences MH_01_easy MH_03_medium MH_05_difficult
 ```
+
+三条常规 fresh runner 会把性能诊断与 canonical 结果一起持久化：每个 sequence 的
+`results.json` 包含独立的 `result.performance_diagnostics`；H1/H2 的训练诊断同时保存在
+`INDEX.json -> canonical_checkpoint.training.performance_diagnostics`。sequence 和 aggregate
+summary 会显示简要 wall time、逐卡利用率以及 H2 predictor 的 CPU/CUDA outer totals。
+这些字段固定标记为 diagnostic-only，不进入评价指标、科学 gate、checkpoint tensor、
+模型输入或方法 lineage 决策。H2 还在常规 strict replay 中记录 predictor exclusive
+fine stages和transfer/IPC；H1/H2 training记录data/H2D、forward/loss、backward、
+optimizer/scaler及独立 synchronization wait。
+
+## 正式执行协议
+
+- H0/H1/H2 的 baseline/control 均在 GPU0 上逐 sequence、逐 condition 执行；每条 trajectory 使用独立 DPVO 进程，退出后再启动下一条，不并行多个 DPVO 实验。
+- H2 Predicted JEPA 每次只运行一条 trajectory、一个 DPVO consumer：GPU2 编码 V-JEPA，GPU1 执行 correspondence/transport/predictor，GPU0 执行 native frontend、frozen bridge 和 DPVO。多个 sequence 依次使用同一三卡映射。
+- Stage C 与标准 DPVO 使用相同固定 CPU profile；predictor/encoder 使用隔离的 CPU cores 和单线程配置。正式运行不动态选择 profile。
+- H1/H2 保留多 GPU preparation 和 GPU-resident train/validation；batch、RNG、AMP、optimizer/scaler、两 pass 或 best-checkpoint selection 均按各模块原 recipe 执行。训练准备与 trajectory 生命周期分离。
+- matched trajectory timing 排除训练、离线 preparation、模型加载、worker 启动、warmup 和 artifact I/O；包括在线 observation 处理、pipeline fill/steady/drain、DPVO terminate 及完成所需同步。
+- 正式路径保留 identity/order、exactly-once、capability、轻量 timing/transfer/provenance。完整 payload 验证和 decision trace 不进入正式计时。GPU telemetry 仅用于解释执行环境，不作为资源准入 gate。
+- scientific lineage 与 execution provenance 分离；执行源码变化不绕过或放宽 checkpoint 科学兼容检查。
 
 ## Artifact 与执行策略
 

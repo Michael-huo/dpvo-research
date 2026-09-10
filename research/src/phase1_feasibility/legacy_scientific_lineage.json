@@ -1,0 +1,48 @@
+{
+  "h1": {
+    "a22deddc0629bef067dc1c6872f326c234c3aed1adc0a91f8b9873144f0775e6": {
+      "legacy_source_manifest": {
+        "research/src/phase1_feasibility/run_h1.py": "8a67867176067d532567fe7b0057e2b8bf221e6ef76a7d8c6b6b05baf70d66aa",
+        "research/src/phase1_feasibility/h1_training.py": "b092e54a288f07e2f4a981dc434747eaa06d1d7eb198d02db5f6736cc249313f",
+        "research/src/phase1_feasibility/bridge_checkpoint.py": "26f7dec9f7a22d85e6dba70407d156fad4c6184d36ea779bde3dcef819bab979",
+        "research/src/phase1_feasibility/jepa_fmap.py": "e7eeb7358a8cd3b83ba5ce87170fb245e4a5f6abd8ee643c11ef958d9a672dc9",
+        "research/src/phase1_feasibility/jepa_runtime.py": "d5c695334c507a8fbe1436a83614cec0efe7ca2479ad9b3f2f19a3518ca40564",
+        "research/src/phase1_feasibility/jepa_worker.py": "e534896d9b5179f304d4678e1cd96a5395b5dc98d66baf3b7bbe20b15666c4e1",
+        "research/src/phase1_feasibility/oracle_packet.py": "9cea15692c2ad20a2990236fe1994258e36a3cf1d3febb423ab0e3ef16811230",
+        "research/src/phase1_feasibility/protocol.py": "806fb7296dd9a5a6220576bb64ffdb84a10fc1a5928b8cadd85a3fbcd3f5d958",
+        "research/src/phase1_feasibility/schema.py": "d47ee7e6925014a2dc4e7140c1d2a67c1ad36f689e2bbdcf1e9a1912af96a03c"
+      },
+      "scientific_source_sha256": "446c0b5a2ccc1a7240e74bd7b1b373a9965670afa5b8b2a34d9d72c5355f28f5",
+      "migration": "Audited Phase 1 execution/scientific contract separation; original canonical weights untouched"
+    },
+    "3cccc695556c6383e213e9bb67346cf1ab1013a48d35eb5b8de007c9245b2a2f": {
+      "legacy_scientific_contract": "phase1_scientific_dependencies_v1",
+      "scientific_source_sha256": "446c0b5a2ccc1a7240e74bd7b1b373a9965670afa5b8b2a34d9d72c5355f28f5",
+      "migration": "Narrowed the audited dependency set; model, data, recipe, coordinate and transport contracts are unchanged"
+    }
+  },
+  "h2": {
+    "dc05048faf5082ca8e88d9424927c3ebfaf48f1f04c88453b9b76c88277f5fee": {
+      "legacy_source_manifest": {
+        "research/src/phase1_feasibility/run_h2.py": "4e2bcee828cf0180176d2aa8f927cefa92d8389e58dddbe81b9beed193dd7fea",
+        "research/src/phase1_feasibility/h2_training.py": "f993bcedc76f0d2c3fbb227733ef6f8873e71ade0eaac5043f2e5ddb18078cec",
+        "research/src/phase1_feasibility/predictor.py": "9eeca096dbc6bc5063ec04cb57193ef860154f1d371949e2a910ec33eda8fce9",
+        "research/src/phase1_feasibility/transport.py": "a47e63caffe060771fba86726868d0c214c38aa9cc4c690be9780b25fda7d172",
+        "research/src/phase1_feasibility/jepa_fmap.py": "e7eeb7358a8cd3b83ba5ce87170fb245e4a5f6abd8ee643c11ef958d9a672dc9",
+        "research/src/phase1_feasibility/jepa_runtime.py": "d5c695334c507a8fbe1436a83614cec0efe7ca2479ad9b3f2f19a3518ca40564",
+        "research/src/phase1_feasibility/jepa_worker.py": "e534896d9b5179f304d4678e1cd96a5395b5dc98d66baf3b7bbe20b15666c4e1",
+        "research/src/phase1_feasibility/oracle_packet.py": "9cea15692c2ad20a2990236fe1994258e36a3cf1d3febb423ab0e3ef16811230",
+        "research/src/phase1_feasibility/protocol.py": "806fb7296dd9a5a6220576bb64ffdb84a10fc1a5928b8cadd85a3fbcd3f5d958",
+        "research/src/phase1_feasibility/schema.py": "d47ee7e6925014a2dc4e7140c1d2a67c1ad36f689e2bbdcf1e9a1912af96a03c",
+        "research/src/phase1_feasibility/efficiency_profiling.py": "f98554ee32484a024106eec1423e372bcb33c1a9d365e745c311ff01b449b112"
+      },
+      "scientific_source_sha256": "270206259aae382a17b64a47d6b8571671685d88874a8872bee501f26e61b7cb",
+      "migration": "Audited Phase 1 execution/scientific contract separation; original canonical weights untouched"
+    },
+    "30292c4de11b371c7f6491027081552dbff315c094485ee70e4765fb7d660dbb": {
+      "legacy_scientific_contract": "phase1_scientific_dependencies_v1",
+      "scientific_source_sha256": "270206259aae382a17b64a47d6b8571671685d88874a8872bee501f26e61b7cb",
+      "migration": "Narrowed the audited dependency set; model, data, recipe, coordinate and transport contracts are unchanged"
+    }
+  }
+}

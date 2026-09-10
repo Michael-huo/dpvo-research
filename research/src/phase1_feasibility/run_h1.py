@@ -6,6 +6,7 @@ import argparse
 import json
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -21,17 +22,19 @@ from .evaluation import (dense_hidden_ate, evaluate_paired_trajectory,
                          filter_groundtruth_associable_timestamps,
                          freeze_evaluation_population, plot_canonical_trajectories,
                          population_coverage)
+from .efficiency_profiling import (
+    PerformanceRecorder, PersistentPerformanceAudit, add_cuda_worker_mapping,
+    condition_runtime_diagnostics, performance_diagnosis,
+)
 from .jepa_runtime import sequence_geometry, state_dict_sha256
 from .jepa_fmap import (
-    build_bridge, contiguous_split,
-    coordinate_protocol_metadata, hidden_split_keys,
+    contiguous_split, coordinate_protocol_metadata, hidden_split_keys,
 )
 from .protocol import (REPO_ROOT, SUPPORTED_SEQUENCES, canonical_sha256,
                        load_sequence_records, post_bootstrap_ratio_roles,
                        ratio_schedule_payload, repo_path, sha256_file)
 from .h1_training import (FeatureStore, HiddenFMapProvider, _previous_anchor_mapping,
-                          evaluate_representation_control, extract_feature_store,
-                          train_bridge)
+                          evaluate_representation_control, train_bridge)
 from .runtime import (OnlineFrame, materialize_schedule, run_formal_mode,
                       sanitize_full_oracle_frames)
 from .schema import condition_metadata
@@ -41,6 +44,13 @@ from .registry import (
     sequence_entry, validate_module_manifest, write_registry_and_summary,
     write_sequence_metadata,
 )
+from .execution_runtime import (
+    cpu_numa_layout, execution_provenance, initialize_formal_main_process,
+    release_cuda_training_state, require_lifecycle_cleanup, runtime_provenance,
+    fixed_cpu_profile,
+)
+from .parallel_runtime import extract_parallel, run_sequential_trajectory_jobs
+from .training_runtime import ResidentH1View
 
 DEFAULT_CONFIG = H1_CONFIG_PATH
 TRAINING_SEQUENCE = H1_TRAINING_SEQUENCE
@@ -59,7 +69,8 @@ def _compact_runtime(row: Mapping[str, Any]) -> dict[str, Any]:
         "hidden_online_rgb_violation_count", "factor_count_allocated",
         "hidden_source_factor_count", "hidden_target_factor_count",
         "finite_trajectory", "tracking_success", "trajectory_pose_count",
-        "timestamp_contract_exact", "elapsed_seconds", "peak_gpu_vram_bytes",
+        "timestamp_contract_exact", "model_training", "gradient_enabled",
+        "elapsed_seconds", "peak_gpu_vram_bytes",
         "representation", "hidden_provider_usage",
     )
     return {key: row.get(key) for key in keys}
@@ -130,34 +141,82 @@ def _feature_diagnostics(path: Path, store: FeatureStore, model: torch.nn.Module
             "online_model_or_dpvo_input": False}
 
 
-def _run_sequence(
-    records: Sequence[Any], calibration: np.ndarray, schedule: Mapping[str, Any],
-    roles: Mapping[str, str], store: FeatureStore, model: torch.nn.Module,
-    config: Mapping[str, Any], output: Path,
+def _feature_store_descriptor(store: FeatureStore) -> dict[str, Any]:
+    return {
+        "block5_path": str(Path(store.block5.filename).resolve()),
+        "block5_shape": list(store.block5.shape),
+        "teacher_path": str(Path(store.teacher.filename).resolve()),
+        "teacher_shape": list(store.teacher.shape),
+        "index": dict(store.index),
+        "identity_keys": list(store.identity_keys),
+    }
+
+
+def _run_condition(
+    condition: str, records: Sequence[Any], calibration: np.ndarray,
+    roles: Mapping[str, str], store: FeatureStore | None,
+    model: torch.nn.Module | None, config: Mapping[str, Any], temporary: Path,
 ) -> dict[str, Any]:
     sequence = records[0].identity.sequence
-    previous_anchor = _previous_anchor_mapping(records, roles)
     all_online = [OnlineFrame(row.identity, row.rgb_path) for row in records]
     packet_online = sanitize_full_oracle_frames(records, roles)
-    all_anchor_roles = {row.identity.key: "anchor" for row in records}
-    runtimes: dict[str, Any] = {}
-    arrays: dict[str, Any] = {}
-    runtimes["full_rgb"], arrays["full_rgb"] = run_formal_mode(
-        "matched_full_rgb", all_online, calibration, config,
-        roles=all_anchor_roles, condition_name="full_rgb",
-    )
-    runtimes["sparse_rgb"], arrays["sparse_rgb"] = run_formal_mode(
-        "sparse_rgb", packet_online, calibration, config,
-        roles=roles, condition_name="sparse_rgb",
-    )
-    for name in ("true_fmap", "oracle_jepa_bridge"):
-        provider = HiddenFMapProvider(
-            name, store, previous_anchor, model if name == "oracle_jepa_bridge" else None,
+    if condition == "full_rgb":
+        runtime, arrays = run_formal_mode(
+            "matched_full_rgb", all_online, calibration, config,
+            roles={row.identity.key: "anchor" for row in records},
+            condition_name=condition, collect_graph_trace=False,
         )
-        runtimes[name], arrays[name] = run_formal_mode(
-            "fmap_zero_context", packet_online, calibration, config, roles=roles,
-            hidden_provider=provider, condition_name=name,
+        return {"condition": condition, "runtime": runtime, "arrays": arrays}
+    if condition == "sparse_rgb":
+        runtime, arrays = run_formal_mode(
+            "sparse_rgb", packet_online, calibration, config,
+            roles=roles, condition_name=condition, collect_graph_trace=False,
         )
+        return {"condition": condition, "runtime": runtime, "arrays": arrays}
+    if condition not in {"true_fmap", "oracle_jepa_bridge"} or store is None:
+        raise ValueError(f"unsupported or unprepared H1 condition: {condition}")
+    provider = HiddenFMapProvider(
+        condition, store, _previous_anchor_mapping(records, roles),
+        model if condition == "oracle_jepa_bridge" else None,
+    )
+    runtime, arrays = run_formal_mode(
+        "fmap_zero_context", packet_online, calibration, config, roles=roles,
+        hidden_provider=provider, condition_name=condition,
+        collect_graph_trace=False,
+    )
+    result = {"condition": condition, "runtime": runtime, "arrays": arrays}
+    if condition == "oracle_jepa_bridge":
+        if model is None:
+            raise RuntimeError("frozen H1 bridge is missing")
+        path = temporary / "feature_diagnostics.png"
+        result["feature_diagnostics"] = _feature_diagnostics(
+            path, store, model,
+            [row.identity.key for row in records if roles[row.identity.key] == "hidden"],
+            int(config["experiment"]["seed"]),
+        )
+        result["feature_diagnostics_path"] = str(path)
+    return result
+
+
+def _assemble_sequence(
+    records: Sequence[Any], schedule: Mapping[str, Any], roles: Mapping[str, str],
+    condition_rows: Sequence[Mapping[str, Any]], config: Mapping[str, Any],
+    output: Path,
+) -> dict[str, Any]:
+    sequence = records[0].identity.sequence
+    by_condition = {row["condition"]: row for row in condition_rows}
+    if set(by_condition) != set(CONDITIONS):
+        raise RuntimeError(f"incomplete H1 condition population for {sequence}")
+    runtimes = {name: by_condition[name]["runtime"] for name in CONDITIONS}
+    arrays = {name: by_condition[name]["arrays"] for name in CONDITIONS}
+    expected_bootstrap = int(schedule["bootstrap_end_candidate_index"])
+    changed = {
+        name: row.get("bootstrap_end_candidate_index")
+        for name, row in runtimes.items()
+        if int(row.get("bootstrap_end_candidate_index", -1)) != expected_bootstrap
+    }
+    if changed:
+        raise RuntimeError(f"H1 frozen bootstrap boundary changed: {changed}")
     groundtruth = repo_path(config["dataset"]["groundtruth_pattern"].format(sequence=sequence))
     anchors = [row for row in records if roles[row.identity.key] == "anchor"]
     hidden = [row for row in records if roles[row.identity.key] == "hidden"]
@@ -200,10 +259,9 @@ def _run_sequence(
         labels={"full_rgb": "Full RGB", "sparse_rgb": "Sparse RGB",
                 "true_fmap": "True FMap", "oracle_jepa_bridge": "Oracle JEPA→Bridge"},
     )
-    diagnostics = _feature_diagnostics(
-        output / "feature_diagnostics.png", store, model,
-        [row.identity.key for row in hidden], int(config["experiment"]["seed"]),
-    )
+    oracle = by_condition["oracle_jepa_bridge"]
+    shutil.copy2(oracle["feature_diagnostics_path"], output / "feature_diagnostics.png")
+    diagnostics = oracle["feature_diagnostics"]
     return {
         "evaluation_role": ("bridge_development_in_sequence_feasibility"
                             if sequence == TRAINING_SEQUENCE else "frozen_bridge_zero_shot"),
@@ -260,14 +318,17 @@ def _training_details(
 
 
 def run(sequences: Sequence[str]) -> dict[str, Any]:
+    command_started = time.perf_counter()
     config, config_path = load_config()
     requested = resolve_sequences(sequences, config["experiment"]["default_sequences"])
+    formal_runtime = initialize_formal_main_process()
     root = repo_path(config["paths"]["output_root"])
     root.parent.mkdir(parents=True, exist_ok=True)
     calibration = np.loadtxt(repo_path(config["paths"]["calibration"]), delimiter=" ")
     evaluation_source_files = h1_training_sources() + tuple(
         Path(__file__).with_name(name) for name in (
             "runtime.py", "dpvo_backend.py", "evaluation.py", "registry.py", "canonical.py",
+            "efficiency_profiling.py",
         )
     )
     training_records, training_base, training_provenance = h1_training_context(config)
@@ -278,33 +339,101 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         (staged_root / "sequences").mkdir(parents=True)
         checkpoint_path = staged_root / "bridge.pt"
         index = empty_index("h1_interface", requested)
+        layout = cpu_numa_layout(formal_runtime["hardware"])
+        stage_c = fixed_cpu_profile(layout)["stage_c"]
+        schedule_rows, training_schedule_execution = run_sequential_trajectory_jobs(
+            [{"kind": "materialize_schedule", "records": training_records,
+              "calibration": calibration, "config": config,
+              "sequence": TRAINING_SEQUENCE}],
+            temporary / "h1_training_schedule", cpu_profile=stage_c,
+            hardware=formal_runtime["hardware"],
+        )
+        training_bootstrap = schedule_rows[0]["schedule"]
 
-        bootstrap = materialize_schedule(training_records, calibration, config)
-        training = _training_details(
-            training_records, int(bootstrap["bootstrap_end_candidate_index"]),
-            calibration, config, training_base,
+        with PersistentPerformanceAudit(
+            "h1_interface", "canonical_bridge_training",
+            components=("bridge_training_main_process",),
+        ) as training_performance:
+            with training_performance.phase("schedule_and_split"):
+                training = _training_details(
+                    training_records,
+                    int(training_bootstrap["bootstrap_end_candidate_index"]),
+                    calibration, config, training_base,
+                )
+                training_temp = temporary / "training"
+                training_temp.mkdir()
+            with training_performance.phase("offline_feature_extraction"):
+                training_store, training_extraction = extract_parallel(
+                    training_records,
+                    set().union(*map(set, training["split_keys"].values())),
+                    calibration, config, training_temp, training["transform"],
+                    devices=(0, 1, 2),
+                    h1_hidden_keys=set().union(*map(set, training["split_keys"].values())),
+                )
+            with training_performance.phase("resident_initialization"):
+                resident_training = ResidentH1View(
+                    training_store, training["split_keys"], device=torch.device("cuda:1"),
+                )
+            with training_performance.phase("bridge_training"):
+                training_batch_performance = PerformanceRecorder(enable_cuda=True)
+                validation_batch_performance = PerformanceRecorder(enable_cuda=True)
+                model, training_summary = train_bridge(
+                    resident_training, training["split_keys"], training["transform"],
+                    config, checkpoint_path, training["lineage"],
+                    profiler=training_batch_performance,
+                    validation_profiler=validation_batch_performance,
+                )
+            residency = dict(resident_training.rows.diagnostics)
+            residency["full_train_validation_residency"] = (
+                residency["resident_rows"] == residency["allowed_rows"]
+            )
+            residency["eliminated_memmap_h2d_bytes_per_epoch"] = (
+                residency["native_bytes"]
+            )
+            resident_training.close()
+            with training_performance.phase("held_out_representation"):
+                representation = evaluate_representation_control(
+                    model, training_store, training["split_keys"]["test"],
+                    training["transform"], config,
+                )
+            with training_performance.phase("checkpoint_validation"):
+                checked_model, _, _ = load_compatible_bridge(
+                    checkpoint_path, training["transform"],
+                    hidden_channels=int(config["bridge"]["hidden_channels"]),
+                    expected_training_input=h1_training_input(training_base),
+                    expected_training_lineage=training["lineage"],
+                )
+                del checked_model
+        training_performance_payload = training_performance.payload()
+        add_cuda_worker_mapping(
+            training_performance_payload, training_extraction["workers"][0],
         )
-        training_temp = temporary / "training"
-        training_temp.mkdir()
-        training_store, training_extraction = extract_feature_store(
-            training_records, set().union(*map(set, training["split_keys"].values())),
-            calibration, config, training_temp, training["transform"],
+        training_performance_payload["execution_backend_provenance"] = (
+            execution_provenance()
         )
-        model, training_summary = train_bridge(
-            training_store, training["split_keys"], training["transform"], config,
-            checkpoint_path, training["lineage"],
+        training_performance_payload["formal_hardware"] = formal_runtime
+        training_performance_payload["training_runtime"] = runtime_provenance(
+            formal_runtime["runtime_settings"], component="h1_bridge_post_training",
+            model=model, amp=True,
         )
-        representation = evaluate_representation_control(
-            model, training_store, training["split_keys"]["test"],
-            training["transform"], config,
+        training_performance_payload["residency"] = residency
+        training_performance_payload["efficiency"] = {
+            "domain": "research_throughput",
+            "parallel_preparation_seconds": training_extraction["elapsed_seconds"],
+            "resident_training_wall_seconds": training_summary["elapsed_seconds"],
+            "resident_epoch_wall_seconds": [
+                row["epoch_wall_seconds"] for row in training_summary["history"]
+            ],
+            "formal_measurement": True,
+            "ddp": "not_implemented; resident path preserves canonical batch and optimizer semantics",
+        }
+        training_performance_payload["training_throughput"] = {
+            "training_batches": training_batch_performance.payload(),
+            "validation_batches": validation_batch_performance.payload(),
+        }
+        training_performance_payload["diagnosis"] = performance_diagnosis(
+            training_performance_payload
         )
-        checked_model, _, _ = load_compatible_bridge(
-            checkpoint_path, training["transform"],
-            hidden_channels=int(config["bridge"]["hidden_channels"]),
-            expected_training_input=h1_training_input(training_base),
-            expected_training_lineage=training["lineage"],
-        )
-        del checked_model
         training_record = {
             "sequence": TRAINING_SEQUENCE, "lineage": training["lineage"],
             "schedule": training["schedule"], "split": training["split"],
@@ -312,17 +441,107 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             "coordinate_transform": training["geometry"],
             "summary": training_summary,
             "held_out_representation": representation,
+            "performance_diagnostics": training_performance_payload,
+            "execution_backend_provenance": execution_provenance(),
             "provenance": training_provenance | {
                 "config_file": str(config_path.relative_to(REPO_ROOT)),
                 "config_file_sha256": sha256_file(config_path),
+                "execution_backend_provenance": execution_provenance(),
+                "formal_hardware": formal_runtime,
             },
         }
         bridge_sha256 = sha256_file(checkpoint_path)
-        records_by_sequence: dict[str, Sequence[Any]] = {TRAINING_SEQUENCE: training_records}
+        bridge_state_sha256 = state_dict_sha256(model.state_dict())
+        model.cpu()
+        schedule_cleanup = release_cuda_training_state(resident_training)
+        require_lifecycle_cleanup(schedule_cleanup)
+        del resident_training, model
+        evaluation_inputs = {}
+        evaluation_stores = {}
+        evaluation_preparation = {}
+        nontraining_records = {
+            sequence: load_sequence_records(config, sequence)
+            for sequence in requested if sequence != TRAINING_SEQUENCE
+        }
+        if nontraining_records:
+            schedule_rows, evaluation_schedule_execution = run_sequential_trajectory_jobs(
+                [
+                    {"kind": "materialize_schedule", "records": records,
+                     "calibration": calibration, "config": config,
+                     "sequence": sequence}
+                    for sequence, records in nontraining_records.items()
+                ],
+                temporary / "h1_evaluation_schedules", cpu_profile=stage_c,
+                hardware=formal_runtime["hardware"],
+            )
+            evaluation_schedules = {
+                row["sequence"]: row["schedule"] for row in schedule_rows
+            }
+        else:
+            evaluation_schedule_execution = None
+            evaluation_schedules = {}
         for sequence in requested:
-            if sequence not in records_by_sequence:
-                records_by_sequence[sequence] = load_sequence_records(config, sequence)
-            records = records_by_sequence[sequence]
+            if sequence == TRAINING_SEQUENCE:
+                records = training_records
+                roles = training["roles"]
+                schedule = training["schedule"]
+                transform = training["transform"]
+                geometry = training["geometry"]
+                store = training_store
+                extraction = training_extraction
+            else:
+                records = nontraining_records[sequence]
+                bootstrap = evaluation_schedules[sequence]
+                bootstrap_end = int(bootstrap["bootstrap_end_candidate_index"])
+                identities = [row.identity for row in records]
+                roles = post_bootstrap_ratio_roles(
+                    identities, bootstrap_end_candidate_index=bootstrap_end,
+                    anchor_ratio=float(config["experiment"]["anchor_ratio"]),
+                )
+                schedule = ratio_schedule_payload(
+                    identities, bootstrap_end_candidate_index=bootstrap_end,
+                    anchor_ratio=float(config["experiment"]["anchor_ratio"]),
+                )
+                transform, geometry = sequence_geometry(
+                    records[0], calibration, config,
+                )
+                hidden_keys = {
+                    row.identity.key for row in records
+                    if roles[row.identity.key] == "hidden"
+                }
+                sequence_prepare = temporary / f"h1_prepare_{sequence}"
+                store, extraction = extract_parallel(
+                    records, hidden_keys, calibration, config, sequence_prepare,
+                    transform, devices=(0, 1, 2), h1_hidden_keys=hidden_keys,
+                )
+            evaluation_inputs[sequence] = {
+                "records": records, "roles": roles, "schedule": schedule,
+                "transform": transform, "geometry": geometry,
+            }
+            evaluation_stores[sequence] = store
+            evaluation_preparation[sequence] = extraction
+        evaluation_jobs = []
+        for sequence in requested:
+            values = evaluation_inputs[sequence]
+            descriptor = _feature_store_descriptor(evaluation_stores[sequence])
+            for condition in CONDITIONS:
+                evaluation_jobs.append({
+                    "kind": "formal_h1_condition", "config": config,
+                    "sequence": sequence, "condition": condition,
+                    "calibration": calibration, "checkpoint": str(checkpoint_path),
+                    "records": values["records"], "roles": values["roles"],
+                    "transform": values["transform"], "store": descriptor,
+                })
+        cleanup_before_trajectories = release_cuda_training_state()
+        require_lifecycle_cleanup(cleanup_before_trajectories)
+        completed, evaluation_scheduler = run_sequential_trajectory_jobs(
+            evaluation_jobs, temporary / "h1_evaluation_jobs", cpu_profile=stage_c,
+            hardware=formal_runtime["hardware"],
+        )
+        completed_by_sequence = {sequence: [] for sequence in requested}
+        for job in completed:
+            completed_by_sequence[job["sequence"]].append(job)
+        for sequence in requested:
             base, provenance = base_lineage(
                 config, sequence, evaluation_source_files,
                 h0_contract_sha256=VISUAL_STATE_CONTRACT_SHA256,
@@ -331,39 +550,32 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             provenance = provenance | {
                 "config_file": str(config_path.relative_to(REPO_ROOT)),
                 "config_file_sha256": sha256_file(config_path),
+                "execution_backend_provenance": execution_provenance(),
+                "formal_hardware": formal_runtime,
             }
-            if sequence == TRAINING_SEQUENCE:
-                roles, schedule, transform = (
-                    training["roles"], training["schedule"], training["transform"],
-                )
-                current_store, extraction = training_store, training_extraction
-            else:
-                bootstrap = materialize_schedule(records, calibration, config)
-                roles = post_bootstrap_ratio_roles(
-                    [row.identity for row in records],
-                    bootstrap_end_candidate_index=int(bootstrap["bootstrap_end_candidate_index"]),
-                    anchor_ratio=float(config["experiment"]["anchor_ratio"]),
-                )
-                schedule = ratio_schedule_payload(
-                    [row.identity for row in records],
-                    bootstrap_end_candidate_index=int(bootstrap["bootstrap_end_candidate_index"]),
-                    anchor_ratio=float(config["experiment"]["anchor_ratio"]),
-                )
-                transform, _ = sequence_geometry(records[0], calibration, config)
-                evaluation_temp = temporary / f"evaluation_{sequence}"
-                evaluation_temp.mkdir()
-                hidden = {row.identity.key for row in records if roles[row.identity.key] == "hidden"}
-                current_store, extraction = extract_feature_store(
-                    records, hidden, calibration, config, evaluation_temp, transform,
-                )
-            evaluation_model = build_bridge(transform, channels=160).cuda().eval()
-            evaluation_model.load_state_dict(model.state_dict(), strict=True)
             output = staged_root / "sequences" / sequence
-            result = _run_sequence(
-                records, calibration, schedule, roles, current_store, evaluation_model,
-                config, output,
+            values = evaluation_inputs[sequence]
+            sequence_jobs = completed_by_sequence[sequence]
+            result = _assemble_sequence(
+                values["records"], values["schedule"], values["roles"],
+                sequence_jobs, config, output,
             )
+            extraction = evaluation_preparation[sequence]
+            performance_payload = {
+                "schema": "phase1_condition_job_performance_v1",
+                "conditions": {
+                    row["condition"]: row["performance"] for row in sequence_jobs
+                },
+                "condition_runtime": condition_runtime_diagnostics(result),
+            }
+            performance_payload["diagnosis"] = performance_diagnosis(
+                performance_payload
+            )
+            performance_payload["sequential_evaluation"] = evaluation_scheduler
+            performance_payload["execution_backend_provenance"] = execution_provenance()
+            result["performance_diagnostics"] = performance_payload
             result["oracle_extraction"] = extraction
+            schedule = result["schedule"]
             lineage = complete_lineage(base, schedule["schedule_sha256"])
             write_sequence_metadata(
                 output, "h1_interface", sequence, result, lineage, provenance,
@@ -372,16 +584,33 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 output, "h1_interface", lineage,
                 bootstrap_end_candidate_index=result["schedule"]["bootstrap_end_candidate_index"],
             )
-            del evaluation_model
-            if current_store is not training_store:
-                current_store.close()
+
+        for sequence, store in evaluation_stores.items():
+            if sequence != TRAINING_SEQUENCE:
+                store.close()
 
         training_store.close()
         index["canonical_checkpoint"] = {
             "file": "bridge.pt", "file_sha256": sha256_file(checkpoint_path),
-            "state_dict_sha256": state_dict_sha256(model.state_dict()),
+            "state_dict_sha256": bridge_state_sha256,
             "training_lineage_sha256": training["lineage"]["training_lineage_sha256"],
             "training": training_record,
+        }
+        total_makespan = time.perf_counter() - command_started
+        index["execution"] = {
+            "schema": "phase1_formal_execution_summary_v1",
+            "hardware": formal_runtime,
+            "provenance": execution_provenance(),
+            "parallel_preparation": training_extraction,
+            "evaluation_preparation": evaluation_preparation,
+            "sequential_evaluation": evaluation_scheduler,
+            "training_schedule_materialization": training_schedule_execution,
+            "evaluation_schedule_materialization": evaluation_schedule_execution,
+            "cleanup_before_evaluation_schedules": schedule_cleanup,
+            "cleanup_before_trajectories": cleanup_before_trajectories,
+            "residency": residency,
+            "total_makespan_seconds": total_makespan,
+            "domain": "research_throughput",
         }
         write_registry_and_summary(staged_root, "h1_interface", index)
         validate_module_manifest(staged_root, "h1_interface", index)
@@ -393,6 +622,12 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         "fresh_sequences": list(requested),
         "checkpoint_training": "fresh",
         "run_policy": "fresh_current_canonical_replace",
+        "performance_diagnostics": {
+            "persistent": True,
+            "sequence_result_field": "result.performance_diagnostics",
+            "training_field": "canonical_checkpoint.training.performance_diagnostics",
+            "aggregate_summary": "SUMMARY_H1.md",
+        },
     }
 
 
