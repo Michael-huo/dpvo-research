@@ -6,14 +6,18 @@
 扩展编译使用 CUDA Toolkit 12.1。运行前准备 EuRoC 数据、DPVO/V-JEPA 权重及正式 YAML 配置指定的路径。
 上游 DPVO 的安装、Demo 和可选后端说明见仓库 README；它们不属于 Phase 1 的正式研究入口。
 
-当前实现位于 `research/src/phase1_feasibility/`，正式配置位于 `research/configs/phase1_feasibility_h0.yaml`、`phase1_feasibility_h1.yaml` 和 `phase1_feasibility_h2.yaml`。三个 runner 不依赖旧实验源码、配置、checkpoint 或 results。
+源码按功能平铺在 `research/src/`，以文件名表达职责，供后续研究阶段复用。Phase 用于科学实验组织和 results，不再作为源码 namespace；Phase 1 的 H0 State、H1 Interface、H2 Prediction 定义不变。正式配置仍为 `research/configs/phase1_feasibility_h0.yaml`、`phase1_feasibility_h1.yaml` 和 `phase1_feasibility_h2.yaml`。
+
+唯一三个公开研究 CLI 为 `research.src.run_h0`、`research.src.run_h1`、`research.src.run_h2`。`jepa_worker`、`pipeline_worker`、`parallel_runtime` 的 module 启动方式仅供内部进程使用。源码布局迁移不改变科学 lineage 或 canonical checkpoint 兼容性；execution provenance 如实记录当前源码路径与 hash。
+
+在仓库根目录执行 CPU/unit 验证：`CUDA_VISIBLE_DEVICES="" python -m unittest discover -s research/src -t . -v`。测试覆盖 CLI mock dispatch、worker fresh-process/spawn 导入；安装了 canonical artifacts 时还会只读验证 H1/H2 checkpoint。
 
 ## H0 State — Latent-State Feasibility
 
 H0 回答“learning-based VSLAM 的 hidden frame 最少需要什么 latent visual state”。conditions 固定为 Full RGB、Sparse RGB 和 True FMap。hidden packet 只保存 `fmap`；`patch_xy` 按 FrameIdentity/seed 确定性派生，`gmap/fmap2` 从 FMap 派生，`imap` 为 zero，colors 删除；pose/depth、factor、update、BA 与 upstream culling 保持正常 DPVO 语义。H0 不加载 JEPA、bridge 或 predictor。
 
 ```bash
-python -m research.src.phase1_feasibility.run_h0 --sequences MH_01_easy
+python -m research.src.run_h0 --sequences MH_01_easy
 ```
 
 ## H1 Interface — Representation-Interface Feasibility
@@ -21,7 +25,7 @@ python -m research.src.phase1_feasibility.run_h0 --sequences MH_01_easy
 H1 验证 Oracle JEPA 能否经 coordinate-correct block-5→FMap interface 提供 H0 latent state。每次显式运行都在 MH01 fresh 训练一次 `bridge.pt`，并使用本轮刚训练的同一个 bridge fresh 评估全部 requested sequences。H1 不读取 H0 results，MH03/MH05 是本轮 bridge 的 frozen zero-shot evaluation。
 
 ```bash
-python -m research.src.phase1_feasibility.run_h1 --sequences MH_01_easy
+python -m research.src.run_h1 --sequences MH_01_easy
 ```
 
 ## H2 Prediction — Sparse-Anchor Prediction Feasibility
@@ -33,13 +37,13 @@ strict 在线 capability 只有 uploaded anchor RGB、anchor identity 和 hidden
 A5 必须真实到达并完成 JEPA 编码，随后才按时间戳顺序提交 buffered hidden observations，且每个 candidate 只消费一次。因此 H2 是 delayed/bracketed、non-causal deployment，`timestamp_causal=false`，不声明 causal 或 strict real-time。
 
 ```bash
-python -m research.src.phase1_feasibility.run_h2 --sequences MH_01_easy
+python -m research.src.run_h2 --sequences MH_01_easy
 ```
 
 三条 CLI 均支持一次请求多个 sequence。需要三序列横向比较时，必须让它们共享同一次 fresh 模型运行：
 
 ```bash
-python -m research.src.phase1_feasibility.run_h2 \
+python -m research.src.run_h2 \
     --sequences MH_01_easy MH_03_medium MH_05_difficult
 ```
 

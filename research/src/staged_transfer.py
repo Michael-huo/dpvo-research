@@ -152,7 +152,7 @@ class GPUWorker:
                  cpu_profile=None):
         self.timeout = timeout; self.responses = queue.Queue(); self.errors = []
         env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = str(device)
-        command = [str(python), "-m", "research.src.phase1_feasibility.pipeline_worker",
+        command = [str(python), "-m", "research.src.pipeline_worker",
                    "--config", str(config_path), "--component", component]
         if cpu_profile is not None:
             cpus = ",".join(str(value) for value in cpu_profile["cpus"])

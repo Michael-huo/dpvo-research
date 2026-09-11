@@ -51,7 +51,7 @@ class DecompositionProtocolTest(unittest.TestCase):
         self.assertEqual(CONDITIONS, ("full_rgb", "sparse_rgb", "true_fmap"))
         self.assertEqual(config["experiment"]["anchor_ratio"], .2)
         source = inspect.getsource(__import__(
-            "research.src.phase1_feasibility.run_h0",
+            "research.src.run_h0",
             fromlist=["run"],
         ))
         self.assertNotIn("jepa_fmap", source)
@@ -62,7 +62,7 @@ class DecompositionProtocolTest(unittest.TestCase):
         source_root = Path(__file__).parent
         runners = {path.name for path in source_root.glob("run_*.py")}
         self.assertEqual(runners, {"run_h0.py", "run_h1.py", "run_h2.py"})
-        config_root = source_root.parents[1] / "configs"
+        config_root = source_root.parent / "configs"
         configs = {path.name for path in config_root.glob("phase1_feasibility_*.yaml")}
         self.assertEqual(configs, {
             "phase1_feasibility_h0.yaml", "phase1_feasibility_h1.yaml",

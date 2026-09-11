@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import queue
+import sys
 import tempfile
 import threading
 import time
@@ -13,7 +14,7 @@ from unittest.mock import MagicMock, PropertyMock, patch
 import numpy as np
 import torch
 
-from . import execution_runtime, parallel_runtime, training_runtime
+from . import execution_runtime, jepa_runtime, parallel_runtime, training_runtime
 from .execution_runtime import (
     FormalExecution, require_lifecycle_cleanup, release_cuda_training_state,
 )
@@ -23,6 +24,42 @@ from .training_runtime import ResidentRows, resident_correspondence
 
 
 class FormalCleanupLifecycleTest(unittest.TestCase):
+    def test_worker_launchers_use_functional_modules_and_original_gpu_mapping(self):
+        with tempfile.TemporaryDirectory() as name:
+            root = Path(name)
+            with patch.object(execution_runtime, "capture_runtime", return_value={}), \
+                 patch.object(jepa_runtime.JepaSidecar, "_receive", return_value={
+                     "status": "ready", "provenance": {},
+                 }), patch("subprocess.Popen") as popen:
+                jepa_runtime.JepaSidecar({"runtime": {"jepa_python": sys.executable}}, root)
+                command = popen.call_args.args[0]
+                self.assertEqual(command[:3], [sys.executable, "-m", "research.src.jepa_worker"])
+                self.assertEqual(popen.call_args.kwargs["cwd"], jepa_runtime.REPO_ROOT)
+
+            for component, device in (("encoder", 2), ("predictor", 1)):
+                ready = {"status": "ready", "provenance": {
+                    "cuda_visible_devices": str(device), "logical_cuda_device_count": 1,
+                    "current_logical_cuda_device": 0,
+                }}
+                with patch("subprocess.Popen") as popen, \
+                     patch.object(threading.Thread, "start"), \
+                     patch.object(GPUWorker, "receive", return_value=ready):
+                    GPUWorker(python=sys.executable, device=device, component=component,
+                              config_path=root / "worker.json")
+                    command = popen.call_args.args[0]
+                    self.assertEqual(command[:3], [sys.executable, "-m", "research.src.pipeline_worker"])
+                    self.assertEqual(command[-2:], ["--component", component])
+                    self.assertEqual(popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], str(device))
+                    self.assertEqual(popen.call_args.kwargs["cwd"], jepa_runtime.REPO_ROOT)
+
+            with patch("subprocess.run") as launch, patch.object(torch, "save"):
+                parallel_runtime._launch({}, root, 0)
+                self.assertEqual(launch.call_args.args[0][:3], [
+                    sys.executable, "-m", "research.src.parallel_runtime",
+                ])
+                self.assertEqual(launch.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "0")
+                self.assertEqual(launch.call_args.kwargs["cwd"], jepa_runtime.REPO_ROOT)
+
     def _health_check_pipeline(self):
         pipeline = object.__new__(CanonicalH2Pipeline)
         pipeline.failures = queue.Queue()
@@ -188,7 +225,7 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
 
     def test_telemetry_exception_is_recorded_without_gating(self) -> None:
         with patch(
-            "research.src.phase1_feasibility.efficiency_profiling.gpu_process_snapshot",
+            "research.src.efficiency_profiling.gpu_process_snapshot",
             side_effect=RuntimeError("diagnostic command failed"),
         ):
             result = parallel_runtime._gpu_process_telemetry()
@@ -375,14 +412,14 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
             with patch.object(
                 CanonicalH2Pipeline, "predictor_config", new_callable=PropertyMock,
             ) as predictor_config, patch(
-                "research.src.phase1_feasibility.h2_pipeline.dataclasses.asdict",
+                "research.src.h2_pipeline.dataclasses.asdict",
                 return_value={},
             ), patch(
-                "research.src.phase1_feasibility.h2_pipeline.GPUWorker", FakeWorker,
+                "research.src.h2_pipeline.GPUWorker", FakeWorker,
             ), patch(
-                "research.src.phase1_feasibility.h2_pipeline.SharedSlot", FakeSlot,
+                "research.src.h2_pipeline.SharedSlot", FakeSlot,
             ), patch(
-                "research.src.phase1_feasibility.h2_pipeline.PinnedTransfer", FakeTransfer,
+                "research.src.h2_pipeline.PinnedTransfer", FakeTransfer,
             ):
                 predictor_config.return_value = {}
                 with self.assertRaisesRegex(RuntimeError, "unfinished tasks"):
