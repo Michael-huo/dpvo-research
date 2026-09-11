@@ -308,7 +308,7 @@ class H2ContractTest(unittest.TestCase):
         self.assertIn("`results.json` is the authoritative sequence result", summary)
 
     def test_h2_does_not_import_h1_runner_or_results(self) -> None:
-        module = __import__("research.src.phase1_feasibility.run_h2", fromlist=["run"])
+        module = __import__("research.src.run_h2", fromlist=["run"])
         source = inspect.getsource(module)
         self.assertNotIn("from .run_h1 import", source)
         self.assertNotIn("h1_interface/results.json", source)
@@ -453,7 +453,7 @@ class H2ContractTest(unittest.TestCase):
         self.assertIn("processed_keys != expected_keys", runtime_source)
 
     def test_h2_uses_only_canonical_training_module(self) -> None:
-        module = __import__("research.src.phase1_feasibility.run_h2", fromlist=["run"])
+        module = __import__("research.src.run_h2", fromlist=["run"])
         source = inspect.getsource(module)
         self.assertNotIn("run_checkpoint_validation", source)
         self.assertIn("from .h2_training import", source)

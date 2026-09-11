@@ -100,7 +100,7 @@ class JepaSidecar:
         atomic_write_json(self.config_path, worker_config)
         self.process = subprocess.Popen(
             [str(worker_config["runtime"]["jepa_python"]), "-m",
-             "research.src.phase1_feasibility.jepa_worker",
+             "research.src.jepa_worker",
              "--config", str(self.config_path)],
             cwd=REPO_ROOT, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, bufsize=1,

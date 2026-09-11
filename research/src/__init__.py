@@ -1,4 +1,4 @@
-"""Canonical Phase 1 feasibility framework."""
+"""Shared research components organized by function."""
 
 from .protocol import FrameIdentity, FrameRole, RepresentationOrigin
 from .schema import VISUAL_STATE_CONTRACT, VISUAL_STATE_CONTRACT_SHA256

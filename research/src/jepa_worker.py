@@ -36,7 +36,7 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     settings = config.get("worker_settings")
     if settings is None:
         raise RuntimeError("V-JEPA worker runtime settings are missing")
-    from research.src.phase1_feasibility.execution_runtime import (
+    from .execution_runtime import (
         apply_runtime, runtime_provenance,
     )
     apply_runtime(settings)

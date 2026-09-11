@@ -52,7 +52,7 @@ def merge_identity_rows(expected_keys, shards):
 def _launch(task,path,device):
     torch.save(task,path/"task.pt")
     env=os.environ.copy();env["CUDA_VISIBLE_DEVICES"]=str(device)
-    command=[sys.executable,"-m","research.src.phase1_feasibility.parallel_runtime",
+    command=[sys.executable,"-m","research.src.parallel_runtime",
              str(path/"task.pt")]
     cpu_profile=task.get("cpu_profile")
     if cpu_profile is not None:

@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 PACKAGE_DIR = Path(__file__).resolve().parent
-REPO_ROOT = PACKAGE_DIR.parents[2]
+REPO_ROOT = PACKAGE_DIR.parents[1]
 RATIO_SCHEDULE_METHOD = "exp6_post_bootstrap_ratio"
 SUPPORTED_SEQUENCES = ("MH_01_easy", "MH_03_medium", "MH_05_difficult")
 
