@@ -131,11 +131,11 @@ class ArchitectureContractTest(unittest.TestCase):
                 process.terminate()
                 process.join(5)
 
-    def test_only_three_public_runners(self) -> None:
+    def test_public_runners_include_anchor_budget(self) -> None:
         root = Path(run_h0.__file__).parent
         self.assertEqual(
             {path.name for path in root.glob("run_*.py")},
-            {"run_h0.py", "run_h1.py", "run_h2.py"},
+            {"run_h0.py", "run_h1.py", "run_h2.py", "run_anchor_budget.py"},
         )
 
     def test_new_package_has_no_legacy_import_or_result_dependency(self) -> None:

@@ -1,0 +1,46 @@
+# Phase 2 overrides only; H2 scientific settings are loaded unchanged.
+schema_version: 1
+sequence: MH_01_easy
+anchor_strides:
+- 3
+- 5
+- 10
+canonical_h2_config: research/configs/phase1_feasibility_h2.yaml
+canonical_h2_config_sha256: 0b1f9c6a15d544784411cf687020d157772e1752cc168ae2e121c7a67db6d4c6
+canonical_h2_index: research/results/phase1-feasibility/h2_prediction/INDEX.json
+canonical_artifact_manifest: research/configs/anchor_budget_canonical_sha256.json
+canonical_artifact_manifest_sha256: c62c3a9e444418f8bdb6c52d2a37a306db575c27d4c0317f5a04d5ae6f85c8a4
+output_root: research/results/phase2-anchor-budget
+fresh_predictor_per_stride: true
+fixed_split:
+  source: frozen_phase1_h2_canonical
+  source_split_sha256: 68eff0d531cb6d3f2d75c14d20a369fc32ef3c51edcfedcb9cae79c5dc364bda
+  bootstrap_end_candidate_index: 7
+  source_candidate_count: 1841
+  endpoint_bounds: inclusive
+  regions:
+    train:
+      candidate_start: 8
+      candidate_end: 1103
+      frame_start: 16
+      frame_end: 2206
+      timestamp_start_ns: 1403636580563555584
+      timestamp_end_ns: 1403636690063555584
+    validation:
+      candidate_start: 1108
+      candidate_end: 1468
+      frame_start: 2216
+      frame_end: 2936
+      timestamp_start_ns: 1403636690563555584
+      timestamp_end_ns: 1403636726563555584
+    test:
+      candidate_start: 1473
+      candidate_end: 1838
+      frame_start: 2946
+      frame_end: 3676
+      timestamp_start_ns: 1403636727063555584
+      timestamp_end_ns: 1403636763563555584
+full_rgb_population:
+  source: phase1_canonical_effective_population
+  candidate_start: 0
+  candidate_end: 1838

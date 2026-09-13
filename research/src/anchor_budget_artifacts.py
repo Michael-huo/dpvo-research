@@ -1,0 +1,383 @@
+"""Lossless scientific aggregation and publication of anchor-budget artifacts.
+
+This module only reads completed results. It never trains, runs SLAM, fits an
+alignment, or computes an evaluation metric. Worker/staging files stay in /tmp.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
+
+import numpy as np
+
+from .protocol import REPO_ROOT, atomic_write_json, canonical_sha256, sha256_file
+
+CHECKPOINT_ROOT = REPO_ROOT / "research/checkpoints/phase2-anchor-budget"
+FORMAL_FILES = {"SUMMARY.md", "results.json", "trajectories.npz",
+                "figures/trajectories.png", "figures/tradeoffs.png"}
+
+
+def inventory(root):
+    return {str(p.relative_to(root)): {"bytes": p.stat().st_size, "sha256": sha256_file(p)}
+            for p in sorted(Path(root).rglob("*")) if p.is_file()}
+
+
+def repository_provenance():
+    def git(*args):
+        return subprocess.check_output(["git", *args], cwd=REPO_ROOT, text=True).strip()
+    return {"git_commit": git("rev-parse", "HEAD"), "worktree_dirty": bool(git("status", "--short"))}
+
+
+def columnar(rows):
+    columns = list(rows[0]) if rows else []
+    if any(set(row) != set(columns) for row in rows):
+        raise ValueError("scientific table columns differ")
+    return {"columns": columns, "rows": [[row[key] for key in columns] for row in rows]}
+
+
+def expand_columns(table):
+    return [dict(zip(table["columns"], row)) for row in table["rows"]]
+
+
+def _array_hash(value):
+    value = np.ascontiguousarray(value)
+    digest = hashlib.sha256()
+    digest.update(str(value.dtype).encode())
+    digest.update(str(value.shape).encode())
+    digest.update(value.tobytes())
+    return digest.hexdigest()
+
+
+def add_trajectory(bundle, name, timestamps, poses):
+    timestamps, poses = np.asarray(timestamps), np.asarray(poses)
+    if poses.shape != (len(timestamps), 7) or len(timestamps) < 2:
+        raise ValueError(f"invalid trajectory shape: {name}")
+    if not np.all(np.diff(timestamps.astype(np.int64)) > 0) or not np.isfinite(poses).all():
+        raise ValueError(f"invalid trajectory values: {name}")
+    bundle[f"{name}__timestamps_ns"] = timestamps.copy()
+    bundle[f"{name}__translation"] = poses[:, :3].copy()
+    bundle[f"{name}__quaternion_xyzw"] = poses[:, 3:7].copy()
+    return {"point_count": len(timestamps), "timestamps_dtype": str(timestamps.dtype),
+            "poses_dtype": str(poses.dtype), "timestamps_sha256": _array_hash(timestamps),
+            "poses_sha256": _array_hash(poses), "quaternion_order": "xyzw",
+            "coordinate_frame": "groundtruth_world" if name == "GT" else "original_dpvo_unaligned"}
+
+
+def reconstruct_trajectory(bundle, name):
+    return {"timestamps_ns": bundle[f"{name}__timestamps_ns"].copy(),
+            "poses": np.concatenate((bundle[f"{name}__translation"],
+                                      bundle[f"{name}__quaternion_xyzw"]), axis=1)}
+
+
+def reconstruct_schedule(bundle, stride):
+    prefix = f"schedule_stride_{stride}__"
+    return {"roles": dict(zip(bundle[prefix + "identities"].tolist(), bundle[prefix + "roles"].tolist())),
+            "intervals": [json.loads(value) for value in bundle[prefix + "intervals_json"].tolist()]}
+
+
+def _compact_condition(row, population_ref):
+    result = {key: copy.deepcopy(value) for key, value in row.items()
+              if key not in {"canonical_population", "provider_usage", "sequential_execution"}}
+    result["evaluation_population_ref"] = population_ref
+    # Aggregate timing/capability fields remain; per-frame worker telemetry does not.
+    if "provider_usage" in row:
+        result["deployment"] = {key: copy.deepcopy(value) for key, value in row["provider_usage"].items()
+                                if key not in {"timeline", "waits", "jepa_worker_pid", "worker_provenance",
+                                               "lifecycle_cleanup", "workers"}}
+    result["execution"] = {key: copy.deepcopy(row["sequential_execution"][key]) for key in (
+        "kind", "condition", "physical_device", "required_physical_devices", "elapsed_seconds")
+        if key in row["sequential_execution"]}
+    if "h2_stage_profile" in result:
+        result["h2_stage_profile"].pop("stage_c_runtime", None)
+        # Already retained verbatim in h2_stage_profile, not two copies.
+        result["runtime"].pop("stage_c_timing", None)
+    return result
+
+
+def _compact_training(training):
+    result = copy.deepcopy(training)
+    for key in ("lineage", "horizon_resolved_quality", "split", "anchor_stride"):
+        result.pop(key)
+    result["epoch_metrics"] = columnar(result["summary"].pop("history"))
+    result["total_wall_seconds"] = result["training_and_diagnostics_wall_seconds"]
+    result["predictor_wall_seconds"] = result["summary"]["elapsed_seconds"]
+    result["total_wall_definition"] = "original_training_and_diagnostics_wall_seconds_includes_preparation"
+    result["development_extraction"].pop("workers", None)
+    # Batch-level extraction timing is debugging detail, not a training target/result.
+    samples = result["test_extraction"].pop("encoder_inference_ms", [])
+    result["test_extraction"]["encoder_inference_summary"] = {
+        "batch_count": len(samples), "total_ms": sum(samples),
+        "source_samples_sha256": canonical_sha256(samples)}
+    runtime = result["test_extraction"].get("jepa", {})
+    runtime.pop("worker_pid", None)
+    runtime.pop("runtime", None)
+    return result
+
+
+def _checkpoint_metadata(path, destination, training, expected_hash):
+    import torch
+    from .predictor import predictor_state_sha256
+    from .anchor_budget_training import validate_stride_lineage
+    if sha256_file(path) != expected_hash:
+        raise RuntimeError("checkpoint file SHA256 mismatch")
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    stride = training["anchor_stride"]
+    lineage = checkpoint["training_lineage"]
+    validate_stride_lineage(lineage, training["lineage"], stride)
+    if predictor_state_sha256(checkpoint["state_dict"]) != checkpoint["state_dict_sha256"]:
+        raise RuntimeError("checkpoint tensor integrity mismatch")
+    return {"relative_path": os.path.relpath(destination, REPO_ROOT), "path_base": "repository_root",
+            "sha256": expected_hash, "stride": stride, "seed": lineage["seed"],
+            "best_epoch": training["summary"]["best_epoch"], "bytes": path.stat().st_size,
+            "state_dict_sha256": checkpoint["state_dict_sha256"],
+            "scientific_lineage_sha256": lineage["training_lineage_sha256"],
+            "scientific_lineage": lineage}
+
+
+def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
+    """Build compact values plus an exact source-data verification contract."""
+    source, checkpoint_root = Path(source), Path(checkpoint_root)
+    original = inventory(source)
+    used = set()
+    def read(name):
+        used.add(str(name))
+        return json.loads((source / name).read_text())
+    index = read("INDEX.json")
+    if index["status"] != "complete":
+        raise RuntimeError("only a completed experiment can be consolidated")
+    strides, sequence = index["anchor_strides"], index["sequence"]
+    if sequence != "MH_01_easy" or not strides or not set(strides) <= {3,5,10}:
+        raise ValueError("unsupported completed pilot")
+    result = {"schema_version": 2, "metadata": {
+        "status": "complete", "sequence": sequence, "anchor_strides": strides,
+        "scientific_question": "How do Sparse RGB and Ours change as anchor upload budget and prediction horizon change?",
+        "fresh_predictor_per_stride": True,
+        "fixed_split": index["preparation"]["fixed_split"],
+        "protocol": index["protocol"], "trajectory_comparison": index["trajectory_comparison"],
+        "config_path": os.path.relpath(index["config"], REPO_ROOT), "config_sha256": index["config_sha256"],
+        "original_run_repository": index.get("repository", {"git_commit": None,
+            "status": "not_recorded_by_original_runner; training_source_hashes_are_preserved_in_checkpoint_lineage"}),
+        "artifact_publication_repository": repository_provenance(),
+        "original_execution": index["execution"],
+        "canonical_artifact_guards": index.get("canonical_artifacts_after", index["preparation"]["canonical_artifacts"]),
+        "stride5_equivalence": index["preparation"]["stride5_equivalence"],
+        "evaluation_populations": {}, "trajectories": {},
+        "plotting": {"projection": "xy", "alignment": "apply_saved_sim3_no_refit",
+                     "full_rgb_alignment": "one_saved_canonical_stride5_sim3_shared_across_panels",
+                     "trend_samples": "measured_points_only_no_interpolation"}},
+        "full_rgb": {}, "strides": {}}
+    metadata = result["metadata"]
+    bundle, proof, checkpoints = {}, {"trajectories": {}, "schedules": {}, "scientific": {}}, []
+    seqroot = Path("sequences") / sequence
+    gt_ref = read(seqroot / "groundtruth.json")
+    gt_path = Path(gt_ref["path"])
+    if sha256_file(gt_path) != gt_ref["sha256"]:
+        raise RuntimeError("groundtruth reference changed")
+    gt = np.loadtxt(gt_path)
+    # Identical to the Phase 1 evaluation reader, including float64 timestamp rounding.
+    gt_ts = np.rint(gt[:, 0]).astype(np.int64)
+    gt_poses = np.concatenate((gt[:, 1:4], gt[:, [5,6,7,4]]), axis=1)
+    metadata["groundtruth"] = {"source_path": os.path.relpath(gt_path, REPO_ROOT),
+                               "source_sha256": gt_ref["sha256"], "role": "reference_not_slam_run",
+                               "timestamp_semantics": "phase1_np_loadtxt_float64_rint_int64",
+                               "scope": "entire_original_gt_reference_included"}
+    metadata["trajectories"]["GT"] = add_trajectory(bundle, "GT", gt_ts, gt_poses)
+    proof["trajectories"]["GT"] = {"timestamps_ns": gt_ts, "poses": gt_poses}
+
+    def trajectory(name, folder, row):
+        path = folder / "trajectory.npz"
+        used.add(str(path))
+        if sha256_file(source / path) != row["trajectory_sha256"]:
+            raise RuntimeError(f"source trajectory hash changed: {name}")
+        with np.load(source / path, allow_pickle=False) as old:
+            if set(old.files) != {"poses", "timestamps_ns"}:
+                raise ValueError(f"unmapped scientific arrays in {path}")
+            arrays = {key: old[key].copy() for key in old.files}
+        metadata["trajectories"][name] = add_trajectory(bundle, name, arrays["timestamps_ns"], arrays["poses"])
+        proof["trajectories"][name] = arrays
+
+    full = read(seqroot / "full_rgb/results.json")
+    metadata["evaluation_populations"]["stride_5"] = full["canonical_population"]
+    result["full_rgb"] = _compact_condition(full, "stride_5")
+    trajectory("Full_RGB", seqroot / "full_rgb", full)
+    proof["scientific"]["full_rgb"] = copy.deepcopy(result["full_rgb"])
+    comparisons, horizons = [], []
+    for stride in strides:
+        folder = seqroot / f"stride_{stride}"
+        old = read(folder / "results.json")
+        schedule = read(folder / "schedule.json")
+        if {key: schedule[key] for key in old["population"]} != old["population"]:
+            raise RuntimeError("schedule summaries disagree")
+        sparse = read(folder / "sparse_rgb/results.json")
+        ours = read(folder / "predicted_jepa/results.json")
+        population_key = f"stride_{stride}"
+        population = sparse["canonical_population"]
+        if population != ours["canonical_population"] or (population_key in metadata["evaluation_populations"]
+                and metadata["evaluation_populations"][population_key] != population):
+            raise RuntimeError("stored evaluation populations disagree")
+        metadata["evaluation_populations"][population_key] = population
+        training = read(Path(old["training_ref"]))
+        query_rows = read(Path(old["training_ref"]).parent / "horizon_queries.json")
+        checkpoint_source = source / old["predictor_ref"]
+        used.add(old["predictor_ref"])
+        destination = checkpoint_root / f"predictor_stride_{stride}.pt"
+        checkpoint = _checkpoint_metadata(checkpoint_source, destination, training, old["predictor_sha256"])
+        checkpoints.append((checkpoint_source, destination, checkpoint["sha256"]))
+        compact_schedule = {key: copy.deepcopy(value) for key, value in old["population"].items()
+                            if key not in {"anchor_stride", "communication"}}
+        compact_schedule["identity_arrays_prefix"] = f"schedule_stride_{stride}__"
+        row = {"schedule": compact_schedule, "communication": old["population"]["communication"],
+               "training": _compact_training(training),
+               "sparse": _compact_condition(sparse, population_key),
+               "ours": _compact_condition(ours, population_key),
+               "horizon": {"by_relative_index": training["horizon_resolved_quality"], "queries": columnar(query_rows)},
+               "comparison": old["comparison"],
+               "provenance": {"checkpoint": checkpoint, "H1_bridge_sha256": training["lineage"]["h1_bridge_sha256"],
+                              "canonical_H2_config_sha256": training["lineage"]["canonical_h2_config_sha256"],
+                              "training_cleanup": old["training_cleanup"]}}
+        result["strides"][str(stride)] = row
+        for name, condition, old_row in (("sparse", "sparse_rgb", sparse), ("ours", "predicted_jepa", ours)):
+            trajectory(f"stride_{stride}_{name}", folder / condition, old_row)
+        prefix = compact_schedule["identity_arrays_prefix"]
+        bundle[prefix + "identities"] = np.asarray(list(schedule["roles"]))
+        bundle[prefix + "roles"] = np.asarray(list(schedule["roles"].values()))
+        bundle[prefix + "intervals_json"] = np.asarray([json.dumps(i, sort_keys=True, separators=(",", ":"))
+                                                       for i in schedule["intervals"]])
+        proof["schedules"][stride] = {"roles": schedule["roles"], "intervals": schedule["intervals"]}
+        proof["scientific"][str(stride)] = copy.deepcopy(row)
+        if expand_columns(row["horizon"]["queries"]) != query_rows or expand_columns(row["training"]["epoch_metrics"]) != training["summary"]["history"]:
+            raise RuntimeError("scientific table conversion was not exact")
+        comparisons.append(old["comparison"])
+        horizons.extend(training["horizon_resolved_quality"])
+    if comparisons != index["accuracy_vs_communication"] or horizons != index["prediction_quality_vs_horizon"]:
+        raise RuntimeError("INDEX scientific tables disagree with per-stride results")
+    for filename, expected in (("accuracy_vs_communication.json", comparisons),
+                               ("prediction_quality_vs_horizon.json", horizons),
+                               ("PREPARATION.json", index["preparation"])):
+        if filename in original and read(filename) != expected:
+            raise RuntimeError(f"duplicate scientific artifact disagrees: {filename}")
+    if "IMPLEMENTATION_CHECKS.json" in original:
+        metadata["prior_implementation_checks"] = read("IMPLEMENTATION_CHECKS.json")
+    derived = {"SUMMARY.md", "accuracy_vs_communication.csv", "prediction_quality_vs_horizon.csv"}
+    unknown = set(original) - used - derived
+    if unknown:
+        raise RuntimeError(f"unmapped files must be audited before cleanup: {sorted(unknown)}")
+    metadata["migration"] = {
+        "original_file_count": len(original), "original_total_bytes": sum(r["bytes"] for r in original.values()),
+        "original_checkpoint_bytes": sum(p.stat().st_size for p,_,_ in checkpoints),
+        "original_artifacts": original,
+        "discarded_debug_fields": ["provider_usage.timeline", "provider_usage.waits", "worker PIDs/runtime telemetry",
+                                    "per-batch test extraction inference samples (aggregate/hash retained)"],
+        "preservation": {"trajectory_arrays_exact": True, "schedule_identities_intervals_exact": True,
+                         "scientific_values_exact": True, "checkpoint_bytes_and_lineage_exact": True,
+                         "no_slam_training_alignment_fit_or_evaluation_run": True}}
+    proof["inventory"] = original
+    return result, bundle, checkpoints, proof
+
+
+def validate_compact(root, *, check_checkpoints=True, proof=None, allow_legacy_models=False):
+    root = Path(root)
+    result = json.loads((root / "results.json").read_text())
+    if result["schema_version"] != 2 or result["metadata"]["status"] != "complete":
+        raise ValueError("not a completed compact artifact")
+    if sha256_file(root / "trajectories.npz") != result["metadata"]["trajectories_npz_sha256"]:
+        raise RuntimeError("consolidated NPZ integrity mismatch")
+    with np.load(root / "trajectories.npz", allow_pickle=False) as bundle:
+        for name, manifest in result["metadata"]["trajectories"].items():
+            arrays = reconstruct_trajectory(bundle, name)
+            if len(arrays["poses"]) != manifest["point_count"] or _array_hash(arrays["poses"]) != manifest["poses_sha256"] or _array_hash(arrays["timestamps_ns"]) != manifest["timestamps_sha256"]:
+                raise RuntimeError(f"trajectory array mismatch: {name}")
+            if proof is not None:
+                for field, value in arrays.items():
+                    before = proof["trajectories"][name][field]
+                    if value.dtype != before.dtype or not np.array_equal(value, before):
+                        raise RuntimeError(f"trajectory changed: {name}/{field}")
+        if proof is not None:
+            for stride, old in proof["schedules"].items():
+                if reconstruct_schedule(bundle, stride) != old:
+                    raise RuntimeError("schedule payload changed")
+    if proof is not None:
+        if result["full_rgb"] != proof["scientific"]["full_rgb"]:
+            raise RuntimeError("Full RGB scientific results changed")
+        for stride in result["strides"]:
+            if result["strides"][stride] != proof["scientific"][stride]:
+                raise RuntimeError(f"scientific results changed: stride {stride}")
+    if check_checkpoints:
+        import torch
+        from .anchor_budget_training import validate_stride_lineage
+        for stride, row in result["strides"].items():
+            expected = row["provenance"]["checkpoint"]
+            path = REPO_ROOT / expected["relative_path"]
+            if path.resolve().is_relative_to(root.resolve()) or sha256_file(path) != expected["sha256"]:
+                raise RuntimeError("checkpoint location/hash mismatch")
+            checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+            validate_stride_lineage(checkpoint["training_lineage"], expected["scientific_lineage"], int(stride))
+    if not allow_legacy_models and any(p.suffix in {".pt", ".pth"} for p in root.rglob("*")):
+        raise RuntimeError("models must not be in compact results")
+    return result
+
+
+def publish_compact(source, destination, checkpoint_root=CHECKPOINT_ROOT):
+    """Validate all replacements before removing the audited old artifacts."""
+    from .anchor_budget_figures import render_figures, write_summary
+    source, destination = Path(source), Path(destination)
+    if (source / ".execute.lock").exists():
+        raise RuntimeError("cannot consolidate an active experiment")
+    if (destination / "results.json").exists():
+        return validate_compact(destination)
+    result, arrays, checkpoints, proof = build_compact(source, checkpoint_root)
+    for _, target, expected in checkpoints:
+        if target.exists() and sha256_file(target) != expected:
+            raise FileExistsError(f"refusing to replace different checkpoint: {target}")
+    with tempfile.TemporaryDirectory(prefix="anchor_budget_publish_", dir="/tmp") as name:
+        staged = Path(name)
+        np.savez_compressed(staged / "trajectories.npz", **arrays)
+        result["metadata"]["trajectories_npz_sha256"] = sha256_file(staged / "trajectories.npz")
+        atomic_write_json(staged / "results.json", result)
+        validate_compact(staged, check_checkpoints=False, proof=proof)
+        render_figures(staged)
+        write_summary(staged)
+        if set(inventory(staged)) != FORMAL_FILES:
+            raise RuntimeError("unexpected staging outputs")
+        # Copy bytes, never reserialize checkpoints. Old files remain until verified publication.
+        for origin, target, expected in checkpoints:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                shutil.copy2(origin, target)
+            if sha256_file(target) != expected:
+                raise RuntimeError("checkpoint relocation changed bytes")
+        validate_compact(staged, proof=proof)
+        if inventory(source) != proof["inventory"]:
+            raise RuntimeError("source artifacts changed during aggregation; cleanup cancelled")
+        destination.mkdir(parents=True, exist_ok=True)
+        if source.resolve() != destination.resolve() and inventory(destination):
+            raise FileExistsError("refusing to overwrite a nonempty result directory")
+        # Keep a temporary recovery copy when replacing an existing formal tree.
+        if source.resolve() == destination.resolve():
+            backup = Path(tempfile.mkdtemp(prefix="anchor_budget_before_publish_", dir="/tmp"))
+            shutil.copytree(source, backup / "artifacts")
+        for relative in sorted(FORMAL_FILES):
+            target = destination / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(staged / relative, target)
+        # Validate the destination, not only the temporary copies, before deletion.
+        for relative in FORMAL_FILES:
+            if sha256_file(destination / relative) != sha256_file(staged / relative):
+                raise RuntimeError("publication copy mismatch; old files retained")
+        validate_compact(destination, proof=proof, allow_legacy_models=True)
+        for relative in proof["inventory"] if source.resolve() == destination.resolve() else ():
+            if relative not in FORMAL_FILES:
+                (destination / relative).unlink()
+        for path in sorted(destination.rglob("*"), key=lambda p: len(p.parts), reverse=True):
+            if path.is_dir() and not any(path.iterdir()):
+                path.rmdir()
+        validate_compact(destination, proof=proof)
+        if set(inventory(destination)) != FORMAL_FILES:
+            raise RuntimeError("formal output contains unexpected files")
+    return result
