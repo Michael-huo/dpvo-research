@@ -266,7 +266,8 @@ class MetricAccumulator:
 def held_out_representation(split_test: Sequence[AnchorInterval], store: CompactFeatureStore,
                             transform: Any, mask: torch.Tensor, robust: RobustCorrespondenceStore,
                             predictor: torch.nn.Module, bridge: torch.nn.Module,
-                            true_teacher: Any) -> dict[str, Any]:
+                            true_teacher: Any, *,
+                            horizon_rows: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     names = ("robust_transport", "predicted_jepa", "oracle_jepa"); token = {name: MetricAccumulator() for name in names}; fmap = {name: MetricAccumulator() for name in names}; gmap = {name: 0. for name in names}; count = 0
     fmap_mask = torch.from_numpy(coordinate_masks(transform)["fmap_valid_mask"]).cuda()
     for batch in _batches(split_test, 2):
@@ -277,6 +278,34 @@ def held_out_representation(split_test: Sequence[AnchorInterval], store: Compact
         queries = [query for interval in batch for query in interval.hidden]
         teacher = _diagnostic_teacher_batch(batch, true_teacher, mask.device)
         for name,value in fmaps.items(): fmap[name].add(value, teacher, fmap_mask)
+        if horizon_rows is not None:
+            # Offline, after checkpoint selection. Reuse the same predictions;
+            # these scalar diagnostics never enter training or online packets.
+            token_cosines = {name: F.cosine_similarity(value.float(), target.float(), dim=1)
+                             [:, mask.bool()].mean(dim=1).cpu().tolist()
+                             for name, value in fields.items()}
+            fmap_cosines = {name: F.cosine_similarity(value.float(), teacher.float(), dim=1)
+                            [:, fmap_mask.bool()].mean(dim=1).cpu().tolist()
+                            for name, value in fmaps.items()}
+            for row, (interval, query) in enumerate(
+                (interval, query) for interval in batch for query in interval.hidden
+            ):
+                horizon_rows.append({
+                    "identity": query.identity.key, "timestamp_ns": query.identity.timestamp_ns,
+                    "interval_index": interval.interval_index,
+                    "anchor0_identity": interval.anchor0.key, "anchor1_identity": interval.anchor1.key,
+                    "relative_hidden_index": query.ordinal, "hidden_count": len(interval.hidden),
+                    "alpha": query.alpha, "delta_t_seconds": query.delta_t_seconds,
+                    "distance_from_previous_anchor_seconds":
+                        (query.identity.timestamp_ns - interval.anchor0.timestamp_ns) / 1e9,
+                    "distance_from_closing_anchor_seconds":
+                        (interval.anchor1.timestamp_ns - query.identity.timestamp_ns) / 1e9,
+                    "predicted_jepa_cosine": token_cosines["predicted_jepa"][row],
+                    "transport_baseline_cosine": token_cosines["robust_transport"][row],
+                    "bridge_fmap_cosine": fmap_cosines["predicted_jepa"][row],
+                    "transport_bridge_fmap_cosine": fmap_cosines["robust_transport"][row],
+                    "fmap_target": "offline_true_fmap_teacher",
+                })
         for row, query in enumerate(queries):
             teacher_state,_ = _derive_frontend_state(
                 FMapZeroContextPacket(teacher[row:row+1,None]), query.identity, 1234,

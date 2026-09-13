@@ -32,6 +32,7 @@ class EvaluationPopulation:
     rpe_pairs_ns: tuple[tuple[int, int], ...]
     horizon_ns: int
     tolerance_ns: int
+    source: str = "canonical_sparse_rgb_reference_k5_groundtruth_associable"
 
     @property
     def population_sha256(self) -> str:
@@ -39,7 +40,7 @@ class EvaluationPopulation:
 
     def to_dict(self, *, include_hash: bool = True) -> dict[str, Any]:
         payload = {
-            "source": "canonical_sparse_rgb_reference_k5_groundtruth_associable",
+            "source": self.source,
             "common_anchor_timestamps_ns": list(self.common_anchor_timestamps_ns),
             "sim3_alignment_timestamps_ns": list(self.common_anchor_timestamps_ns),
             "ate_timestamps_ns": list(self.common_anchor_timestamps_ns),
@@ -56,6 +57,7 @@ class EvaluationPopulation:
 def build_rpe_pairs(
     timestamps_ns: Sequence[int], *, horizon_seconds: float = 1.0,
     tolerance_ns: int = 1_000_000,
+    allow_empty: bool = False,
 ) -> tuple[tuple[int, int], ...]:
     """Build pairs by EuRoC time, never by frame/candidate offsets."""
     timestamps = np.asarray([int(value) for value in timestamps_ns], dtype=np.int64)
@@ -75,20 +77,24 @@ def build_rpe_pairs(
         chosen = min(options, key=lambda index: (abs(int(timestamps[index]) - wanted), index))
         if abs(int(timestamps[chosen]) - wanted) <= int(tolerance_ns):
             result.append((int(left), int(timestamps[chosen])))
-    if not result:
+    if not result and not allow_empty:
         raise ValueError("canonical timestamp population yielded no 1.0 s RPE pairs")
     return tuple(result)
 
 
 def freeze_evaluation_population(
     timestamps_ns: Sequence[int], *, horizon_seconds: float, tolerance_ns: int,
+    allow_empty_rpe: bool = False,
+    source: str = "canonical_sparse_rgb_reference_k5_groundtruth_associable",
 ) -> EvaluationPopulation:
     timestamps = tuple(int(value) for value in timestamps_ns)
     return EvaluationPopulation(
         timestamps,
-        build_rpe_pairs(timestamps, horizon_seconds=horizon_seconds, tolerance_ns=tolerance_ns),
+        build_rpe_pairs(timestamps, horizon_seconds=horizon_seconds, tolerance_ns=tolerance_ns,
+                        allow_empty=allow_empty_rpe),
         int(round(float(horizon_seconds) * 1_000_000_000.0)),
         int(tolerance_ns),
+        source,
     )
 
 
@@ -222,8 +228,10 @@ def evaluate_paired_trajectory(
         "ate_rmse_m": float(np.sqrt(np.mean(np.square(ate_errors)))),
         "rpe_horizon_seconds": population.horizon_ns / 1e9,
         "rpe_pair_count": len(translation_errors),
-        "translation_rpe_rmse_m": float(np.sqrt(np.mean(np.square(translation_errors)))),
-        "rotation_rpe_rmse_deg": float(np.sqrt(np.mean(np.square(rotation_errors)))),
+        "translation_rpe_rmse_m": (float(np.sqrt(np.mean(np.square(translation_errors))))
+                                   if translation_errors else None),
+        "rotation_rpe_rmse_deg": (float(np.sqrt(np.mean(np.square(rotation_errors))))
+                                  if rotation_errors else None),
         "sim3": {
             "scale": fitted["scale"],
             "rotation": np.asarray(fitted["rotation"]).tolist(),

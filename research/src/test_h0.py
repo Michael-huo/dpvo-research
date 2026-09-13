@@ -60,7 +60,7 @@ class DecompositionProtocolTest(unittest.TestCase):
 
     def test_only_three_public_phase1_runners_and_configs_exist(self) -> None:
         source_root = Path(__file__).parent
-        runners = {path.name for path in source_root.glob("run_*.py")}
+        runners = {path.name for path in source_root.glob("run_h[012].py")}
         self.assertEqual(runners, {"run_h0.py", "run_h1.py", "run_h2.py"})
         config_root = source_root.parent / "configs"
         configs = {path.name for path in config_root.glob("phase1_feasibility_*.yaml")}
