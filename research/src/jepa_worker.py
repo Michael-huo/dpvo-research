@@ -39,6 +39,8 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     from .execution_runtime import (
         apply_runtime, runtime_provenance,
     )
+    from .cuda_devices import select_worker_device
+    logical_device = select_worker_device(config["worker_device"])
     apply_runtime(settings)
 
     if not torch.cuda.is_available():
@@ -60,9 +62,10 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
     provider_research = str(repo / "research")
     if provider_research not in research_package.__path__:
         research_package.__path__ = [*research_package.__path__, provider_research]
+    # Provider API name in the external V-JEPA repository; not an experiment phase.
     from research.scripts.common.dense_pca import load_phase2_encoder
 
-    device = torch.device("cuda:0")
+    device = torch.device("cuda", logical_device)
     encoder = load_phase2_encoder(device).requires_grad_(False).eval()
     encoder.out_layers = [5]
     provenance = {
@@ -71,9 +74,9 @@ def _load(config: dict[str, Any]) -> tuple[Any, Any, dict[str, Any]]:
         "checkpoint_sha256": _sha256(checkpoint),
         "layers_zero_based": [5],
         "worker_pid": int(os.getpid()),
-        "logical_cuda_ordinal": 0,
+        "logical_cuda_ordinal": logical_device,
         "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
-        "cuda_device_name": torch.cuda.get_device_properties(0).name,
+        "cuda_device_name": torch.cuda.get_device_properties(logical_device).name,
     }
     provenance["runtime"] = runtime_provenance(
         settings, component="v_jepa_encoder", model=encoder,
@@ -117,7 +120,7 @@ def worker(config: dict[str, Any]) -> int:
         source = np.load(request["input_npy"], mmap_mode="r")
         if source.ndim != 5 or source.shape[1] != 3 or source.shape[2] != 1:
             raise ValueError(f"expected preprocessed [B,3,1,H,W], got {source.shape}")
-        batch = torch.from_numpy(np.asarray(source, dtype=np.float32)).to("cuda:0")
+        batch = torch.from_numpy(np.asarray(source, dtype=np.float32)).to(torch.device("cuda", provenance["logical_cuda_ordinal"]))
         with torch.inference_mode(), torch.cuda.amp.autocast(dtype=torch.bfloat16):
             start_event = torch.cuda.Event(enable_timing=True)
             end_event = torch.cuda.Event(enable_timing=True)

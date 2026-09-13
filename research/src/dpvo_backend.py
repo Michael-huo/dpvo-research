@@ -1,4 +1,4 @@
-"""DPVO construction and visual-state wrappers used by formal Phase 1 runners."""
+"""DPVO construction and visual-state wrappers used by formal feasibility runners."""
 from __future__ import annotations
 
 import random

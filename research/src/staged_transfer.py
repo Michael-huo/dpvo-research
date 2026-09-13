@@ -151,14 +151,15 @@ class GPUWorker:
     def __init__(self, *, python, device, component, config_path, timeout=120.,
                  cpu_profile=None):
         self.timeout = timeout; self.responses = queue.Queue(); self.errors = []
-        env = os.environ.copy(); env["CUDA_VISIBLE_DEVICES"] = str(device)
+        env = os.environ.copy()
         command = [str(python), "-m", "research.src.pipeline_worker",
-                   "--config", str(config_path), "--component", component]
+                   "--config", str(config_path), "--component", component,
+                   "--logical-device", str(device)]
         if cpu_profile is not None:
             cpus = ",".join(str(value) for value in cpu_profile["cpus"])
             env["OMP_NUM_THREADS"] = str(cpu_profile["omp_num_threads"])
             env["MKL_NUM_THREADS"] = str(cpu_profile["mkl_num_threads"])
-            env["PHASE1_CPU_PROFILE"] = json.dumps(cpu_profile, sort_keys=True)
+            env["RESEARCH_CPU_PROFILE"] = json.dumps(cpu_profile, sort_keys=True)
             if shutil.which("numactl") and cpu_profile.get("numa_node") is not None:
                 command = [
                     "numactl", f"--physcpubind={cpus}",
@@ -186,16 +187,9 @@ class GPUWorker:
             self.provenance = self.receive()
             if self.provenance.get("status") != "ready": raise RuntimeError(self.provenance)
             runtime = self.provenance.get("provenance", {})
-            if (
-                runtime.get("cuda_visible_devices") != str(device)
-                or runtime.get("logical_cuda_device_count") != 1
-                or runtime.get("current_logical_cuda_device") != 0
-            ):
-                raise RuntimeError(
-                    f"{component} worker device binding mismatch: requested={device}, "
-                    f"runtime={runtime}"
-                )
-            self.provenance["physical_device"] = int(device)
+            from .cuda_devices import validate_worker_binding
+            validate_worker_binding(runtime, int(device))
+            self.provenance["logical_device"] = int(device)
             self.provenance["requested_global_logical_device"] = int(device)
             self.provenance["cpu_profile"] = cpu_profile
         except BaseException as primary_error:
@@ -208,7 +202,7 @@ class GPUWorker:
                         f"{type(cleanup_error).__name__}: {cleanup_error}",
                     ],
                 }
-            setattr(primary_error, "phase1_worker_cleanup", cleanup)
+            setattr(primary_error, "research_worker_cleanup", cleanup)
             raise
 
     def receive(self):

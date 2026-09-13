@@ -1,4 +1,4 @@
-"""Canonical Phase 1 condition metadata and visual-state contracts."""
+"""Canonical feasibility condition metadata and visual-state contracts."""
 
 from __future__ import annotations
 

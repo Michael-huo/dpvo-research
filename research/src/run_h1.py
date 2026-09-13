@@ -44,6 +44,9 @@ from .registry import (
     sequence_entry, validate_module_manifest, write_registry_and_summary,
     write_sequence_metadata,
 )
+from .artifact_runtime import staged_directory
+from .registry import CHECKPOINT_ROOTS
+from .cuda_devices import CudaDevicePool
 from .execution_runtime import (
     cpu_numa_layout, execution_provenance, initialize_formal_main_process,
     release_cuda_training_state, require_lifecycle_cleanup, runtime_provenance,
@@ -109,7 +112,7 @@ def _metadata() -> dict[str, dict[str, Any]]:
 def _feature_diagnostics(path: Path, store: FeatureStore, model: torch.nn.Module,
                          hidden_keys: Sequence[str], seed: int) -> dict[str, Any]:
     import os
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-phase1-exp6")
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-research-exp6")
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -324,6 +327,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
     formal_runtime = initialize_formal_main_process()
     root = repo_path(config["paths"]["output_root"])
     root.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_root = CHECKPOINT_ROOTS["h1_interface"]
     calibration = np.loadtxt(repo_path(config["paths"]["calibration"]), delimiter=" ")
     evaluation_source_files = h1_training_sources() + tuple(
         Path(__file__).with_name(name) for name in (
@@ -333,11 +337,11 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
     )
     training_records, training_base, training_provenance = h1_training_context(config)
 
-    with tempfile.TemporaryDirectory(prefix=".phase1_h1_", dir=root.parent) as name:
+    with tempfile.TemporaryDirectory(prefix=".research_h1_", dir=root.parent) as name, staged_directory(checkpoint_root) as staged_checkpoints:
         temporary = Path(name)
         staged_root = temporary / "h1_interface"
         (staged_root / "sequences").mkdir(parents=True)
-        checkpoint_path = staged_root / "bridge.pt"
+        checkpoint_path = staged_checkpoints / "bridge.pt"
         index = empty_index("h1_interface", requested)
         layout = cpu_numa_layout(formal_runtime["hardware"])
         stage_c = fixed_cpu_profile(layout)["stage_c"]
@@ -367,12 +371,12 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                     training_records,
                     set().union(*map(set, training["split_keys"].values())),
                     calibration, config, training_temp, training["transform"],
-                    devices=(0, 1, 2),
+
                     h1_hidden_keys=set().union(*map(set, training["split_keys"].values())),
                 )
             with training_performance.phase("resident_initialization"):
                 resident_training = ResidentH1View(
-                    training_store, training["split_keys"], device=torch.device("cuda:1"),
+                    training_store, training["split_keys"], device=torch.device(CudaDevicePool.discover().primary_device),
                 )
             with training_performance.phase("bridge_training"):
                 training_batch_performance = PerformanceRecorder(enable_cuda=True)
@@ -512,7 +516,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 sequence_prepare = temporary / f"h1_prepare_{sequence}"
                 store, extraction = extract_parallel(
                     records, hidden_keys, calibration, config, sequence_prepare,
-                    transform, devices=(0, 1, 2), h1_hidden_keys=hidden_keys,
+                    transform,  h1_hidden_keys=hidden_keys,
                 )
             evaluation_inputs[sequence] = {
                 "records": records, "roles": roles, "schedule": schedule,
@@ -562,7 +566,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             )
             extraction = evaluation_preparation[sequence]
             performance_payload = {
-                "schema": "phase1_condition_job_performance_v1",
+                "schema": "research_condition_job_performance_v1",
                 "conditions": {
                     row["condition"]: row["performance"] for row in sequence_jobs
                 },
@@ -591,14 +595,19 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
 
         training_store.close()
         index["canonical_checkpoint"] = {
-            "file": "bridge.pt", "file_sha256": sha256_file(checkpoint_path),
+            "file": str((checkpoint_root / "bridge.pt").relative_to(REPO_ROOT)),
+            "path_base": "repository_root", "seed": config["experiment"]["seed"],
+            "best_epoch": training_summary["best_epoch"], "file_sha256": sha256_file(checkpoint_path),
             "state_dict_sha256": bridge_state_sha256,
             "training_lineage_sha256": training["lineage"]["training_lineage_sha256"],
+            "scientific_lineage": training["lineage"],
+            "checkpoint_selector": config["bridge"]["checkpoint_selector"],
+            "selected_epoch": training_summary["final"]["global_epoch"],
             "training": training_record,
         }
         total_makespan = time.perf_counter() - command_started
         index["execution"] = {
-            "schema": "phase1_formal_execution_summary_v1",
+            "schema": "research_formal_execution_summary_v1",
             "hardware": formal_runtime,
             "provenance": execution_provenance(),
             "parallel_preparation": training_extraction,
@@ -613,8 +622,9 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             "domain": "research_throughput",
         }
         write_registry_and_summary(staged_root, "h1_interface", index)
-        validate_module_manifest(staged_root, "h1_interface", index)
-        publish_current_canonical(staged_root, root)
+        validate_module_manifest(staged_root, "h1_interface", index, checkpoint_root=staged_checkpoints)
+        publish_current_canonical(staged_root, root, checkpoint_staged=staged_checkpoints,
+                                  checkpoint_destination=checkpoint_root)
     return {
         "status": "complete", "module": "h1_interface",
         "output": str(root.relative_to(REPO_ROOT)),
@@ -644,7 +654,7 @@ def main() -> int:
     args = parser().parse_args()
     config, _ = load_config()
     requested = resolve_sequences(args.sequences, config["experiment"]["default_sequences"])
-    print("Phase 1: H1 Interface — Representation-Interface Feasibility")
+    print("H1 Interface — Representation-Interface Feasibility")
     print("Input modes: full_rgb, sparse_rgb, true_fmap, oracle_jepa_bridge")
     print(json.dumps(run(requested), indent=2, sort_keys=True))
     return 0

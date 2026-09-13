@@ -18,8 +18,12 @@ from .predictor import build_anchor_intervals, predictor_state_sha256
 from .protocol import FrameIdentity, atomic_write_json, canonical_sha256, sha256_file
 
 
-def legacy_fixture(parent):
-    root = parent / "legacy"
+def staging_fixture(parent, strides=(3, 5, 10)):
+    parent.mkdir(parents=True, exist_ok=True)
+    worker_log = parent / ".research_anchor_budget_run/workers/job_000/worker.log"
+    worker_log.parent.mkdir(parents=True)
+    worker_log.write_text("runtime diagnostics")
+    root = parent / "staging"
     sequence = root / "sequences/MH_01_easy"
     sequence.mkdir(parents=True)
     ts = np.asarray([1403636579763555584 + i*100_000_000 for i in range(31)], dtype=np.uint64)
@@ -33,7 +37,7 @@ def legacy_fixture(parent):
                          for name,a,b in (("train",0,9),("validation",11,19),("test",21,30))}}
     comparisons, horizons, references = [], [], {}
     populations = {s: {"population_sha256": str(s), "common_anchor_timestamps_ns": [int(t) for t in ts[::s]],
-                       "rpe_pairs_ns": [] if s == 3 else [[int(ts[0]),int(ts[10])]]} for s in (3,5,10)}
+                       "rpe_pairs_ns": [] if s == 3 else [[int(ts[0]),int(ts[10])]]} for s in set((*strides, 5))}
     profile = {"context_wait_ms": {"mean_ms": 150, "p95_ms": 200},
                "effective_hidden_delay_ms": {"mean_ms": 900}, "stages": {"jepa_encoder": {"total_ms": 100}},
                "stage_c_runtime": {"pid": 123}, "stage_c_timing": {"total_ms": 30}}
@@ -48,7 +52,8 @@ def legacy_fixture(parent):
                "canonical_population": populations[stride], "canonical_coverage": {"canonical_pose_coverage": 1.0},
                "graph_workload": {"final_node_count": 12, "cumulative_factor_count": 200},
                "matched_trajectory_wall_seconds": 3.456789,
-               "sequential_execution": {"physical_device": 0, "elapsed_seconds": 5, "worker_log": "/tmp/worker.log"},
+               "sequential_execution": {"logical_device": 0, "elapsed_seconds": 5, "worker_log": str(worker_log)},
+               "performance_diagnostics": {"jobs": [{"worker_log": str(worker_log), "elapsed_seconds": 5}]},
                "trajectory_sha256": sha256_file(folder / "trajectory.npz")}
         if ours:
             row["h2_stage_profile"] = copy.deepcopy(profile)
@@ -57,7 +62,7 @@ def legacy_fixture(parent):
         atomic_write_json(folder / "results.json", row)
         return row
     condition(sequence / "full_rgb", slice(None), 5)
-    for stride in (3,5,10):
+    for stride in strides:
         folder = sequence / f"stride_{stride}"
         sparse = condition(folder / "sparse_rgb", slice(None,None,stride), stride)
         ours = condition(folder / "predicted_jepa", slice(None), stride, ours=True)
@@ -69,7 +74,7 @@ def legacy_fixture(parent):
                                         "encoded_anchor_bytes": 30, "encoded_full_bytes":100}}
         atomic_write_json(folder / "schedule.json", population | {"roles":roles,"intervals":[r.payload() for r in intervals]})
         lineage = {"protocol":"anchor_budget_fresh_predictor_v1", "anchor_stride":stride, "seed":1234,
-                   "h1_bridge_sha256":"h1", "canonical_h2_config_sha256":"h2"}
+                   "h1_bridge_sha256":"h1", "scientific_config":{"config_protocol_sha256":"h2"}}
         lineage["training_lineage_sha256"] = canonical_sha256(lineage)
         modelroot = root / "models" / f"stride_{stride}"
         modelroot.mkdir(parents=True)
@@ -85,7 +90,7 @@ def legacy_fixture(parent):
                                "history":[{"epoch":1,"train_total":.5,"validation_total":.3},
                                           {"epoch":2,"train_total":.4,"validation_total":.2}]},
                     "training_and_diagnostics_wall_seconds":3.14159,
-                    "development_extraction":{"elapsed_seconds":.123,"workers":[{"pid":123}]},
+                    "development_extraction":{"elapsed_seconds":.123,"workers":[{"pid":123,"worker_log":str(worker_log)}]},
                     "test_extraction":{"encoder_inference_ms":[1.0,2.0],"jepa":{"worker_pid":5,"runtime":{}}},
                     "held_out_representation":{"gate1_block5":{"predicted_jepa":{"cosine":.9}},
                         "gate2_frozen_h1_bridge_vs_true_fmap":{"predicted_jepa":{"cosine":.7}}}}
@@ -102,10 +107,11 @@ def legacy_fixture(parent):
         atomic_write_json(folder / "results.json",legacy)
         references[str(stride)] = str((folder / "results.json").relative_to(root))
         comparisons.append(comparison); horizons.extend(horizon)
-    index = {"status":"complete","anchor_strides":[3,5,10],"sequence":"MH_01_easy","protocol":"test",
+    index = {"status":"complete","anchor_strides":list(strides),"sequence":"MH_01_easy","protocol":"test",
              "trajectory_comparison":["GT","Full RGB","Sparse RGB","Ours"], "config":"/tmp/config.yaml","config_sha256":"config",
              "preparation":{"fixed_split":fixed,"canonical_artifacts":{},"stride5_equivalence":{"all_exact":True}},
-             "execution":{"maximum_concurrent_dpvo_instances":1},"strides":references,
+             "repository":{"git_commit":"fixture"}, "execution":{"maximum_concurrent_dpvo_instances":1,
+                 "sequential_evaluation":{"jobs":[{"worker_log":str(worker_log),"elapsed_seconds":5}]}},"strides":references,
              "accuracy_vs_communication":comparisons,"prediction_quality_vs_horizon":horizons}
     atomic_write_json(root / "INDEX.json",index)
     atomic_write_json(root / "accuracy_vs_communication.json",comparisons)
@@ -118,7 +124,8 @@ class ArtifactAggregationTest(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory(prefix="anchor_budget_test_", dir="/tmp")
         self.addCleanup(self.temporary.cleanup)
         self.parent = Path(self.temporary.name)
-        self.source = legacy_fixture(self.parent)
+        self.source = staging_fixture(self.parent)
+        self.destination = self.parent / "results"
         self.checkpoints = self.parent / "checkpoints"
 
     def test_scientific_values_and_all_trajectories_are_exact(self):
@@ -141,31 +148,45 @@ class ArtifactAggregationTest(unittest.TestCase):
             self.assertEqual(artifacts.expand_columns(row["training"]["epoch_metrics"]),old_train["summary"]["history"])
             self.assertEqual(artifacts.reconstruct_schedule(bundle,stride),proof["schedules"][stride])
             self.assertEqual(row["provenance"]["checkpoint"]["scientific_lineage"],old_train["lineage"])
-        self.assertIsNone(data["metadata"]["original_run_repository"]["git_commit"])
+        self.assertEqual(data["metadata"]["repository"]["git_commit"], "fixture")
         self.assertNotIn('"timeline"',json.dumps(data))
         self.assertNotIn('"waits"',json.dumps(data))
 
-    def test_publish_relocates_checkpoints_and_removes_only_migrated_files(self):
+    def test_publish_separates_checkpoints_and_preserves_fresh_source(self):
         before=artifacts.inventory(self.source)
-        data=artifacts.publish_compact(self.source,self.source,self.checkpoints)
-        self.assertEqual(set(artifacts.inventory(self.source)),artifacts.FORMAL_FILES)
+        data=artifacts.publish_compact(self.source,self.destination,self.checkpoints)
+        self.assertEqual(set(artifacts.inventory(self.destination)),artifacts.FORMAL_FILES)
         for stride in (3,5,10):
             old=f"models/stride_{stride}/predictor.pt"
             new=self.checkpoints/f"predictor_stride_{stride}.pt"
             self.assertEqual(sha256_file(new),before[old]["sha256"])
         self.assertEqual(len(list(self.checkpoints.iterdir())),3)
-        artifacts.validate_compact(self.source)
-        self.assertLess(len((self.source/"SUMMARY.md").read_text().splitlines()),40)
-        self.assertEqual(data["metadata"]["migration"]["original_file_count"],len(before))
-        self.assertEqual(artifacts.publish_compact(self.source,self.source,self.checkpoints),data)
+        for path in self.destination.rglob("*.json"):
+            self.assertNotIn(".research_", path.read_text(), str(path))
+            self.assertNotIn('"worker_log"', path.read_text(), str(path))
+        self.assertEqual(data["metadata"]["execution"]["sequential_evaluation"]["jobs"],
+                         [{"elapsed_seconds": 5}])
+        for condition in [data["full_rgb"], *[row[kind] for row in data["strides"].values()
+                                             for kind in ("sparse", "ours")]]:
+            self.assertEqual(condition["performance_diagnostics"]["jobs"], [{"elapsed_seconds": 5}])
+            self.assertEqual(condition["execution"]["elapsed_seconds"], 5)
+        for row in data["strides"].values():
+            self.assertEqual(row["training"]["development_extraction"],
+                             {"elapsed_seconds": .123, "workers": [{"pid": 123}]})
+        self.assertEqual((self.parent / ".research_anchor_budget_run/workers/job_000/worker.log").read_text(),
+                         "runtime diagnostics")
+        artifacts.validate_compact(self.destination)
+        self.assertLess(len((self.destination/"SUMMARY.md").read_text().splitlines()),40)
+        self.assertEqual(artifacts.inventory(self.source), before)
+        self.assertEqual(artifacts.publish_compact(self.source,self.destination,self.checkpoints)["strides"],data["strides"])
 
     def test_figures_need_only_json_and_npz_and_do_not_refit(self):
-        artifacts.publish_compact(self.source,self.source,self.checkpoints)
+        artifacts.publish_compact(self.source,self.destination,self.checkpoints)
         package=self.parent/"standalone"
         package.mkdir()
         import shutil
         for filename in ("results.json","trajectories.npz"):
-            shutil.copy2(self.source/filename,package/filename)
+            shutil.copy2(self.destination/filename,package/filename)
         before={name:sha256_file(package/name) for name in ("results.json","trajectories.npz")}
         with patch("research.src.evaluation.fit_sim3_trajectory",side_effect=AssertionError("no refit")), \
              patch("research.src.evaluation.evaluate_paired_trajectory",side_effect=AssertionError("no evaluation")), \
@@ -180,23 +201,46 @@ class ArtifactAggregationTest(unittest.TestCase):
         (self.source/"unmapped_science.json").write_text('{"measurement": 17}')
         before=artifacts.inventory(self.source)
         with self.assertRaisesRegex(RuntimeError,"unmapped"):
-            artifacts.publish_compact(self.source,self.source,self.checkpoints)
+            artifacts.publish_compact(self.source,self.destination,self.checkpoints)
         self.assertEqual(before,artifacts.inventory(self.source))
 
     def test_duplicate_scientific_disagreement_prevents_cleanup(self):
         (self.source/"accuracy_vs_communication.json").write_text('[]')
         before=artifacts.inventory(self.source)
         with self.assertRaisesRegex(RuntimeError,"disagrees"):
-            artifacts.publish_compact(self.source,self.source,self.checkpoints)
+            artifacts.publish_compact(self.source,self.destination,self.checkpoints)
         self.assertEqual(before,artifacts.inventory(self.source))
 
-    def test_checkpoint_collision_prevents_cleanup(self):
+    def test_existing_checkpoint_is_replaced_after_success(self):
         self.checkpoints.mkdir()
-        (self.checkpoints/"predictor_stride_3.pt").write_bytes(b"different model")
-        before=artifacts.inventory(self.source)
-        with self.assertRaises(FileExistsError):
-            artifacts.publish_compact(self.source,self.source,self.checkpoints)
-        self.assertEqual(before,artifacts.inventory(self.source))
+        old = self.checkpoints/"predictor_stride_3.pt"
+        old.write_bytes(b"different model")
+        artifacts.publish_compact(self.source,self.destination,self.checkpoints)
+        self.assertEqual(sha256_file(old), sha256_file(self.source/"models/stride_3/predictor.pt"))
+        artifacts.validate_compact(self.destination)
+
+    def test_new_stride_request_replaces_both_canonical_sets(self):
+        artifacts.publish_compact(self.source,self.destination,self.checkpoints)
+        source = staging_fixture(self.parent / "new_request", (5, 7, 8))
+        artifacts.publish_compact(source,self.destination,self.checkpoints)
+        result = artifacts.validate_compact(self.destination)
+        self.assertEqual(set(result["strides"]), {"5", "7", "8"})
+        self.assertEqual({p.name for p in self.checkpoints.iterdir()}, {f"predictor_stride_{s}.pt" for s in (5,7,8)})
+        self.assertEqual(set(result["metadata"]["trajectories"]), {"GT", "Full_RGB", *[f"stride_{s}_{c}" for s in (5,7,8) for c in ("sparse", "ours")]})
+        source = staging_fixture(self.parent / "subset", (7,))
+        artifacts.publish_compact(source,self.destination,self.checkpoints)
+        self.assertEqual(set(artifacts.validate_compact(self.destination)["strides"]), {"7"})
+        self.assertEqual({p.name for p in self.checkpoints.iterdir()}, {"predictor_stride_7.pt"})
+        self.assertEqual(set(artifacts.inventory(self.destination)), artifacts.FORMAL_FILES)
+
+    def test_render_failure_preserves_both_canonical_trees_and_cleans_staging(self):
+        artifacts.publish_compact(self.source,self.destination,self.checkpoints)
+        before = (artifacts.inventory(self.destination), artifacts.inventory(self.checkpoints))
+        with patch("research.src.anchor_budget_figures.render_figures", side_effect=RuntimeError("plot failed")):
+            with self.assertRaisesRegex(RuntimeError, "plot failed"):
+                artifacts.publish_compact(self.source,self.destination,self.checkpoints)
+        self.assertEqual(before, (artifacts.inventory(self.destination), artifacts.inventory(self.checkpoints)))
+        self.assertFalse(any("staging-" in p.name or "backup-" in p.name for p in self.parent.iterdir()))
 
     def test_stored_sim3_is_applied_without_changing_raw_arrays(self):
         value=np.arange(9,dtype=np.float64).reshape(3,3)
@@ -206,16 +250,17 @@ class ArtifactAggregationTest(unittest.TestCase):
         self.assertTrue(np.array_equal(value,before))
         self.assertTrue(np.array_equal(output,value*2+np.asarray([1,2,3])))
 
-    def test_runner_reads_compact_outputs_after_legacy_removal(self):
-        artifacts.publish_compact(self.source,self.source,self.checkpoints)
+    def test_preparation_does_not_read_existing_canonical_results(self):
+        self.destination.mkdir()
+        (self.destination / "results.json").write_text("invalid old result")
         protocol,canonical,path=runner.load_protocol()
-        protocol=protocol | {"output_root":str(self.source)}
+        protocol=protocol | {"output_root":str(self.destination)}
         with patch.object(runner,"load_protocol",return_value=(protocol,canonical,path)), \
-             patch.object(runner,"load_sequence_records",side_effect=AssertionError("no dataset read")), \
+             patch.object(runner,"load_sequence_records",return_value=()), \
+             patch.object(runner,"prepare_protocol",return_value=({}, {})), \
              patch.object(runner,"execute_sequence",side_effect=AssertionError("no experiment")):
-            self.assertEqual(runner.run()["status"],"complete")
-            with self.assertRaises(FileExistsError):
-                runner.run(execute=True)
+            self.assertEqual(runner.run()["status"],"prepared_no_experiment_run")
+        self.assertEqual((self.destination / "results.json").read_text(), "invalid old result")
 
     def test_offline_cli_actions_are_mutually_exclusive_with_execution(self):
         import contextlib,io

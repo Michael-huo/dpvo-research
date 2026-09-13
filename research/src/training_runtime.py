@@ -58,7 +58,7 @@ class ResidentRows:
                         f"{type(cleanup_error).__name__}: {cleanup_error}",
                     ],
                 }
-            setattr(error, "phase1_resident_cleanup", cleanup)
+            setattr(error, "research_resident_cleanup", cleanup)
             raise
         allocated_after = self._memory_value(torch.cuda.memory_allocated)
         reserved_after = self._memory_value(torch.cuda.memory_reserved)
@@ -211,7 +211,7 @@ def resident_correspondence(store, device):
                 cleanup_errors.append(
                     f"empty_cache: {type(cleanup_error).__name__}: {cleanup_error}"
                 )
-        setattr(error, "phase1_correspondence_resident_cleanup", {
+        setattr(error, "research_correspondence_resident_cleanup", {
             "resident_tensors_cleared": True,
             "errors": cleanup_errors,
         })

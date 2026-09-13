@@ -1,4 +1,4 @@
-"""Shared Phase 1 identities, RGB boundary, EuRoC IO, and deterministic schedule."""
+"""Shared feasibility identities, RGB boundary, EuRoC IO, and deterministic schedule."""
 
 from __future__ import annotations
 

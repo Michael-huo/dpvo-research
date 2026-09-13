@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import contextlib
 import io
 import json
@@ -140,13 +141,9 @@ class AnchorBudgetProtocolTest(unittest.TestCase):
             self.assertEqual(config["experiment"]["seed"], self.config["experiment"]["seed"])
             self.assertEqual(config["paths"]["h1_bridge"], self.config["paths"]["h1_bridge"])
         self.assertNotIn("anchor_stride", self.config["experiment"])
-        self.assertEqual(budget_protocol.OUTPUT_ROOT, repo_path("research/results/phase2-anchor-budget"))
+        self.assertEqual(budget_protocol.OUTPUT_ROOT, repo_path("research/results/anchor-budget"))
 
-    def test_canonical_artifacts_and_real_stride5_exactness_when_installed(self):
-        manifest = json.loads(repo_path(self.protocol["canonical_artifact_manifest"]).read_text())
-        if not all(repo_path(p).is_file() for p in manifest):
-            self.skipTest("canonical Phase 1 artifacts not installed")
-        self.assertTrue(budget_protocol.verify_canonical_artifacts(self.protocol)["all_unchanged"])
+    def test_real_stride5_exactness_without_previous_artifacts(self):
         try:
             source = load_sequence_records(self.config, "MH_01_easy")
         except FileNotFoundError:
@@ -158,18 +155,12 @@ class AnchorBudgetProtocolTest(unittest.TestCase):
         self.assertEqual(evaluation_population(b["records"], b["roles"], self.config),
                          _evaluation_population(b["records"], b["roles"], self.config))
 
-    def test_canonical_hash_tampering_is_rejected(self):
-        with tempfile.TemporaryDirectory() as name:
-            path = Path(name) / "artifact"
-            path.write_bytes(b"original")
-            from .protocol import sha256_file
-            manifest = Path(name) / "manifest.json"
-            manifest.write_text(json.dumps({str(path): sha256_file(path)}))
-            protocol = {"canonical_artifact_manifest": str(manifest),
-                        "canonical_artifact_manifest_sha256": sha256_file(manifest)}
-            path.write_bytes(b"changed")
-            with self.assertRaisesRegex(RuntimeError, "SHA256 changed"):
-                budget_protocol.verify_canonical_artifacts(protocol)
+    def test_frozen_split_tampering_is_rejected(self):
+        protocol = copy.deepcopy(self.protocol)
+        protocol["fixed_split"]["source_split_sha256"] = "changed"
+        with self.assertRaisesRegex(RuntimeError, "exact-equivalence failed"):
+            budget_protocol.backward_equivalence(self.records, protocol)
+
 
 
 class VariableQueryTest(unittest.TestCase):
@@ -296,7 +287,7 @@ class VariableQueryTest(unittest.TestCase):
                 training.validate_stride_lineage(lineage, lineage, stride+1)
             with self.assertRaisesRegex(RuntimeError, "lineage mismatch"):
                 training.validate_stride_lineage(lineage, lineage | {"extra": 1}, stride)
-        with self.assertRaisesRegex(RuntimeError, "Phase 2 predictor lineage"):
+        with self.assertRaisesRegex(RuntimeError, "Anchor Budget predictor lineage"):
             training.validate_stride_lineage({}, {}, 5)
 
     def test_empty_rpe_is_explicit_opt_in_and_ate_remains_available(self):
@@ -381,6 +372,7 @@ class BudgetExecutionTest(unittest.TestCase):
                   "matched_trajectory_wall_seconds": 1.0, "graph_workload": {}}
         with tempfile.TemporaryDirectory() as name, contextlib.ExitStack() as stack:
             root = Path(name)
+            stack.enter_context(patch.object(torch.cuda, "device_count", return_value=3))
             stack.enter_context(patch.object(runner, "initialize_formal_main_process", return_value={"hardware": {}}))
             stack.enter_context(patch.object(runner, "cpu_numa_layout", return_value={}))
             stack.enter_context(patch.object(runner, "fixed_cpu_profile", return_value={"stage_c": {}}))

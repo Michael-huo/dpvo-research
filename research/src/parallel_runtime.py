@@ -1,4 +1,4 @@
-"""Three-GPU preparation and canonical sequential GPU0 trajectory runtime."""
+"""Visible-pool preparation and sequential primary-device trajectory runtime."""
 from __future__ import annotations
 
 import concurrent.futures
@@ -21,7 +21,7 @@ from .execution_runtime import (
 from .protocol import REPO_ROOT, canonical_sha256, atomic_write_json
 
 
-FORMAL_DEVICES = (0, 1, 2)
+from .cuda_devices import CudaDevicePool, select_worker_device, validate_worker_binding
 
 
 def shard_batches(values, batch_size, devices):
@@ -50,8 +50,9 @@ def merge_identity_rows(expected_keys, shards):
 
 
 def _launch(task,path,device):
+    task = dict(task, logical_device=int(device))
     torch.save(task,path/"task.pt")
-    env=os.environ.copy();env["CUDA_VISIBLE_DEVICES"]=str(device)
+    env=os.environ.copy()
     command=[sys.executable,"-m","research.src.parallel_runtime",
              str(path/"task.pt")]
     cpu_profile=task.get("cpu_profile")
@@ -59,7 +60,7 @@ def _launch(task,path,device):
         cpus=",".join(str(value) for value in cpu_profile["cpus"])
         env["OMP_NUM_THREADS"]=str(cpu_profile["omp_num_threads"])
         env["MKL_NUM_THREADS"]=str(cpu_profile["mkl_num_threads"])
-        env["PHASE1_CPU_PROFILE"]=json.dumps(cpu_profile,sort_keys=True)
+        env["RESEARCH_CPU_PROFILE"]=json.dumps(cpu_profile,sort_keys=True)
         if shutil.which("numactl") and cpu_profile.get("numa_node") is not None:
             command=["numactl",f"--physcpubind={cpus}",
                      f"--membind={int(cpu_profile['numa_node'])}",*command]
@@ -86,41 +87,34 @@ def _gpu_process_telemetry():
 
 
 def _validate_isolated_worker_binding(runtime, requested_device):
-    if (
-        not isinstance(runtime, dict)
-        or runtime.get("cuda_visible_devices") != str(requested_device)
-        or runtime.get("logical_cuda_device_count") != 1
-        or runtime.get("current_logical_cuda_device") != 0
-    ):
-        raise RuntimeError(
-            "formal worker device binding mismatch: "
-            f"requested={requested_device}, runtime={runtime}"
-        )
+    validate_worker_binding(runtime, requested_device)
 
 
 def run_sequential_trajectory_jobs(tasks, temporary, *, cpu_profile=None, hardware):
-    """Run formal trajectories one at a time in fresh GPU0 processes."""
+    """Run formal trajectories one at a time in fresh primary-device processes."""
     temporary = Path(temporary)
     temporary.mkdir(parents=True, exist_ok=False)
     started = time.perf_counter()
+    pool = CudaDevicePool.discover()
+    primary = pool.require(0)
     rows = []
     timeline = []
     for ordinal, task in enumerate(tasks):
-        required_devices = (
-            FORMAL_DEVICES if task["kind"] == "formal_h2_predicted" else (0,)
-        )
+        if task["kind"] == "formal_h2_predicted":
+            pool.online_mapping()
+        required_devices = tuple(pool.logical_ids[:3]) if task["kind"] == "formal_h2_predicted" else (primary,)
         before = _gpu_process_telemetry()
         path = temporary / f"job_{ordinal:03d}"
         path.mkdir()
         value = dict(task) | {
             "settings": task.get("settings", capture_runtime()),
-            "physical_device": 0,
+            "logical_device": primary,
             "submitted_ns": time.monotonic_ns(),
             "cpu_profile": cpu_profile,
         }
-        _launch(value, path, 0)
+        _launch(value, path, primary)
         payload = torch.load(path / "result.pt", map_location="cpu", weights_only=False)
-        _validate_isolated_worker_binding(payload.get("worker_runtime"), 0)
+        _validate_isolated_worker_binding(payload.get("worker_runtime"), primary)
         cleanup = payload.get("cleanup", {})
         require_lifecycle_cleanup(cleanup)
         started_ns = payload.pop("started_ns")
@@ -129,7 +123,7 @@ def run_sequential_trajectory_jobs(tasks, temporary, *, cpu_profile=None, hardwa
             "kind": value["kind"],
             "sequence": value.get("sequence", payload.get("sequence")),
             "condition": value.get("condition", payload.get("condition")),
-            "physical_device": 0,
+            "logical_device": primary,
             "submitted_ns": value["submitted_ns"],
             "started_ns": started_ns,
             "completed_ns": completed_ns,
@@ -137,7 +131,7 @@ def run_sequential_trajectory_jobs(tasks, temporary, *, cpu_profile=None, hardwa
             "worker_log": str(path / "worker.log"),
             "runtime": payload.get("worker_runtime"),
             "processes_before": before,
-            "required_physical_devices": list(required_devices),
+            "required_logical_devices": list(required_devices),
             "gpu_process_telemetry_only": True,
             "cleanup": cleanup,
         }
@@ -147,8 +141,8 @@ def run_sequential_trajectory_jobs(tasks, temporary, *, cpu_profile=None, hardwa
         after = _gpu_process_telemetry()
         record["processes_after"] = after
     return rows, {
-        "schema": "phase1_sequential_gpu0_trajectory_execution_v1",
-        "device": 0,
+        "schema": "research_sequential_primary_trajectory_execution_v1",
+        "device": pool.primary_device,
         "job_count": len(tasks),
         "makespan_seconds": time.perf_counter() - started,
         "jobs": timeline,
@@ -158,9 +152,10 @@ def run_sequential_trajectory_jobs(tasks, temporary, *, cpu_profile=None, hardwa
     }
 
 
-def extract_parallel(records, identities, calibration, config, temporary, transform, *, devices,
+def extract_parallel(records, identities, calibration, config, temporary, transform, *, devices=None,
                      h1_hidden_keys=None):
     """Whole original JEPA batches are indivisible sharding units."""
+    devices = devices or CudaDevicePool.discover().preparation_devices
     from .jepa_runtime import CompactFeatureStore
     from .h1_training import FeatureStore
     temporary=Path(temporary);temporary.mkdir(parents=True,exist_ok=True)
@@ -173,7 +168,7 @@ def extract_parallel(records, identities, calibration, config, temporary, transf
             path=temporary/f"shard_{ordinal}";path.mkdir()
             keys={v.identity.key if hasattr(v,"identity") else v.key for v in shard}
             task={"kind":"h1" if h1_hidden_keys is not None else "h2","settings":settings,
-                  "physical_device":device,
+                  "logical_device":device,
                   "records":shard if h1_hidden_keys is not None else [r for r in records if r.identity.key in keys],
                   "identities":shard,"hidden_keys":h1_hidden_keys,"calibration":calibration,
                   "config":config,"transform":transform}
@@ -208,7 +203,9 @@ def extract_parallel(records, identities, calibration, config, temporary, transf
     meta=store.finalize(set(h1_hidden_keys)) if h1 else store.finalize()
     return store,{"store":meta,"elapsed_seconds":time.perf_counter()-started,
         "identity_sha256":canonical_sha256(keys),"ordered_content_sha256":canonical_sha256([(k,hashes[k]) for k in keys]),
-        "workers":worker_provenance,"batch_membership_preserved":True,"domain":"research_throughput"}
+        "workers":worker_provenance,"shard_assignment": [
+            {"logical_device": d, "identities": [v.identity.key if hasattr(v, "identity") else v.key for v in shard]}
+            for d, shard in zip(devices, shards)], "batch_membership_preserved":True,"domain":"research_throughput"}
 
 
 class ReadonlyFeatureRows:
@@ -239,7 +236,8 @@ class ReadonlyH1FeatureStore:
                 mmap.close()
 
 
-def correspondence_parallel(intervals,store,transform,mask,calibration,temporary,*,devices):
+def correspondence_parallel(intervals,store,transform,mask,calibration,temporary,*,devices=None):
+    devices = devices or CudaDevicePool.discover().preparation_devices
     from .h2_training import RobustCorrespondenceStore
     from .transport import RobustCorrespondence
     path=Path(temporary);path.mkdir(parents=True,exist_ok=True);started=time.perf_counter()
@@ -266,7 +264,8 @@ def correspondence_parallel(intervals,store,transform,mask,calibration,temporary
     result.rows={key:by_key[key] for key in expected}
     hashes={str(key):{name:hashlib.sha256(getattr(by_key[key],name).numpy().tobytes()).hexdigest()
                       for name in RobustCorrespondence.__dataclass_fields__} for key in expected}
-    return result,{"interval_count":len(intervals),"endpoint_only":True,"contains_hidden_target":False,
+    return result,{"shard_assignment": [{"logical_device": d, "interval_indices": [r.interval_index for r in shard]} for d, shard in zip(devices, tasks)],
+                   "interval_count":len(intervals),"endpoint_only":True,"contains_hidden_target":False,
                    "calibration_sha256":canonical_sha256(calibration),"elapsed_seconds":time.perf_counter()-started,
                    "ordered_content_sha256":canonical_sha256([(key,hashes[str(key)]) for key in expected]),
                    "domain":"research_throughput"}
@@ -276,6 +275,7 @@ def worker(task_path):
     task=torch.load(task_path,map_location="cpu",weights_only=False);path=Path(task_path).parent
     if task.get("cpu_profile") is not None:
         apply_cpu_profile(task["cpu_profile"])
+    select_worker_device(task["logical_device"])
     apply_runtime(task["settings"])
     started_ns = time.monotonic_ns()
     if task["kind"] == "materialize_schedule":
@@ -288,7 +288,7 @@ def worker(task_path):
             "sequence": task["records"][0].identity.sequence,
             "condition": "bootstrap_schedule", "schedule": schedule,
             "worker_runtime": runtime_provenance(
-                task["settings"], component="gpu0_bootstrap_schedule",
+                task["settings"], component="primary_bootstrap_schedule",
             ),
             "cleanup": cleanup, "started_ns": started_ns,
             "completed_ns": time.monotonic_ns(),
@@ -485,7 +485,7 @@ def worker(task_path):
             + cleanup_seconds
         )
         timing_scopes = {
-            "schema": "phase1_h2_condition_timing_scopes_v1",
+            "schema": "research_h2_condition_timing_scopes_v1",
             "model_and_checkpoint_setup_seconds": model_setup_seconds,
             "offline_block5_preparation_seconds": block5_preparation_seconds,
             "offline_preparation_and_diagnostics_seconds": (
@@ -580,8 +580,8 @@ def worker(task_path):
     if task["kind"]=="h1":
         for i,key in enumerate(keys):hashes[key]["teacher"]=hashlib.sha256(store.teacher[i].tobytes()).hexdigest()
     worker_runtime=runtime_provenance(task["settings"],component="offline_extraction",amp=True)
-    worker_runtime["physical_device"]=task.get("physical_device")
-    worker_runtime["logical_cuda_ordinal"]=0
+    worker_runtime["logical_device"]=task["logical_device"]
+    worker_runtime["logical_cuda_ordinal"]=task["logical_device"]
     atomic_write_json(path/"manifest.json",{"keys":keys,"token_keys":token_keys,"hashes":hashes,
         "runtime":worker_runtime})
     store.close()

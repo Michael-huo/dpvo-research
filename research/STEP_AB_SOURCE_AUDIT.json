@@ -1,0 +1,292 @@
+{
+  "config_audit": [
+    {
+      "before": "phase1_feasibility_h0.yaml",
+      "after": "h0_state.yaml",
+      "equal_scientific_leaf_count": 24,
+      "changes": {
+        "experiment.name": {
+          "before": "phase1_h0_state",
+          "after": "h0_state"
+        },
+        "paths.output_root": {
+          "before": "research/results/phase1-feasibility/h0_state",
+          "after": "research/results/h0-state"
+        }
+      }
+    },
+    {
+      "before": "phase1_feasibility_h1.yaml",
+      "after": "h1_interface.yaml",
+      "equal_scientific_leaf_count": 62,
+      "changes": {
+        "paths.output_root": {
+          "before": "research/results/phase1-feasibility/h1_interface",
+          "after": "research/results/h1-interface"
+        },
+        "experiment.name": {
+          "before": "phase1_h1_interface",
+          "after": "h1_interface"
+        }
+      }
+    },
+    {
+      "before": "phase1_feasibility_h2.yaml",
+      "after": "h2_prediction.yaml",
+      "equal_scientific_leaf_count": 80,
+      "changes": {
+        "paths.output_root": {
+          "before": "research/results/phase1-feasibility/h2_prediction",
+          "after": "research/results/h2-prediction"
+        },
+        "experiment.name": {
+          "before": "phase1_h2_prediction",
+          "after": "h2_prediction"
+        },
+        "paths.h1_bridge": {
+          "before": "research/results/phase1-feasibility/h1_interface/bridge.pt",
+          "after": "research/checkpoints/h1-interface/bridge.pt"
+        }
+      }
+    },
+    {
+      "before": "phase2_anchor_budget.yaml",
+      "after": "anchor_budget.yaml",
+      "equal_scientific_leaf_count": 30,
+      "changes": {
+        "full_rgb_population.source": {
+          "before": "phase1_canonical_effective_population",
+          "after": "canonical_effective_population"
+        },
+        "canonical_h2_config": {
+          "before": "research/configs/phase1_feasibility_h2.yaml",
+          "after": "research/configs/h2_prediction.yaml"
+        },
+        "canonical_h2_index": {
+          "before": "research/results/phase1-feasibility/h2_prediction/INDEX.json",
+          "after": null
+        },
+        "fixed_split.source": {
+          "before": "frozen_phase1_h2_canonical",
+          "after": "frozen_h2_timestamp_regions"
+        },
+        "canonical_artifact_manifest_sha256": {
+          "before": "c62c3a9e444418f8bdb6c52d2a37a306db575c27d4c0317f5a04d5ae6f85c8a4",
+          "after": null
+        },
+        "canonical_artifact_manifest": {
+          "before": "research/configs/anchor_budget_canonical_sha256.json",
+          "after": null
+        },
+        "canonical_h2_config_sha256": {
+          "before": "0b1f9c6a15d544784411cf687020d157772e1752cc168ae2e121c7a67db6d4c6",
+          "after": null
+        },
+        "output_root": {
+          "before": "research/results/phase2-anchor-budget",
+          "after": "research/results/anchor-budget"
+        }
+      }
+    }
+  ],
+  "protected_ast": [
+    {
+      "file": "predictor.py",
+      "function_count": 17,
+      "raw_sha256_before": "9eeca096dbc6bc5063ec04cb57193ef860154f1d371949e2a910ec33eda8fce9",
+      "raw_sha256_after": "9eeca096dbc6bc5063ec04cb57193ef860154f1d371949e2a910ec33eda8fce9",
+      "normalized_ast_sha256": "50e25e0ef1c95fb03f034bee5953a3d16f9c1e92cdb7a6eddd65e6431f3b5128",
+      "equal": true,
+      "allowed_execution_metadata_changes": []
+    },
+    {
+      "file": "transport.py",
+      "function_count": 19,
+      "raw_sha256_before": "886c5a56812da66c2f1518300ee8c5266b7b8ca1ec312e0b0e935c64a88aa048",
+      "raw_sha256_after": "886c5a56812da66c2f1518300ee8c5266b7b8ca1ec312e0b0e935c64a88aa048",
+      "normalized_ast_sha256": "876eea4364b611e7248b2aa07c38ab2a96bc2b25ea3ca92dcac0eba926c7df04",
+      "equal": true,
+      "allowed_execution_metadata_changes": []
+    },
+    {
+      "file": "h1_training.py",
+      "function_count": 15,
+      "raw_sha256_before": "966e81a02aa89c793b82ab04232535cfea37b7f69904d6dad2fd7955de3d5227",
+      "raw_sha256_after": "966e81a02aa89c793b82ab04232535cfea37b7f69904d6dad2fd7955de3d5227",
+      "normalized_ast_sha256": "57ceaff784e67ff85009a37590845b92191b553df42e69bea2b23e2f8c5c05a4",
+      "equal": true,
+      "allowed_execution_metadata_changes": []
+    },
+    {
+      "file": "h2_training.py",
+      "function_count": 23,
+      "raw_sha256_before": "cf710bd62bf0de0caa33f26ea4413d8bd881d2d9d7d425270079ced99dd46557",
+      "raw_sha256_after": "5ab6d282c5de35b86cb91e0b286a3bd4c6beb343ca1620437d893c8b876095df",
+      "normalized_ast_sha256": "2a97a8fc857d2ee43beaa391bb9d2c4911b1ebde43be28823a2edb84e4d2eec1",
+      "equal": true,
+      "allowed_execution_metadata_changes": [
+        "MPLCONFIGDIR temporary directory label only"
+      ]
+    },
+    {
+      "file": "jepa_fmap.py",
+      "function_count": 18,
+      "raw_sha256_before": "e7eeb7358a8cd3b83ba5ce87170fb245e4a5f6abd8ee643c11ef958d9a672dc9",
+      "raw_sha256_after": "e7eeb7358a8cd3b83ba5ce87170fb245e4a5f6abd8ee643c11ef958d9a672dc9",
+      "normalized_ast_sha256": "abed4f67bedc411b8140dfb75e7be54555a4afc05deb4a84f1f24e89563f9a24",
+      "equal": true,
+      "allowed_execution_metadata_changes": []
+    },
+    {
+      "file": "h2_deployment.py",
+      "function_count": 16,
+      "raw_sha256_before": "e3f9ddf0dacb62c0b4f3801d17031f8c5007c5b1d83f9b0bd2cafc5c5c999bfd",
+      "raw_sha256_after": "e3f9ddf0dacb62c0b4f3801d17031f8c5007c5b1d83f9b0bd2cafc5c5c999bfd",
+      "normalized_ast_sha256": "499827a385e17d7ab38454070c65c3c30550ceb9fa1875caf75f79e5e8c516ef",
+      "equal": true,
+      "allowed_execution_metadata_changes": []
+    },
+    {
+      "file": "h2_pipeline.py",
+      "function_count": 20,
+      "raw_sha256_before": "97a8528d62f05987924829d8c2e37ad6235805fd41d2f2fddc3e87e85aeb78a9",
+      "raw_sha256_after": "5c65a115359140bd78b784d48873ceff0ef42fa5cd8fc0f5757a55d6e0bf4dc1",
+      "normalized_ast_sha256": "b4e6c53efe8e00c4430c316ad04526a35e6c28e886902a6d8524f36ccfd2bf6d",
+      "equal": true,
+      "allowed_execution_metadata_changes": [
+        "cleanup exception attribute label",
+        "default execution allocation from logical pool",
+        "encoder logical ordinal in usage provenance"
+      ]
+    }
+  ],
+  "runner_scientific_helpers": [
+    {
+      "file": "run_h0.py",
+      "exact_ast_helpers": [
+        "load_config",
+        "_extractor",
+        "_compact_runtime",
+        "_condition_metadata",
+        "_run_condition",
+        "_assemble_sequence",
+        "parser"
+      ],
+      "changed_or_removed_helpers_to_review": [
+        "run",
+        "main"
+      ]
+    },
+    {
+      "file": "run_h1.py",
+      "exact_ast_helpers": [
+        "load_config",
+        "_compact_runtime",
+        "_metadata",
+        "_feature_store_descriptor",
+        "_run_condition",
+        "_assemble_sequence",
+        "_training_details",
+        "parser"
+      ],
+      "changed_or_removed_helpers_to_review": [
+        "_feature_diagnostics",
+        "run",
+        "main"
+      ]
+    },
+    {
+      "file": "run_h2.py",
+      "exact_ast_helpers": [
+        "load_config",
+        "_repository_provenance",
+        "_unique_identities",
+        "_load_bridge",
+        "_save_predictor",
+        "_new_predictor",
+        "_predictor_training_details",
+        "_validate_fresh_predictor",
+        "_evaluation_protocol",
+        "_metadata",
+        "_compact_runtime",
+        "_store_observations",
+        "_evaluation_population",
+        "_run_strict_replay",
+        "_run_sequence",
+        "parser"
+      ],
+      "changed_or_removed_helpers_to_review": [
+        "run",
+        "main"
+      ]
+    },
+    {
+      "file": "pipeline_worker.py",
+      "exact_ast_helpers": [
+        "emit"
+      ],
+      "changed_or_removed_helpers_to_review": [
+        "run",
+        "main"
+      ]
+    },
+    {
+      "file": "jepa_runtime.py",
+      "exact_ast_helpers": [
+        "state_dict_sha256",
+        "load_dpvo_domain",
+        "load_fnet",
+        "teacher_fmap",
+        "sequence_geometry",
+        "extract_block5_store",
+        "extract_true_fmap_store"
+      ],
+      "changed_or_removed_helpers_to_review": []
+    },
+    {
+      "file": "anchor_budget_results.py",
+      "exact_ast_helpers": [
+        "evaluation_population",
+        "comparison_row",
+        "write_csv",
+        "publish_index"
+      ],
+      "changed_or_removed_helpers_to_review": [
+        "save_trajectory",
+        "write_tables"
+      ]
+    },
+    {
+      "file": "anchor_budget_training.py",
+      "exact_ast_helpers": [
+        "load_budget_predictor",
+        "group_horizon",
+        "release_training_before_trajectory"
+      ],
+      "changed_or_removed_helpers_to_review": [
+        "training_lineage",
+        "validate_stride_lineage",
+        "fresh_train_budget"
+      ]
+    },
+    {
+      "file": "anchor_budget.py",
+      "exact_ast_helpers": [
+        "stride_roles",
+        "split_fixed_intervals",
+        "build_budget",
+        "online_identity_order",
+        "budget_config",
+        "population_summary"
+      ],
+      "changed_or_removed_helpers_to_review": [
+        "load_protocol",
+        "verify_canonical_artifacts",
+        "encoded_communication",
+        "backward_equivalence",
+        "prepare_protocol"
+      ]
+    }
+  ],
+  "dpvo_and_upstream_config_worktree_unchanged": true
+}

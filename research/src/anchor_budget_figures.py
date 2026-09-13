@@ -88,6 +88,8 @@ def _tradeoff_figure(root, data):
     from matplotlib.lines import Line2D
     strides = data["metadata"]["anchor_strides"]
     rows = [data["strides"][str(s)] for s in strides]
+    palette = plt.get_cmap("tab10")
+    stride_colors = {s: STRIDE_COLORS.get(s, palette(i % 10)) for i, s in enumerate(strides)}
     ratios = [r["communication"]["actual_anchor_ratio"]*100 for r in rows]
     reductions = [r["communication"]["encoded_byte_reduction"]*100 for r in rows]
     figure, axes = plt.subplots(2,3, figsize=(17.6,9.4))
@@ -121,10 +123,10 @@ def _tradeoff_figure(root, data):
         for stride, row in zip(strides,rows):
             horizon = row["horizon"]["by_relative_index"]
             x = [r["distance_from_previous_anchor_seconds"] for r in horizon]
-            axis.scatter(x, [r[predicted] for r in horizon], color=STRIDE_COLORS[stride], s=46, marker="o")
-            axis.scatter(x, [r[baseline] for r in horizon], edgecolors=STRIDE_COLORS[stride], facecolors="none", s=50, marker="D")
+            axis.scatter(x, [r[predicted] for r in horizon], color=stride_colors[stride], s=46, marker="o")
+            axis.scatter(x, [r[baseline] for r in horizon], edgecolors=stride_colors[stride], facecolors="none", s=50, marker="D")
         axis.set(title=title, xlabel="Distance from previous anchor [s]", ylabel="Held-out cosine")
-        handles = [Line2D([], [], color=STRIDE_COLORS[s], marker="o", linestyle="None", label=f"Stride {s}") for s in strides]
+        handles = [Line2D([], [], color=stride_colors[s], marker="o", linestyle="None", label=f"Stride {s}") for s in strides]
         handles += [Line2D([], [], color="gray", marker="o", linestyle="None", label="Prediction"),
                     Line2D([], [], color="gray", marker="D", markerfacecolor="none", linestyle="None", label="Transport")]
         axis.legend(handles=handles, fontsize=8, ncol=2)
@@ -156,7 +158,7 @@ def write_summary(root):
     data = json.loads((root / "results.json").read_text())
     metadata, strides = data["metadata"], data["metadata"]["anchor_strides"]
     split = metadata["fixed_split"]["regions"]
-    lines = ["# Phase 2 — Anchor Budget / Prediction Horizon", "",
+    lines = ["# Anchor Budget — Communication-Budget Sensitivity", "",
              "Question: how do Sparse RGB and Ours change as anchor upload budget decreases and prediction horizon grows?", "",
              f"Sequence: **{metadata['sequence']}**; strides: **{', '.join(map(str,strides))}**. Fresh predictor per stride; frozen H1 bridge.",
              "Fixed inclusive candidate regions: " + "; ".join(f"{name} {split[name]['candidate_start']}–{split[name]['candidate_end']}" for name in ("train", "validation", "test")) + ".",
@@ -171,7 +173,7 @@ def write_summary(root):
         lines.append("| " + " | ".join(map(str,values)) + " |")
     full = data["full_rgb"]
     lines += ["", f"Full RGB: ATE {_number(full['canonical_evaluation']['ate_rmse_m'])} m; matched wall {_number(full['matched_trajectory_wall_seconds'])} s (frozen stride-5 evaluation population).",
-              "ATE populations remain paired within each stride; stride 3 RPE is unavailable under the unchanged 1 s rule (zero pairs).", ""]
+              "ATE populations remain paired within each stride; RPE uses the unchanged 1 s rule and is null where no valid pairs exist.", ""]
     quality = []
     for stride in strides:
         held = data["strides"][str(stride)]["training"]["held_out_representation"]
@@ -185,8 +187,8 @@ def write_summary(root):
     for stride in strides:
         checkpoint = data["strides"][str(stride)]["provenance"]["checkpoint"]
         lines.append(f"Predictor K={stride}: `{checkpoint['relative_path']}`; SHA256 `{checkpoint['sha256']}`; seed {checkpoint['seed']}, best epoch {checkpoint['best_epoch']}.")
-    original = metadata["original_run_repository"].get("git_commit") or "not recorded (original source hashes retained)"
-    lines += [f"Experiment commit: {original}; artifact-publication commit: `{metadata['artifact_publication_repository']['git_commit']}`.",
+    original = metadata["repository"]["git_commit"]
+    lines += [f"Experiment commit: `{original}`; worktree dirty: {metadata['repository'].get('worktree_dirty', False)}.",
               f"Results SHA256: `{sha256_file(root / 'results.json')}`.", "",
               "[All numerical results](results.json) · [Raw trajectories](trajectories.npz) · [Trajectories](figures/trajectories.png) · [Tradeoffs](figures/tradeoffs.png)", ""]
     atomic_write_bytes(root / "SUMMARY.md", "\n".join(lines).encode())

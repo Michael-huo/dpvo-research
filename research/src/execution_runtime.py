@@ -1,4 +1,4 @@
-"""Fixed execution settings for the three-GPU Phase 1 formal runners.
+"""Execution settings for functional experiment runners.
 
 These settings describe how a scientific contract is executed.  They are
 recorded in provenance and never participate in checkpoint compatibility.
@@ -20,7 +20,7 @@ import torch
 from .protocol import canonical_sha256
 
 
-FORMAL_DEVICES = (0, 1, 2)
+from .cuda_devices import CudaDevicePool, logical_device_telemetry
 
 
 def _parse_cpu_list(value: str) -> list[int]:
@@ -72,7 +72,7 @@ def cpu_numa_layout(hardware: dict[str, Any]) -> dict[str, Any]:
     devices = hardware.get("devices", [])
     basis = "gpu_sysfs_numa"
     try:
-        by_index = {int(row["physical_index"]): row for row in devices}
+        by_index = {int(row["logical_index"]): row for row in devices}
         stage_node = int(by_index[0]["numa_node"])
         remote_node = int(by_index[1]["numa_node"])
         if stage_node == remote_node or int(by_index[2]["numa_node"]) != remote_node:
@@ -94,7 +94,7 @@ def cpu_numa_layout(hardware: dict[str, Any]) -> dict[str, Any]:
     if not predictor or not encoder:
         predictor = encoder = remote
     payload = {
-        "schema": "phase1_cpu_numa_layout_v1",
+        "schema": "research_cpu_numa_layout_v1",
         "stage_c": {"device": 0, "numa_node": stage_node, "cpus": stage},
         "predictor": {"device": 1, "numa_node": remote_node, "cpus": predictor},
         "encoder": {"device": 2, "numa_node": remote_node, "cpus": encoder},
@@ -136,40 +136,8 @@ def apply_cpu_profile(component: dict[str, Any]) -> None:
         raise RuntimeError("CPU affinity application failed")
 
 
-def _parse_nvidia_p2p_matrix(value: str) -> tuple[dict[str, bool], dict[str, str]]:
-    expected = [f"GPU{index}" for index in FORMAL_DEVICES]
-    token_rows = [line.split() for line in value.splitlines() if line.strip()]
-    matrix = {}
-    for row in token_rows:
-        # Driver releases format the header differently (and some append CPU or
-        # NIC columns). A data row is unambiguous because its first matrix value
-        # is a P2P status rather than another GPU label.
-        if (
-            len(row) >= len(expected) + 1
-            and row[0] in expected
-            and row[1] not in expected
-        ):
-            matrix[row[0]] = row[1:len(expected) + 1]
-    if set(matrix) != set(expected):
-        raise RuntimeError(
-            "nvidia-smi P2P output has an incomplete GPU matrix; "
-            f"parsed_rows={sorted(matrix)}"
-        )
-    access = {}
-    status = {}
-    for left in FORMAL_DEVICES:
-        for right in FORMAL_DEVICES:
-            if left == right:
-                continue
-            code = matrix[f"GPU{left}"][right]
-            status[f"{left}->{right}"] = code
-            access[f"{left}->{right}"] = code.upper() == "OK"
-    return access, status
-
-
 def validate_formal_hardware() -> dict[str, Any]:
     """Collect best-effort hardware telemetry without making it an admission gate."""
-    visible = os.environ.get("CUDA_VISIBLE_DEVICES")
     inventory_error = None
     try:
         output = subprocess.check_output([
@@ -204,67 +172,37 @@ def validate_formal_hardware() -> dict[str, Any]:
         except (OSError, ValueError) as error:
             row["numa_node"] = None
             row["numa_error"] = f"{type(error).__name__}: {error}"
-    p2p_error = None
-    try:
-        p2p_output = subprocess.check_output(
-            ["nvidia-smi", "topo", "-p2p", "r"], text=True, timeout=10,
-        )
-        p2p, p2p_status = _parse_nvidia_p2p_matrix(p2p_output)
-    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError) as error:
-        p2p_output, p2p, p2p_status = "", {}, {}
-        p2p_error = f"{type(error).__name__}: {error}"
-    devices = [{
-        "physical_index": row["physical_index"], "name": row["name"],
-        "total_memory_bytes": int(row["memory_total_mib"]) * 2**20,
-        "uuid": row["uuid"],
-    } for row in topology]
+    pool = CudaDevicePool.discover()
+    devices = logical_device_telemetry(pool.device_count, topology)
     payload = {
-        "schema": "phase1_formal_hardware_v1",
-        "required_gpu_count": 3,
-        "devices": topology,
-        "torch_devices": devices,
-        "p2p": p2p,
-        "p2p_read_status": p2p_status,
-        "p2p_read_matrix_raw": p2p_output,
-        "nvidia_smi_inventory_error": inventory_error,
-        "nvidia_smi_p2p_error": p2p_error,
-        "telemetry_only": True,
-        "mapping": {
-            "preparation": [0, 1, 2],
-            "standalone_trajectory": 0,
-            "h2_predicted_jepa": {
-                "vjepa": 2, "predictor": 1, "native_frontend_bridge_dpvo": 0,
-            },
-        },
+        "schema": "research_formal_hardware_v2",
+        "devices": devices, "physical_inventory": topology,
+        "nvidia_smi_inventory_error": inventory_error, "telemetry_only": True,
+        **pool.provenance(),
+        "mapping": {"preparation": list(pool.logical_ids),
+                    "standalone_trajectory": pool.primary_device if pool.device_count else None,
+                    "h2_predicted_jepa": pool.online_mapping() if pool.device_count >= 3 else None},
     }
     return payload | {"hardware_sha256": canonical_sha256(payload)}
 
 
-def initialize_formal_main_process(*, training_device: int | None = 1,
-                                   required_logical_devices: tuple[int, ...] = ()) -> dict[str, Any]:
+def initialize_formal_main_process(*, training_device: int | None = 0,
+                                   require_online: bool = False) -> dict[str, Any]:
+    pool = CudaDevicePool.discover()
+    if require_online:
+        pool.online_mapping()
+    pool.require(0)
     hardware = validate_formal_hardware()
     settings = capture_runtime()
-    if required_logical_devices:
-        count = int(torch.cuda.device_count())
-        missing = [device for device in required_logical_devices if device >= count]
-        if missing:
-            raise RuntimeError(
-                "H2 canonical pipeline requires logical cuda:0/1/2; "
-                f"visible_count={count}, missing={missing}"
-            )
     if training_device is not None:
-        if training_device not in FORMAL_DEVICES:
-            raise ValueError(f"invalid formal training device: {training_device}")
-        # H1/H2 training currently owns GPU1. Every trajectory is launched in a
-        # fresh child and never executes in this coordinator process.
+        pool.require(training_device)
+        if training_device != 0:
+            raise ValueError("formal training belongs to the primary logical device")
         torch.cuda.set_device(training_device)
         apply_runtime(settings)
-    return {
-        "hardware": hardware,
-        "main_process_device": training_device,
-        "required_logical_devices": list(required_logical_devices),
-        "runtime_settings": settings,
-    }
+    return {"hardware": hardware, "device_pool": pool.provenance(),
+            "main_process_device": training_device,
+            "runtime_settings": settings}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -277,8 +215,15 @@ class FormalExecution:
     sensor_paced: bool = False
     verify_transfers: bool = False
     decision_trace: bool = False
-    # Retained as false in serialized execution provenance for schema compatibility.
+    # Formal execution keeps pre-online A/B acceptance explicitly disabled.
     preonline_acceptance: bool = False
+
+    @classmethod
+    def from_pool(cls, pool=None):
+        mapping = (pool or CudaDevicePool.discover()).online_mapping()
+        return cls(encoder_device=mapping["encoder"].split(":")[1],
+                   predictor_device=mapping["predictor"].split(":")[1],
+                   consumer_device=mapping["stage_c"].split(":")[1])
 
     def __post_init__(self):
         if self.preonline_acceptance:
@@ -286,9 +231,9 @@ class FormalExecution:
         if self.queue_capacity < 1 or self.timeout_seconds <= 0:
             raise ValueError("queue capacity and timeout must be positive")
         if len({self.encoder_device, self.predictor_device, self.consumer_device}) != 3:
-            raise ValueError("formal execution needs three distinct physical GPUs")
+            raise ValueError("formal execution needs three distinct logical CUDA devices")
         if (self.encoder_device, self.predictor_device, self.consumer_device) != ("2", "1", "0"):
-            raise ValueError("canonical H2 mapping is fixed to encoder=GPU2, predictor=GPU1, consumer=GPU0")
+            raise ValueError("canonical H2 logical mapping is encoder=2, predictor=1, Stage C=0")
 
 
 def capture_runtime(seed: int = 1234) -> dict[str, Any]:
@@ -432,16 +377,20 @@ def require_lifecycle_cleanup(cleanup: dict[str, Any]) -> None:
 
 def execution_provenance(options: FormalExecution | None = None) -> dict[str, Any]:
     names = (
-        "execution_runtime.py", "training_runtime.py", "parallel_runtime.py",
+        "execution_runtime.py", "cuda_devices.py", "artifact_runtime.py", "training_runtime.py", "parallel_runtime.py",
         "h2_pipeline.py", "pipeline_worker.py", "staged_transfer.py",
         "jepa_runtime.py", "jepa_worker.py", "runtime.py",
         "efficiency_profiling.py", "run_h0.py", "run_h1.py", "run_h2.py",
+        "run_anchor_budget.py", "anchor_budget.py", "anchor_budget_training.py",
+        "anchor_budget_artifacts.py", "scientific_lineage.py", "registry.py",
+        "predictor.py", "transport.py", "h1_training.py", "h2_training.py",
+        "jepa_fmap.py", "h2_deployment.py",
     )
     files = {
         name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()
         for name in names
     }
-    payload = {"version": "phase1_formal_execution_v2_single_dpvo_numa", "source_manifest": files,
-               "options": dataclasses.asdict(options or FormalExecution()),
+    payload = {"version": "research_formal_execution_v2_single_dpvo_numa", "source_manifest": files,
+               "options": dataclasses.asdict(options) if options is not None else None,
                "excluded_from_checkpoint_compatibility": True}
     return payload | {"execution_sha256": canonical_sha256(payload)}

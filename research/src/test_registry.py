@@ -6,12 +6,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from .protocol import atomic_write_json, sha256_file
+from .protocol import REPO_ROOT, atomic_write_json, sha256_file
 from .registry import (
+    CHECKPOINT_ROOTS,
     CONDITION_ORDER, LINEAGE_FIELDS, SEQUENCE_FILES, complete_lineage,
     dataset_fingerprint, empty_index, publish_current_canonical,
     render_aggregate_summary, render_sequence_summary, sequence_entry,
-    validate_module_manifest,
+    validate_module_manifest, write_registry_and_summary, write_sequence_metadata,
 )
 
 
@@ -108,10 +109,12 @@ class CanonicalManifestTest(unittest.TestCase):
             "h0_state": None, "h1_interface": "bridge.pt", "h2_prediction": "predictor.pt",
         }[module]
         if checkpoint_name is not None:
-            (root / checkpoint_name).write_bytes(b"fresh checkpoint")
+            checkpoint_root = root.with_name(root.name + "_checkpoints")
+            checkpoint_root.mkdir()
+            (checkpoint_root / checkpoint_name).write_bytes(b"fresh checkpoint")
             index["canonical_checkpoint"] = {
-                "file": checkpoint_name,
-                "file_sha256": sha256_file(root / checkpoint_name),
+                "file": str((CHECKPOINT_ROOTS[module] / checkpoint_name).relative_to(REPO_ROOT)),
+                "file_sha256": sha256_file(checkpoint_root / checkpoint_name),
             }
         (root / {"h0_state": "SUMMARY_H0.md", "h1_interface": "SUMMARY_H1.md",
                  "h2_prediction": "SUMMARY_H2.md"}[module]).write_text("summary")
@@ -131,6 +134,65 @@ class CanonicalManifestTest(unittest.TestCase):
             (root / "sequences/MH_01_easy/trajectory.png").write_bytes(b"corrupt")
             with self.assertRaisesRegex(RuntimeError, "artifact hash mismatch"):
                 validate_module_manifest(root, "h0_state", index)
+
+    def test_published_module_json_has_no_staging_worker_paths(self) -> None:
+        for module in ("h0_state", "h1_interface", "h2_prediction"):
+            with self.subTest(module=module), tempfile.TemporaryDirectory() as name:
+                parent = Path(name)
+                temporary = parent / f".research_{module}_run"
+                worker_log = temporary / "workers/job_000/worker.log"
+                worker_log.parent.mkdir(parents=True)
+                worker_log.write_text("runtime diagnostics")
+                staged = temporary / "payload"
+                sequence = "MH_01_easy"
+                index = self._module(staged, module, (sequence,))
+                job = {"worker_log": str(worker_log), "logical_device": 0,
+                       "elapsed_seconds": 1.234567890123, "cleanup": {"success": True}}
+                execution = {"sequential_evaluation": {"jobs": [job],
+                             "makespan_seconds": 2.345678901234, "job_count": 1}}
+                index["execution"] = execution
+                if module != "h0_state":
+                    index["canonical_checkpoint"]["training"] = {
+                        "performance_diagnostics": {"formal_command": execution}}
+                result = _summary_result(module)
+                result["performance_diagnostics"] = {"formal_command": execution}
+                for condition in result["conditions"].values():
+                    condition["sequential_execution"] = job
+                directory = staged / "sequences" / sequence
+                lineage = self._lineage(module)
+                write_sequence_metadata(directory, module, sequence, result, lineage,
+                                        {"formal_command": execution})
+                index["sequences"][sequence] = sequence_entry(
+                    directory, module, lineage, bootstrap_end_candidate_index=7)
+                write_registry_and_summary(staged, module, index)
+                checkpoint_staged = (None if module == "h0_state"
+                                     else staged.with_name(staged.name + "_checkpoints"))
+                validate_module_manifest(staged, module, index, checkpoint_root=checkpoint_staged)
+                destination = parent / "canonical"
+                publish_current_canonical(
+                    staged, destination, checkpoint_staged=checkpoint_staged,
+                    checkpoint_destination=None if checkpoint_staged is None else parent / "checkpoints")
+                for path in destination.rglob("*.json"):
+                    self.assertNotIn(".research_", path.read_text(), str(path))
+                    self.assertNotIn('"worker_log"', path.read_text(), str(path))
+                published_index = json.loads((destination / "INDEX.json").read_text())
+                published = json.loads((destination / "sequences" / sequence / "results.json").read_text())
+                validate_module_manifest(destination, module, published_index,
+                                         checkpoint_root=parent / "checkpoints")
+                expected_job = {key: value for key, value in job.items() if key != "worker_log"}
+                self.assertEqual(published_index["execution"]["sequential_evaluation"]["jobs"], [expected_job])
+                self.assertEqual(published_index["execution"]["sequential_evaluation"]["makespan_seconds"],
+                                 execution["sequential_evaluation"]["makespan_seconds"])
+                self.assertEqual(published["provenance"]["formal_command"], published_index["execution"])
+                self.assertEqual(published["result"]["performance_diagnostics"]["formal_command"],
+                                 published_index["execution"])
+                self.assertEqual(published["lineage"], lineage)
+                for key, condition in published["result"]["conditions"].items():
+                    self.assertEqual(condition["canonical_evaluation"], result["conditions"][key]["canonical_evaluation"])
+                    self.assertEqual(condition["sequential_execution"], expected_job)
+                self.assertFalse(list(destination.rglob("*.log")))
+                self.assertEqual(worker_log.read_text(), "runtime diagnostics")
+                self.assertEqual(job["worker_log"], str(worker_log))
 
     def test_manifest_fails_closed_on_result_lineage_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -157,9 +219,9 @@ class CanonicalManifestTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as name:
             root = Path(name) / "h1_interface"
             index = self._module(root, "h1_interface", ("MH_01_easy",))
-            (root / "bridge.pt").write_bytes(b"different checkpoint")
+            (root.with_name(root.name + "_checkpoints") / "bridge.pt").write_bytes(b"different checkpoint")
             with self.assertRaisesRegex(RuntimeError, "checkpoint artifact hash mismatch"):
-                validate_module_manifest(root, "h1_interface", index)
+                validate_module_manifest(root, "h1_interface", index, checkpoint_root=root.with_name(root.name + "_checkpoints"))
 
     def test_current_canonical_publish_removes_unrequested_sequences(self) -> None:
         with tempfile.TemporaryDirectory() as name:
@@ -168,8 +230,8 @@ class CanonicalManifestTest(unittest.TestCase):
             staged = parent / "staged"
             self._module(destination, "h2_prediction", ("MH_01_easy",))
             index = self._module(staged, "h2_prediction", ("MH_03_medium",))
-            validate_module_manifest(staged, "h2_prediction", index)
-            publish_current_canonical(staged, destination)
+            validate_module_manifest(staged, "h2_prediction", index, checkpoint_root=staged.with_name(staged.name + "_checkpoints"))
+            publish_current_canonical(staged, destination, checkpoint_staged=staged.with_name(staged.name + "_checkpoints"), checkpoint_destination=destination.with_name(destination.name + "_checkpoints"))
             self.assertEqual(
                 {path.name for path in (destination / "sequences").iterdir()},
                 {"MH_03_medium"},

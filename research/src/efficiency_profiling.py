@@ -1,4 +1,4 @@
-"""Execution instrumentation used by the formal Phase 1 runners.
+"""Execution instrumentation used by the formal feasibility runners.
 
 This module deliberately owns no scientific configuration, model, checkpoint,
 evaluation, or publication logic. It provides timing, transfer, and telemetry
@@ -331,7 +331,7 @@ class NvidiaSmiSampler:
 
 
 class PersistentPerformanceAudit:
-    """Run-integrated performance provenance for canonical Phase 1 commands.
+    """Run-integrated performance provenance for canonical feasibility commands.
 
     This recorder owns diagnostic timing and hardware sampling only.  It does
     not inspect evaluation values or participate in any scientific decision.
@@ -412,7 +412,7 @@ class PersistentPerformanceAudit:
                 f"persistent CPU phases overlap: residual={residual:.6f}ms"
             )
         self._payload = {
-            "schema": "phase1_persistent_performance_diagnostics_v1",
+            "schema": "research_persistent_performance_diagnostics_v1",
             "module": self.module,
             "scope": self.scope,
             "diagnostic_only": True,
@@ -467,14 +467,12 @@ def add_cuda_worker_mapping(
     payload: dict[str, Any], worker: Mapping[str, Any], *,
     component: str = "v_jepa_worker",
 ) -> None:
-    """Attach a sidecar's real PID and inherited logical cuda:0 mapping."""
+    """Attach a sidecar's real PID and inherited logical CUDA mapping."""
     logical_index = int(worker.get("logical_cuda_ordinal", 0))
-    physical_index = worker.get("physical_device")
     topology = payload.get("devices", {}).get("topology", {})
     mapping = next((
         row for row in topology.get("logical_devices", [])
-        if (row.get("physical_index") == physical_index
-            if physical_index is not None else row.get("logical_index") == logical_index)
+        if row.get("logical_index") == logical_index
     ), {})
     payload["devices"]["components"][str(component)] = {
         "component": str(component),
@@ -482,7 +480,7 @@ def add_cuda_worker_mapping(
         "logical_index": logical_index,
         "cuda_visible_devices": worker.get("cuda_visible_devices"),
         "name": worker.get("cuda_device_name", mapping.get("name")),
-        "mapping_basis": "explicit physical worker device with logical cuda:0",
+        "mapping_basis": "inherited logical CUDA ordinal",
         **{key: mapping.get(key) for key in (
             "physical_index", "uuid", "pci_bus_id",
         )},
@@ -584,57 +582,9 @@ def parse_nvidia_topology(value: str | None) -> list[dict[str, Any]]:
 def logical_physical_mapping(
     logical_count: int, physical_devices: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    """Resolve CUDA ordinals to nvidia-smi/NVML identities.
-
-    Older PyTorch device properties do not expose UUID or PCI bus ID.  PyTorch's
-    NVML-index resolver still accounts for CUDA_VISIBLE_DEVICES (including UUID
-    selectors), so use it first and retain an explicit fallback/basis in the
-    audit instead of silently reporting an assumed direct mapping.
-    """
-    physical_by_index = {
-        int(row["physical_index"]): row for row in physical_devices
-        if row.get("physical_index") is not None
-    }
-    result: list[dict[str, Any]] = []
-    for logical in range(int(logical_count)):
-        physical_index: int | None = None
-        mapping_basis: str
-        mapping_error: str | None = None
-        try:
-            physical_index = int(torch.cuda._get_nvml_device_index(logical))
-            mapping_basis = "torch.cuda._get_nvml_device_index"
-        except Exception as error:
-            mapping_error = f"{type(error).__name__}: {error}"
-            visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-            if visible is None:
-                physical_index = logical
-                mapping_basis = "unmasked_cuda_ordinal_fallback"
-            else:
-                selectors = [item.strip() for item in visible.split(",")]
-                selector = selectors[logical] if logical < len(selectors) else ""
-                if selector.isdigit():
-                    physical_index = int(selector)
-                    mapping_basis = "CUDA_VISIBLE_DEVICES_numeric_fallback"
-                else:
-                    match = next((
-                        row for row in physical_devices
-                        if str(row.get("uuid", "")).startswith(selector)
-                    ), None)
-                    physical_index = (
-                        int(match["physical_index"]) if match is not None else None
-                    )
-                    mapping_basis = "CUDA_VISIBLE_DEVICES_uuid_fallback"
-        physical = physical_by_index.get(physical_index) if physical_index is not None else None
-        result.append({
-            "logical_index": logical,
-            "physical_index": physical_index,
-            "uuid": physical.get("uuid") if physical else None,
-            "pci_bus_id": physical.get("pci_bus_id") if physical else None,
-            "physical_name": physical.get("name") if physical else None,
-            "mapping_basis": mapping_basis,
-            "mapping_error": mapping_error,
-        })
-    return result
+    """Best-effort driver UUID/PCI mapping, with no CUDA context creation."""
+    from .cuda_devices import logical_device_telemetry
+    return logical_device_telemetry(logical_count, physical_devices)
 
 
 def gpu_topology_audit() -> dict[str, Any]:
@@ -664,31 +614,7 @@ def gpu_topology_audit() -> dict[str, Any]:
     try:
         cuda_available = bool(torch.cuda.is_available())
         count = int(torch.cuda.device_count())
-        resolved = {
-            row["logical_index"]: row
-            for row in logical_physical_mapping(count, physical_devices)
-        }
-        for source in range(count):
-            properties = torch.cuda.get_device_properties(source)
-            mapping = resolved[source]
-            logical_devices.append({
-                "logical_index": source, "name": properties.name,
-                "physical_index": mapping["physical_index"],
-                "uuid": mapping["uuid"], "pci_bus_id": mapping["pci_bus_id"],
-                "mapping_basis": mapping["mapping_basis"],
-                "mapping_error": mapping["mapping_error"],
-            })
-            for destination in range(count):
-                if source == destination:
-                    continue
-                try:
-                    allowed = bool(torch.cuda.can_device_access_peer(source, destination))
-                    peer.append({"source": source, "destination": destination,
-                                 "can_access_peer": allowed, "error": None})
-                except Exception as error:
-                    peer.append({"source": source, "destination": destination,
-                                 "can_access_peer": False,
-                                 "error": f"{type(error).__name__}: {error}"})
+        logical_devices = logical_physical_mapping(count, physical_devices)
     except Exception as error:
         cuda_error = f"{type(error).__name__}: {error}"
     pair_summary = []

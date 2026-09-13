@@ -96,6 +96,7 @@ class JepaSidecar:
             "worker_settings",
             capture_runtime(int(config.get("experiment", {}).get("seed", 1234))),
         )
+        worker_config["worker_device"] = int(torch.cuda.current_device())
         self.config_path = temporary / "jepa_worker_config.json"
         atomic_write_json(self.config_path, worker_config)
         self.process = subprocess.Popen(

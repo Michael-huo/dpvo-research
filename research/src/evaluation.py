@@ -302,7 +302,7 @@ def plot_canonical_trajectories(
 ) -> None:
     """Generic single-panel plot used by the final Exp6 modules."""
     import os
-    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-phase1-exp6")
+    os.environ.setdefault("MPLCONFIGDIR", "/tmp/matplotlib-research-exp6")
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

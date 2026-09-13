@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import os
 import queue
 import sys
 import tempfile
@@ -25,7 +26,7 @@ from .training_runtime import ResidentRows, resident_correspondence
 
 class FormalCleanupLifecycleTest(unittest.TestCase):
     def test_worker_launchers_use_functional_modules_and_original_gpu_mapping(self):
-        with tempfile.TemporaryDirectory() as name:
+        with tempfile.TemporaryDirectory() as name, patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,0,1"}), patch.object(torch.cuda, "device_count", return_value=3), patch.object(torch.cuda, "current_device", return_value=0):
             root = Path(name)
             with patch.object(execution_runtime, "capture_runtime", return_value={}), \
                  patch.object(jepa_runtime.JepaSidecar, "_receive", return_value={
@@ -38,8 +39,8 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
 
             for component, device in (("encoder", 2), ("predictor", 1)):
                 ready = {"status": "ready", "provenance": {
-                    "cuda_visible_devices": str(device), "logical_cuda_device_count": 1,
-                    "current_logical_cuda_device": 0,
+                    "cuda_visible_devices": "2,0,1", "logical_cuda_device_count": 3,
+                    "current_logical_cuda_device": device,
                 }}
                 with patch("subprocess.Popen") as popen, \
                      patch.object(threading.Thread, "start"), \
@@ -48,8 +49,8 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
                               config_path=root / "worker.json")
                     command = popen.call_args.args[0]
                     self.assertEqual(command[:3], [sys.executable, "-m", "research.src.pipeline_worker"])
-                    self.assertEqual(command[-2:], ["--component", component])
-                    self.assertEqual(popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], str(device))
+                    self.assertEqual(command[-2:], ["--logical-device", str(device)])
+                    self.assertEqual(popen.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "2,0,1")
                     self.assertEqual(popen.call_args.kwargs["cwd"], jepa_runtime.REPO_ROOT)
 
             with patch("subprocess.run") as launch, patch.object(torch, "save"):
@@ -57,7 +58,7 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
                 self.assertEqual(launch.call_args.args[0][:3], [
                     sys.executable, "-m", "research.src.parallel_runtime",
                 ])
-                self.assertEqual(launch.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "0")
+                self.assertEqual(launch.call_args.kwargs["env"]["CUDA_VISIBLE_DEVICES"], "2,0,1")
                 self.assertEqual(launch.call_args.kwargs["cwd"], jepa_runtime.REPO_ROOT)
 
     def _health_check_pipeline(self):
@@ -149,7 +150,6 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
             result = execution_runtime.validate_formal_hardware()
         self.assertTrue(result["telemetry_only"])
         self.assertIn("NVML unavailable", result["nvidia_smi_inventory_error"])
-        self.assertIn("NVML unavailable", result["nvidia_smi_p2p_error"])
 
     def test_h2_requires_three_logical_cuda_devices(self) -> None:
         with patch.object(
@@ -157,16 +157,16 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
         ), patch.object(
             execution_runtime, "capture_runtime", return_value={"seed": 1234},
         ), patch.object(torch.cuda, "device_count", return_value=2):
-            with self.assertRaisesRegex(RuntimeError, "logical cuda:0/1/2"):
+            with self.assertRaisesRegex(RuntimeError, "requires 3 visible CUDA devices"):
                 execution_runtime.initialize_formal_main_process(
-                    training_device=None, required_logical_devices=(0, 1, 2),
+                    training_device=None, require_online=True,
                 )
 
     def test_numa_query_failure_uses_deterministic_cpuset_fallback(self) -> None:
         hardware = {"devices": [
-            {"physical_index": 0, "numa_node": 0},
-            {"physical_index": 1, "numa_node": 1},
-            {"physical_index": 2, "numa_node": 1},
+            {"logical_index": 0, "numa_node": 0},
+            {"logical_index": 1, "numa_node": 1},
+            {"logical_index": 2, "numa_node": 1},
         ]}
         with patch.object(
             execution_runtime, "_physical_cpus_for_node",
@@ -181,15 +181,12 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
         self.assertTrue(layout["sets_disjoint"])
 
     def test_worker_binding_validation_uses_logical_runtime(self) -> None:
-        valid = {
-            "cuda_visible_devices": "2", "logical_cuda_device_count": 1,
-            "current_logical_cuda_device": 0,
-        }
-        parallel_runtime._validate_isolated_worker_binding(valid, 2)
-        with self.assertRaisesRegex(RuntimeError, "binding mismatch"):
-            parallel_runtime._validate_isolated_worker_binding(
-                valid | {"current_logical_cuda_device": 1}, 2,
-            )
+        valid = {"cuda_visible_devices": "2,0,1", "logical_cuda_device_count": 3,
+                 "current_logical_cuda_device": 2}
+        with patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,0,1"}), patch.object(torch.cuda, "device_count", return_value=3):
+            parallel_runtime._validate_isolated_worker_binding(valid, 2)
+            with self.assertRaisesRegex(RuntimeError, "binding mismatch"):
+                parallel_runtime._validate_isolated_worker_binding(valid | {"current_logical_cuda_device": 1}, 2)
 
     def test_external_gpu_process_snapshot_does_not_gate_job(self) -> None:
         process_snapshot = {
@@ -201,7 +198,7 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
             torch.save({
                 "sequence": "sequence", "condition": "bootstrap_schedule",
                 "worker_runtime": {
-                    "cuda_visible_devices": "0", "logical_cuda_device_count": 1,
+                    "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"), "logical_cuda_device_count": 1,
                     "current_logical_cuda_device": 0,
                 },
                 "cleanup": {"cleanup_complete": True},
@@ -212,7 +209,7 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as name, patch.object(
             parallel_runtime, "_gpu_process_telemetry", return_value=process_snapshot,
-        ), patch.object(parallel_runtime, "_launch", side_effect=fake_launch):
+        ), patch.object(parallel_runtime, "_launch", side_effect=fake_launch), patch.object(torch.cuda, "device_count", return_value=1):
             rows, execution = parallel_runtime.run_sequential_trajectory_jobs(
                 ({"kind": "materialize_schedule", "sequence": "sequence"},),
                 Path(name) / "jobs", hardware={"devices": []},
@@ -269,11 +266,11 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
                 )
         self.assertIs(raised.exception, original)
         self.assertTrue(
-            raised.exception.phase1_resident_cleanup["resident_tensors_cleared"],
+            raised.exception.research_resident_cleanup["resident_tensors_cleared"],
         )
         self.assertIn(
             "cleanup diagnostic",
-            " ".join(raised.exception.phase1_resident_cleanup["errors"]),
+            " ".join(raised.exception.research_resident_cleanup["errors"]),
         )
 
     def test_partial_correspondence_oom_preserves_original_exception(self) -> None:
@@ -299,7 +296,7 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
                 resident_correspondence(store, torch.device("cpu"))
         self.assertIs(raised.exception, original)
         self.assertTrue(
-            raised.exception.phase1_correspondence_resident_cleanup[
+            raised.exception.research_correspondence_resident_cleanup[
                 "resident_tensors_cleared"
             ],
         )
@@ -319,7 +316,7 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
         self.assertIs(raised.exception, original)
         self.assertIn(
             "cleanup failed",
-            " ".join(raised.exception.phase1_resident_cleanup["errors"]),
+            " ".join(raised.exception.research_resident_cleanup["errors"]),
         )
 
     def test_shared_slot_close_is_idempotent_and_reports_busy_state(self) -> None:

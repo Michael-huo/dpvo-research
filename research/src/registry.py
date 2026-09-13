@@ -5,7 +5,6 @@ from __future__ import annotations
 import copy
 import json
 import os
-import shutil
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -13,6 +12,15 @@ from .protocol import (
     REPO_ROOT, atomic_write_bytes, atomic_write_json, canonical_sha256,
     load_sequence_records, repo_path, sha256_file,
 )
+
+from .artifact_runtime import (
+    publish_current_canonical, validate_lightweight_results, without_worker_log_paths,
+)
+
+CHECKPOINT_ROOTS = {
+    "h1_interface": REPO_ROOT / "research/checkpoints/h1-interface",
+    "h2_prediction": REPO_ROOT / "research/checkpoints/h2-prediction",
+}
 
 INDEX_SCHEMA_VERSION = 2
 MODULES = ("h0_state", "h1_interface", "h2_prediction")
@@ -44,7 +52,7 @@ def _calibration_path(config: Mapping[str, Any]) -> Path:
     if value is None:
         value = config.get("dataset", {}).get("calibration")
     if value is None:
-        raise KeyError("Phase 1 config has no calibration path")
+        raise KeyError("feasibility config has no calibration path")
     return repo_path(value)
 
 
@@ -84,8 +92,7 @@ def _scientific_config(config: Mapping[str, Any]) -> dict[str, Any]:
     paths = payload.get("paths", {})
     paths.pop("output_root", None)
     paths.pop("h1_bridge", None)
-    runtime = payload.get("runtime", {})
-    runtime.pop("jepa_python", None)
+    payload.pop("runtime", None)
     return payload
 
 
@@ -185,24 +192,6 @@ def sequence_entry(
     }
 
 
-def publish_current_canonical(staged: Path, destination: Path) -> None:
-    """Replace one complete module only after its fresh run validates."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    backup = destination.with_name(f".{destination.name}.previous")
-    if backup.exists():
-        raise RuntimeError(f"stale module publish backup exists: {backup}")
-    if destination.exists():
-        destination.rename(backup)
-    try:
-        staged.rename(destination)
-    except Exception:
-        if backup.exists() and not destination.exists():
-            backup.rename(destination)
-        raise
-    if backup.exists():
-        shutil.rmtree(backup)
-
-
 CONDITION_LABELS = {
     "full_rgb": "Full RGB", "sparse_rgb": "Sparse RGB", "true_fmap": "True FMap",
     "oracle_jepa_bridge": "Oracle JEPA→Bridge",
@@ -297,11 +286,11 @@ def _performance_summary_lines(
         assignments = ", ".join(
             f"job{index}({row.get('sequence', '?')}/"
             f"{row.get('condition') or row.get('kind', '?')})"
-            f"→GPU{row.get('physical_device')}"
+            f"→GPU{row.get('logical_device')}"
             for index, row in enumerate(scheduler.get("jobs", ()))
         )
         lines.append(
-            f"- Canonical sequential evaluation: {scheduler.get('job_count', 0)} GPU0 jobs; "
+            f"- Canonical sequential evaluation: {scheduler.get('job_count', 0)} logical cuda:0 jobs; "
             f"makespan {_fixed(scheduler.get('makespan_seconds'), 3)} s"
             + (f"; {assignments}." if assignments else ".")
         )
@@ -449,11 +438,11 @@ def _result_summary_lines(module: str, result: Mapping[str, Any]) -> list[str]:
                 f"{_fixed(float(segments.get('drain_ms', 0.0)) / 1000.0, 3)} s."
             )
         lines.append(
-            "- Peak VRAM by process: GPU2 V-JEPA "
+            "- Peak VRAM by process: logical cuda:2 V-JEPA "
             f"{_fixed(float(stage_profile.get('peak_online_vram_jepa_worker_bytes', 0)) / 2**30, 3)} GiB; "
-            "GPU1 predictor "
+            "logical cuda:1 predictor "
             f"{_fixed(float(stage_profile.get('peak_online_vram_predictor_worker_bytes', 0)) / 2**30, 3)} GiB; "
-            "GPU0 frontend/bridge/DPVO "
+            "logical cuda:0 frontend/bridge/DPVO "
             f"{_fixed(float(stage_profile.get('peak_online_vram_main_process_bytes', 0)) / 2**30, 3)} GiB."
         )
     lines.extend(_performance_summary_lines(result.get("performance_diagnostics")))
@@ -475,7 +464,7 @@ def write_sequence_metadata(
         "schema_version": 1, "module": module, "sequence": sequence,
         "lineage": dict(lineage), "provenance": dict(provenance), "result": dict(result),
     }
-    atomic_write_json(directory / "results.json", payload)
+    atomic_write_json(directory / "results.json", without_worker_log_paths(payload))
     atomic_write_bytes(
         directory / SUMMARY_NAMES[module],
         render_sequence_summary(module, sequence, result).encode("utf-8"),
@@ -518,16 +507,16 @@ def render_aggregate_summary(root: Path, module: str, index: Mapping[str, Any]) 
         mapping = execution.get("hardware", {}).get("hardware", {}).get("mapping")
         if mapping:
             lines.append(
-                "- GPU mapping: preparation GPU0/1/2; standalone trajectories GPU0; "
+                f"- GPU mapping: preparation {mapping['preparation']}; standalone trajectories {mapping['standalone_trajectory']}; "
                 "H2 Predicted JEPA "
-                "GPU2 V-JEPA, GPU1 predictor, GPU0 native frontend/bridge/DPVO."
+                "logical cuda:2 V-JEPA, logical cuda:1 predictor, logical cuda:0 native frontend/bridge/DPVO."
             )
         scheduler = execution.get("sequential_evaluation") or execution.get(
             "sequential_trajectory_execution"
         )
         if isinstance(scheduler, Mapping):
             lines.append(
-                f"- Sequential GPU0 trajectory makespan: "
+                f"- Sequential logical cuda:0 trajectory makespan: "
                 f"{_fixed(scheduler.get('makespan_seconds'), 3)} s for "
                 f"{scheduler.get('job_count', 0)} jobs; maximum concurrent DPVO instances 1."
             )
@@ -564,13 +553,13 @@ def render_aggregate_summary(root: Path, module: str, index: Mapping[str, Any]) 
                 "- H2 CPU/NUMA profile: "
                 f"`{cpu_profile.get('selection')}`; dynamic calibration "
                 f"{cpu_profile.get('dynamic_calibration')}; "
-                "GPU0 Stage C OMP/MKL/intra/inter "
+                "logical cuda:0 Stage C OMP/MKL/intra/inter "
                 f"{stage_c.get('omp_num_threads')}/{stage_c.get('mkl_num_threads')}/"
                 f"{stage_c.get('intraop_threads')}/{stage_c.get('interop_threads')}; "
-                "GPU1 predictor "
+                "logical cuda:1 predictor "
                 f"{predictor.get('omp_num_threads')}/{predictor.get('mkl_num_threads')}/"
                 f"{predictor.get('intraop_threads')}/{predictor.get('interop_threads')}; "
-                "GPU2 V-JEPA "
+                "logical cuda:2 V-JEPA "
                 f"{encoder.get('omp_num_threads')}/{encoder.get('mkl_num_threads')}/"
                 f"{encoder.get('intraop_threads')}/{encoder.get('interop_threads')}."
             )
@@ -584,7 +573,7 @@ def render_aggregate_summary(root: Path, module: str, index: Mapping[str, Any]) 
             lines.append(
                 "- H2 component wall estimate: "
                 f"{_fixed(estimate.get('estimated_formal_wall_seconds'), 3)} s "
-                "(parallel preparation + resident training + sequential GPU0 controls/"
+                "(parallel preparation + resident training + sequential logical cuda:0 controls/"
                 "three-GPU Predicted JEPA + artifact/evaluation work)."
             )
         lines.append("")
@@ -603,11 +592,13 @@ def write_registry_and_summary(root: Path, module: str, index: Mapping[str, Any]
     summary_temp = summary_path.with_name(f".{summary_path.name}.{os.getpid()}.tmp")
     summary_temp.write_text(render_aggregate_summary(root, module, index), encoding="utf-8")
     os.replace(summary_temp, summary_path)
-    atomic_write_json(root / "INDEX.json", index)
+    atomic_write_json(root / "INDEX.json", without_worker_log_paths(index))
 
 
-def validate_module_manifest(root: Path, module: str, index: Mapping[str, Any]) -> None:
+def validate_module_manifest(root: Path, module: str, index: Mapping[str, Any], *,
+                             checkpoint_root: Path | None = None) -> None:
     """Fail closed before publishing a freshly constructed canonical module."""
+    validate_lightweight_results(root)
     if index.get("schema_version") != INDEX_SCHEMA_VERSION or index.get("module") != module:
         raise RuntimeError("canonical manifest schema/module mismatch")
     if index.get("run_policy") != "fresh_current_canonical_replace":
@@ -628,10 +619,13 @@ def validate_module_manifest(root: Path, module: str, index: Mapping[str, Any]) 
         if checkpoint is not None:
             raise RuntimeError("H0 canonical manifest must not contain a checkpoint")
     else:
-        expected_root.add(checkpoint_name)
-        if not isinstance(checkpoint, Mapping) or checkpoint.get("file") != checkpoint_name:
+        canonical_path = CHECKPOINT_ROOTS[module] / checkpoint_name
+        if not isinstance(checkpoint, Mapping) or checkpoint.get("file") != str(canonical_path.relative_to(REPO_ROOT)):
             raise RuntimeError("canonical checkpoint manifest is missing")
-        if sha256_file(root / checkpoint_name) != checkpoint.get("file_sha256"):
+        checkpoint_root = checkpoint_root or CHECKPOINT_ROOTS[module]
+        if {p.name for p in checkpoint_root.iterdir()} != {checkpoint_name}:
+            raise RuntimeError("canonical checkpoint directory set mismatch")
+        if sha256_file(checkpoint_root / checkpoint_name) != checkpoint.get("file_sha256"):
             raise RuntimeError("canonical checkpoint artifact hash mismatch")
     if {path.name for path in root.iterdir()} != expected_root:
         raise RuntimeError("canonical module contains unexpected root artifacts")

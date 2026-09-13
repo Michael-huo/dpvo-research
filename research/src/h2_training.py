@@ -415,7 +415,7 @@ def _plot_feature_diagnostics(path: Path, sequence: str, intervals: Sequence[Anc
         return max(1e-6,float(np.quantile(finite,.99)))
     error_limits={"jepa_prediction":vmax(jepa_error),"h1_bridge_to_true_fmap":vmax(h1_error),
                   "h2_prediction_through_bridge":vmax(h2_error)}
-    os.environ.setdefault("MPLCONFIGDIR","/tmp/matplotlib-phase1-exp6-3-final")
+    os.environ.setdefault("MPLCONFIGDIR","/tmp/matplotlib-research-exp6-3-final")
     import matplotlib; matplotlib.use("Agg"); import matplotlib.pyplot as plt
     figure,axes=plt.subplots(count,8,figsize=(22,2.7*count),squeeze=False)
     titles=("Oracle JEPA\n(shared PCA)","Predicted JEPA\n(shared PCA)","JEPA cosine error",

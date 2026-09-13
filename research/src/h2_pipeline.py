@@ -53,7 +53,7 @@ class CanonicalH2Pipeline(DelayedDeploymentProvider):
                  worker_settings=None, cpu_profile=None,
                  **kwargs):
         super().__init__(**kwargs)
-        self.execution = execution or FormalExecution()
+        self.execution = execution or FormalExecution.from_pool()
         self.predictor_checkpoint = str(predictor_checkpoint)
         self.predictor_state_sha256 = predictor_state_sha256
         self.cpu_profile = cpu_profile
@@ -219,7 +219,7 @@ class CanonicalH2Pipeline(DelayedDeploymentProvider):
                 "complete": not errors,
             }
             if primary_error is not None:
-                setattr(primary_error, "phase1_pipeline_cleanup", self.lifecycle_cleanup)
+                setattr(primary_error, "research_pipeline_cleanup", self.lifecycle_cleanup)
             elif errors:
                 raise RuntimeError(f"H2 pipeline lifecycle cleanup failed: {errors}")
 
@@ -471,6 +471,7 @@ class CanonicalH2Pipeline(DelayedDeploymentProvider):
             fill_ms = steady_ms = drain_ms = 0.0
             latency = {"count": 0, "mean_ms": None, "p95_ms": None, "max_ms": None}
         payload = super().usage_payload() | {"execution_backend":execution_provenance(self.execution),
+            "jepa_worker_logical_cuda_ordinal": int(self.execution.encoder_device),
             "worker_provenance":{name:worker.provenance for name,worker in self.workers.items()},
             "workers":self.worker_diagnostics,"timeline":self.timeline,"waits":self.waits,
             "stage_c_transfer":self.transfer.payload() if self.transfer else None,
