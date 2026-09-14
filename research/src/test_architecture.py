@@ -44,11 +44,11 @@ class ArchitectureContractTest(unittest.TestCase):
         ):
             config, path = runner.load_config()
             self.assertEqual(
-                path, REPO_ROOT / "research/configs" / f"{old_name}_{module[:2]}.yaml",
+                path, REPO_ROOT / "research/configs" / f"{module}.yaml",
             )
             self.assertEqual(
                 repo_path(config["paths"]["output_root"]),
-                REPO_ROOT / "research/results/phase1-feasibility" / module,
+                REPO_ROOT / "research/results" / module.replace("_", "-"),
             )
 
     def test_public_cli_dispatch_single_three_and_default_sequences(self) -> None:
@@ -173,7 +173,7 @@ class ArchitectureContractTest(unittest.TestCase):
         config, _ = run_h2.load_config()
         self.assertEqual(
             config["paths"]["h1_bridge"],
-            "research/results/phase1-feasibility/h1_interface/bridge.pt",
+            "research/checkpoints/h1-interface/bridge.pt",
         )
         self.assertNotIn("h0", str(config["paths"]))
 

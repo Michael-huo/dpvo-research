@@ -3,20 +3,17 @@
 from __future__ import annotations
 
 import copy
-import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-
-import numpy as np
 
 from .canonical import load_yaml
 from .predictor import build_anchor_intervals, effective_records, split_anchor_intervals
 from .protocol import (REPO_ROOT, canonical_sha256, post_bootstrap_ratio_roles,
-                       ratio_schedule_payload, repo_path, sha256_file)
+                       ratio_schedule_payload, repo_path)
 from .run_h2 import load_config as load_h2_config
 
-DEFAULT_CONFIG = REPO_ROOT / "research/configs/phase2_anchor_budget.yaml"
-OUTPUT_ROOT = REPO_ROOT / "research/results/phase2-anchor-budget"
+DEFAULT_CONFIG = REPO_ROOT / "research/configs/anchor_budget.yaml"
+OUTPUT_ROOT = REPO_ROOT / "research/results/anchor-budget"
 PILOT_STRIDES = (3, 5, 10)
 SPLITS = ("train", "validation", "test")
 
@@ -28,23 +25,9 @@ def load_protocol(path: str | Path = DEFAULT_CONFIG):
     if protocol["fresh_predictor_per_stride"] is not True:
         raise ValueError("each stride requires a fresh predictor")
     if repo_path(protocol["output_root"]) != OUTPUT_ROOT:
-        raise ValueError("anchor-budget output must stay in the Phase 2 results root")
-    config, config_path = load_h2_config(repo_path(protocol["canonical_h2_config"]))
-    if sha256_file(config_path) != protocol["canonical_h2_config_sha256"]:
-        raise RuntimeError("frozen canonical H2 config changed")
+        raise ValueError("anchor-budget output must stay in the Anchor Budget results root")
+    config, _ = load_h2_config(repo_path(protocol["canonical_h2_config"]))
     return protocol, config, path
-
-
-def verify_canonical_artifacts(protocol: Mapping[str, Any]) -> dict[str, Any]:
-    path = repo_path(protocol["canonical_artifact_manifest"])
-    if sha256_file(path) != protocol["canonical_artifact_manifest_sha256"]:
-        raise RuntimeError("canonical artifact manifest changed")
-    expected = json.loads(path.read_text())
-    actual = {name: sha256_file(repo_path(name)) for name in expected}
-    if actual != expected:
-        raise RuntimeError("Phase 1 canonical artifact SHA256 changed")
-    return {"verified_file_count": len(actual), "all_unchanged": True,
-            "manifest_sha256": sha256_file(path)}
 
 
 def stride_roles(identities: Sequence[Any], bootstrap_end: int, anchor_stride: int):
@@ -102,7 +85,7 @@ def split_fixed_intervals(intervals, fixed_split):
 
 
 def encoded_communication(records, roles):
-    """Count original uploaded PNG bytes, as in Phase 1, without decoding RGB."""
+    """Count original uploaded PNG bytes without decoding RGB."""
     full = sum(Path(row.rgb_path).stat().st_size for row in records)
     anchors = [row for row in records if roles[row.identity.key] == "anchor"]
     uploaded = sum(Path(row.rgb_path).stat().st_size for row in anchors)
@@ -113,7 +96,7 @@ def encoded_communication(records, roles):
             "actual_anchor_ratio": len(anchors) / len(records),
             "encoded_full_bytes": full, "encoded_anchor_bytes": uploaded,
             "encoded_bytes": uploaded, "encoded_byte_reduction": 1 - uploaded / full,
-            "encoding": "source_png_file_bytes_same_as_phase1",
+            "encoding": "source_png_file_bytes",
             "predicted_hidden_uplink_bytes": 0}
 
 
@@ -152,57 +135,35 @@ def online_identity_order(records, roles, intervals):
 
 
 def backward_equivalence(records, protocol):
-    """Read-only hard gate against old logic AND frozen canonical artifact hashes."""
+    """Exact stride-5 schedule/split guard, independent of previous result files."""
     fixed = protocol["fixed_split"]
     budget = build_budget(records, 5, fixed)
-    index_path = repo_path(protocol["canonical_h2_index"])
-    index = json.loads(index_path.read_text())
-    training = index["canonical_checkpoint"]["training"]
-    legacy_roles = post_bootstrap_ratio_roles(
+    reference_roles = post_bootstrap_ratio_roles(
         [r.identity for r in records],
-        bootstrap_end_candidate_index=training["lineage"]["bootstrap_end_candidate_index"],
+        bootstrap_end_candidate_index=fixed["bootstrap_end_candidate_index"],
         anchor_ratio=0.2,
     )
-    legacy_intervals = build_anchor_intervals(records, legacy_roles)
-    legacy_split, legacy_payload = split_anchor_intervals(legacy_intervals)
-    legacy_effective, legacy_tail = effective_records(records, legacy_intervals)
+    reference_intervals = build_anchor_intervals(records, reference_roles)
+    reference_split, reference_payload = split_anchor_intervals(reference_intervals)
+    reference_effective, reference_tail = effective_records(records, reference_intervals)
     checks = {
         "source_candidate_count": len(records) == fixed["source_candidate_count"],
-        "source_schedule": budget["source_schedule"] == training["schedule"],
-        "interval_boundaries_alpha_delta_queries": budget["intervals"] == legacy_intervals,
-        "candidate_order_and_tail": budget["records"] == legacy_effective and budget["effective_population"] == legacy_tail,
-        "roles": budget["roles"] == {r.identity.key: legacy_roles[r.identity.key] for r in legacy_effective},
-        "split_membership": budget["split"] == legacy_split,
-        "canonical_split": legacy_payload == training["split"],
-        "frozen_split_hash": fixed["source_split_sha256"] == legacy_payload["split_sha256"],
-        "dropped_boundary_intervals": budget["split_payload"]["dropped_boundary_interval_indices"] == legacy_payload["dropped_boundary_interval_indices"],
+        "interval_boundaries_alpha_delta_queries": budget["intervals"] == reference_intervals,
+        "candidate_order_and_tail": budget["records"] == reference_effective and budget["effective_population"] == reference_tail,
+        "roles": budget["roles"] == {r.identity.key: reference_roles[r.identity.key] for r in reference_effective},
+        "split_membership": budget["split"] == reference_split,
+        "frozen_split_hash": fixed["source_split_sha256"] == reference_payload["split_sha256"],
+        "dropped_boundary_intervals": budget["split_payload"]["dropped_boundary_interval_indices"] == reference_payload["dropped_boundary_interval_indices"],
     }
     for name, region in fixed["regions"].items():
-        first, last = legacy_split[name][0].anchor0, legacy_split[name][-1].anchor1
+        first, last = reference_split[name][0].anchor0, reference_split[name][-1].anchor1
         checks[f"fixed_region_{name}"] = region == {
             "candidate_start": first.candidate_index, "candidate_end": last.candidate_index,
             "frame_start": first.frame_id, "frame_end": last.frame_id,
             "timestamp_start_ns": first.timestamp_ns, "timestamp_end_ns": last.timestamp_ns,
         }
-    sequence_root = index_path.parent / "sequences" / protocol["sequence"]
-    saved_result = json.loads((sequence_root / "results.json").read_text())["result"]
-    checks["canonical_effective_schedule"] = budget["schedule"] == saved_result["schedule"]
-    with np.load(sequence_root / "trajectories.npz", allow_pickle=False) as saved:
-        for key, values in {
-            "frame_identity_keys": [r.identity.key for r in budget["records"]],
-            "candidate_indices": [r.identity.candidate_index for r in budget["records"]],
-            "timestamps_ns": [r.identity.timestamp_ns for r in budget["records"]],
-            "roles": list(budget["roles"].values()),
-        }.items():
-            checks[f"canonical_{key}"] = bool(np.array_equal(saved[f"input__{key}"], values))
     order = online_identity_order(budget["records"], budget["roles"], budget["intervals"])
     checks["online_order_exactly_once"] = order == [r.identity.key for r in budget["records"]] and len(order) == len(set(order))
-    usage = saved_result["conditions"]["predicted_jepa_hidden"]["runtime"]
-    checks["canonical_online_order_hash"] = canonical_sha256(order) == usage["candidate_identity_order_sha256"]
-    communication = encoded_communication(budget["records"], budget["roles"])
-    saved_bytes = saved_result["efficiency"]["transmission"]
-    checks["communication_counts_bytes"] = all(communication[k] == saved_bytes[k] for k in (
-        "anchor_count", "encoded_full_bytes", "encoded_anchor_bytes", "encoded_byte_reduction"))
     if not all(checks.values()):
         raise RuntimeError(f"stride=5 exact-equivalence failed: {[k for k,v in checks.items() if not v]}")
     return {"all_exact": True, "checks": checks, "gpu_numerical_smoke_run": False,
@@ -228,18 +189,17 @@ def population_summary(budget):
             "split": budget["split_payload"], "schedule": budget["schedule"]}
 
 
-def prepare_protocol(records, protocol):
-    guards = verify_canonical_artifacts(protocol)
+def prepare_protocol(records, protocol, strides=None):
     equivalence = backward_equivalence(records, protocol)
+    requested = tuple(protocol["anchor_strides"] if strides is None else strides)
     budgets = {stride: build_budget(records, stride, protocol["fixed_split"])
-               for stride in protocol["anchor_strides"]}
+               for stride in dict.fromkeys((*requested, 5))}
+    # Full RGB retains its frozen stride-5 population. Other strides keep their
+    # own complete intervals/tails; never truncate or promote anchors to match it.
     span = protocol["full_rgb_population"]
     full = tuple(r for r in records if span["candidate_start"] <= r.identity.candidate_index <= span["candidate_end"])
-    # First pilot naturally has the same tail for all three strides. Do not truncate
-    # or promote anchors to manufacture matching populations for future strides.
-    if any(b["records"] != full for b in budgets.values()):
-        raise RuntimeError("stride tails differ from frozen Full RGB span; pilot protocol needs explicit review")
+    if budgets[5]["records"] != full:
+        raise RuntimeError("stride-5 Full RGB population changed")
     return budgets, {"status": "prepared_no_experiment_run", "sequence": protocol["sequence"],
-                     "canonical_artifacts": guards, "stride5_equivalence": equivalence,
-                     "fixed_split": protocol["fixed_split"],
-                     "populations": [population_summary(b) for b in budgets.values()]}
+                     "stride5_equivalence": equivalence, "fixed_split": protocol["fixed_split"],
+                     "populations": [population_summary(budgets[s]) for s in requested]}

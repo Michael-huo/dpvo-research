@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .cuda_devices import CudaDevicePool
 from .execution_runtime import release_cuda_training_state, require_lifecycle_cleanup
 from .h2_training import (build_robust_correspondence_store, calibrate_train_only_thresholds,
                           held_out_representation, train_predictor)
@@ -19,6 +20,7 @@ from .protocol import atomic_write_json, canonical_sha256, repo_path, sha256_fil
 from .run_h2 import (_hidden_identities, _load_bridge, _save_predictor,
                      _unique_identities, _validate_fresh_predictor)
 from .scientific_lineage import scientific_fingerprint
+from .registry import config_protocol_fingerprint
 from .training_runtime import ResidentH2View, resident_correspondence
 from .transport import robust_protocol_metadata
 
@@ -27,8 +29,6 @@ def training_lineage(budget, protocol, geometry, config):
     train = budget["split"]["train"]
     anchors = {i.key: i for row in train for i in (row.anchor0, row.anchor1)}
     population = [i.public_dict() for i in sorted(anchors.values(), key=lambda i: i.candidate_index)]
-    source_files = {p.name: sha256_file(p) for p in sorted(Path(__file__).parent.glob("*.py"))
-                  if not p.name.startswith("test_")}
     return {
         "protocol": "anchor_budget_fresh_predictor_v1",
         "anchor_stride": budget["anchor_stride"],
@@ -39,7 +39,7 @@ def training_lineage(budget, protocol, geometry, config):
         "split_sha256": budget["split_payload"]["split_sha256"],
         "training_schedule_sha256": budget["source_schedule"]["schedule_sha256"],
         "canonical_h2_scientific_settings": scientific_fingerprint("h2"),
-        "canonical_h2_config_sha256": protocol["canonical_h2_config_sha256"],
+        "scientific_config": config_protocol_fingerprint(config),
         "h1_bridge_sha256": sha256_file(repo_path(config["paths"]["h1_bridge"])),
         "dpvo_checkpoint_sha256": sha256_file(repo_path(config["paths"]["dpvo_checkpoint"])),
         "dpvo_config_sha256": sha256_file(repo_path(config["paths"]["dpvo_config"])),
@@ -49,13 +49,12 @@ def training_lineage(budget, protocol, geometry, config):
         "seed": config["experiment"]["seed"],
         "training_recipe": config["training"],
         "initialization": "fresh_new_predictor_no_checkpoint_resume",
-        "training_source_sha256_by_file": source_files,
     }
 
 
 def validate_stride_lineage(stored, expected, stride):
     if stored.get("protocol") != "anchor_budget_fresh_predictor_v1":
-        raise RuntimeError("Phase 2 predictor lineage required; Phase 1/zero-shot checkpoint rejected")
+        raise RuntimeError("Anchor Budget predictor lineage required; generic/zero-shot checkpoint rejected")
     if stored.get("anchor_stride") != stride:
         raise RuntimeError("predictor anchor_stride mismatch")
     if dict(stored) != dict(expected):
@@ -88,7 +87,7 @@ def fresh_train_budget(records, budget, protocol, config, output, temporary):
     """No predictor resume and no H1 training; return only CPU model state/metadata.
 
     train_predictor preserves seed, AMP, 30 epochs, two intervals per batch,
-    AdamW, losses, and best-validation selection for every stride. The Phase 1
+    AdamW, losses, and best-validation selection for every stride. The feasibility
     feasibility-only tiny-overfit gate is not repeated in this sensitivity study.
     """
     started = time.perf_counter()
@@ -106,15 +105,15 @@ def fresh_train_budget(records, budget, protocol, config, output, temporary):
         mask = torch.from_numpy(coordinate_masks(transform)["valid_token_mask"]).cuda()
         dev, dev_meta = extract_parallel(
             records, _unique_identities(development), calibration, config,
-            temporary / "development", transform, devices=(0, 1, 2))
+            temporary / "development", transform, )
         stores.append(dev)
         thresholds = calibrate_train_only_thresholds(
             budget["split"]["train"], dev, transform, mask)
         robust, robust_meta = correspondence_parallel(
             development, dev, transform, mask, thresholds,
-            temporary / "correspondence", devices=(0, 1, 2))
-        resident = ResidentH2View(dev, development, device=torch.device("cuda:1"))
-        robust_resident = resident_correspondence(robust, torch.device("cuda:1"))
+            temporary / "correspondence", )
+        resident = ResidentH2View(dev, development, device=torch.device(CudaDevicePool.discover().primary_device))
+        robust_resident = resident_correspondence(robust, torch.device(CudaDevicePool.discover().primary_device))
         predictor, summary = train_predictor(
             resident, budget["split"], transform, mask, config, robust_resident)
         resident.close()

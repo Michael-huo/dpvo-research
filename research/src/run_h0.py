@@ -4,14 +4,6 @@ from __future__ import annotations
 
 import os
 
-# The public H0 module is a CPU-only coordinator. This must happen before torch,
-# DPVO, or profiling modules are imported: several CUDA extension/runtime probes
-# can otherwise retain a primary context even though H0 trajectories themselves
-# run in fresh children. The worker imports this module by its package name (not
-# as __main__) after the launcher has explicitly selected physical GPU0.
-if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"] = ""
-
 import argparse
 import json
 import tempfile
@@ -54,7 +46,7 @@ from .execution_runtime import (
 )
 from .parallel_runtime import run_sequential_trajectory_jobs
 
-DEFAULT_CONFIG = REPO_ROOT / "research/configs/phase1_feasibility_h0.yaml"
+DEFAULT_CONFIG = REPO_ROOT / "research/configs/h0_state.yaml"
 CONDITIONS = ("full_rgb", "sparse_rgb", "true_fmap")
 
 
@@ -309,7 +301,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         Path(__file__).with_name("schema.py"),
         Path(__file__).with_name("efficiency_profiling.py"),
     )
-    with tempfile.TemporaryDirectory(prefix=".phase1_h0_", dir=root.parent) as name:
+    with tempfile.TemporaryDirectory(prefix=".research_h0_", dir=root.parent) as name:
         staged_root = Path(name) / "h0_state"
         (staged_root / "sequences").mkdir(parents=True)
         index = empty_index("h0_state", requested)
@@ -393,7 +385,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 config, sequence, records, roles, schedule, sequence_jobs, output,
             )
             performance_payload = {
-                "schema": "phase1_condition_job_performance_v1",
+                "schema": "research_condition_job_performance_v1",
                 "conditions": {
                     row["condition"]: row["performance"] for row in sequence_jobs
                 },
@@ -416,7 +408,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             )
         total_makespan = time.perf_counter() - command_started
         index["execution"] = {
-            "schema": "phase1_formal_execution_summary_v1",
+            "schema": "research_formal_execution_summary_v1",
             "hardware": formal_runtime,
             "provenance": execution_provenance(),
             "sequential_evaluation": scheduler,
@@ -455,7 +447,7 @@ def main() -> int:
     args = parser().parse_args()
     config, _ = load_config()
     requested = resolve_sequences(args.sequences, config["experiment"]["default_sequences"])
-    print("Phase 1: H0 State — Latent-State Feasibility")
+    print("H0 State — Latent-State Feasibility")
     print("Input modes: full_rgb, sparse_rgb, true_fmap")
     print(json.dumps(run(requested), indent=2, sort_keys=True))
     return 0

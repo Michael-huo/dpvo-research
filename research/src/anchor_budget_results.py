@@ -59,7 +59,7 @@ def save_trajectory(output, row, records, roles, config, *, dense):
         "sequential_execution": row["sequential_execution"],
         "trajectory_sha256": sha256_file(output / "trajectory.npz"),
         "evaluation_role": "in_sequence_trajectory_feasibility_not_held_out_generalization",
-        "timing_protocol": "phase1_matched_online_wall_including_terminate_and_worker_flush",
+        "timing_protocol": "research_matched_online_wall_including_terminate_and_worker_flush",
         "warmup": row.get("warmup", row.get("online_profile", {}).get("warmup")),
     }
     if "online_profile" in row:
@@ -117,7 +117,7 @@ def write_tables(root, index):
     atomic_write_json(root / "prediction_quality_vs_horizon.json", horizon)
     write_csv(root / "accuracy_vs_communication.csv", accuracy)
     write_csv(root / "prediction_quality_vs_horizon.csv", horizon)
-    lines = ["# Phase 2 — Anchor Budget Sensitivity / Prediction Horizon", "",
+    lines = ["# Anchor Budget — Communication-Budget Sensitivity", "",
              f"Status: {index['status']}. Sequence: {index['sequence']}.", "",
              "GT is a shared reference. Full RGB runs once; each stride uses a fresh predictor, "
              "then separate sequential Sparse RGB and Ours DPVO processes.", "",
@@ -142,7 +142,7 @@ def write_tables(root, index):
         lines.extend(["", f"Full RGB (shared): ATE {fmt(full['ate_rmse_m'], suffix=' m')}; "
                       f"matched wall {fmt(full['matched_trajectory_wall_seconds'], suffix=' s')}. "
                       f"Metrics and graph workload: `{full['results']}`."])
-    lines.extend(["", "ATE uses the unchanged Phase 1 Sim(3) protocol on each stride's common "
+    lines.extend(["", "ATE uses the unchanged feasibility Sim(3) protocol on each stride's common "
                   "GT-associable anchor timestamps. Sparse and Ours share that population; "
                   "population hashes and RPE pair counts accompany every comparison. "
                   "The shared Full RGB ATE uses the frozen canonical stride-5 evaluation population.", "",

@@ -1,15 +1,12 @@
 """Explicit scientific contracts, independent of execution implementation."""
 from __future__ import annotations
 
-import json
-from pathlib import Path
 from typing import Mapping
 
 from .protocol import canonical_sha256
 
 
 COMMON_CONTRACT = {
-    "phase": "phase1_feasibility",
     "identity_and_schedule": "frame_identity_post_bootstrap_ratio_schedule_v1",
     "visual_state": "dpvo_fmap_zero_context_v1",
     "jepa_layer": 5,
@@ -48,7 +45,7 @@ def scientific_fingerprint(module: str) -> dict:
         raise ValueError(module)
     contract = COMMON_CONTRACT | MODULE_CONTRACTS[module]
     payload = {
-        "version": "phase1_explicit_scientific_contract_v1",
+        "version": "research_explicit_scientific_contract_v1",
         "module": module,
         "contract": contract,
     }
@@ -56,18 +53,4 @@ def scientific_fingerprint(module: str) -> dict:
 
 
 def compatible_training_input(actual: Mapping, expected: Mapping, *, module="h1") -> bool:
-    actual = dict(actual)
-    expected = dict(expected)
-    if actual == expected:
-        return True
-    source = actual.get("source_sha256")
-    path = Path(__file__).with_name("legacy_scientific_lineage.json")
-    migrations = json.loads(path.read_text())
-    migration = migrations.get(module, {}).get(source)
-    if migration is None:
-        return False
-    current = scientific_fingerprint(module)["source_sha256"]
-    if migration["scientific_source_sha256"] != current:
-        return False
-    actual["source_sha256"] = current
-    return actual == expected
+    return dict(actual) == dict(expected)

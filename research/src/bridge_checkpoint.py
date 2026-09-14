@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -15,7 +16,7 @@ from .protocol import REPO_ROOT, canonical_sha256, load_sequence_records, sha256
 from .registry import base_lineage
 from .schema import VISUAL_STATE_CONTRACT_SHA256
 
-H1_CONFIG_PATH = REPO_ROOT / "research/configs/phase1_feasibility_h1.yaml"
+H1_CONFIG_PATH = REPO_ROOT / "research/configs/h1_interface.yaml"
 H1_TRAINING_SEQUENCE = "MH_01_easy"
 H1_TRAINING_SOURCE_NAMES = (
     "run_h1.py", "h1_training.py", "bridge_checkpoint.py", "jepa_fmap.py",
@@ -120,7 +121,7 @@ def load_compatible_bridge(
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     model.requires_grad_(False)
     metadata = {
-        "file": str(path.relative_to(REPO_ROOT)), "file_sha256": sha256_file(path),
+        "file": os.path.relpath(path, REPO_ROOT), "file_sha256": sha256_file(path),
         "architecture": checkpoint["architecture"], "layer_zero_based": 5,
         "coordinate_protocol": checkpoint["coordinate_protocol"],
         "training_lineage_sha256": lineage["training_lineage_sha256"],

@@ -58,15 +58,15 @@ class DecompositionProtocolTest(unittest.TestCase):
         self.assertNotIn("from .predictor import", source)
         self.assertNotIn("from .jepa_fmap import", source)
 
-    def test_only_three_public_phase1_runners_and_configs_exist(self) -> None:
+    def test_hypothesis_runners_and_configs_exist(self) -> None:
         source_root = Path(__file__).parent
         runners = {path.name for path in source_root.glob("run_h[012].py")}
         self.assertEqual(runners, {"run_h0.py", "run_h1.py", "run_h2.py"})
         config_root = source_root.parent / "configs"
-        configs = {path.name for path in config_root.glob("phase1_feasibility_*.yaml")}
+        configs = {path.name for path in config_root.glob("h[012]_*.yaml")}
         self.assertEqual(configs, {
-            "phase1_feasibility_h0.yaml", "phase1_feasibility_h1.yaml",
-            "phase1_feasibility_h2.yaml",
+            "h0_state.yaml", "h1_interface.yaml",
+            "h2_prediction.yaml",
         })
 
 

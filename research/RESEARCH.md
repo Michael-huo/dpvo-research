@@ -1,150 +1,139 @@
-# Phase 1 — Feasibility Analysis
+# Research Method
 
-## 环境前提
+当前主体方法为：Sparse anchor RGB → V-JEPA representation → hidden JEPA prediction → H1 bridge → DPVO。
 
-使用 `research/environment.yml` 中的 DPVO 环境（Python 3.10），并安装项目的 CUDA extensions。
-扩展编译使用 CUDA Toolkit 12.1。运行前准备 EuRoC 数据、DPVO/V-JEPA 权重及正式 YAML 配置指定的路径。
-上游 DPVO 的安装、Demo 和可选后端说明见仓库 README；它们不属于 Phase 1 的正式研究入口。
+RGB 只在 anchor 上传。V-JEPA 提取 block-5 representation，predictor 利用已上传的 bracket endpoints 预测 hidden JEPA；frozen H1 bridge 将它映射成 DPVO FMap-only visual state。Anchor 保留 native DPVO frontend，hidden observation 不具有 RGB、offline reference 或 groundtruth capability。Closing anchor 必须真实到达并完成编码，随后按时间戳顺序消费 buffered hidden observations，每个 candidate 恰好一次。因此当前方法是 delayed/bracketed、non-causal deployment，`timestamp_causal=false`，不声明 causal 或 strict real-time。
 
-源码按功能平铺在 `research/src/`，以文件名表达职责，供后续研究阶段复用。Phase 用于科学实验组织和 results，不再作为源码 namespace；Phase 1 的 H0 State、H1 Interface、H2 Prediction 定义不变。正式配置仍为 `research/configs/phase1_feasibility_h0.yaml`、`phase1_feasibility_h1.yaml` 和 `phase1_feasibility_h2.yaml`。
+源码按功能平铺在 `research/src/`。上游 DPVO 安装和 Demo 见仓库 README。算法版本标识（如 block5、robust transport v1、H1–H4/A5）描述 representation/算法/观测协议，不构成实验模块的先后流程。
 
-Phase 1 的三个公开研究 CLI 为 `research.src.run_h0`、`research.src.run_h1`、`research.src.run_h2`；Phase 2 新增 `research.src.run_anchor_budget`。`jepa_worker`、`pipeline_worker`、`parallel_runtime` 的 module 启动方式仅供内部进程使用。源码布局迁移不改变科学 lineage 或 canonical checkpoint 兼容性；execution provenance 如实记录当前源码路径与 hash。
+# Experiment Modules
 
-在仓库根目录执行 CPU/unit 验证：`CUDA_VISIBLE_DEVICES="" python -m unittest discover -s research/src -t . -v`。测试覆盖 CLI mock dispatch、worker fresh-process/spawn 导入；安装了 canonical artifacts 时还会只读验证 H1/H2 checkpoint。
+H0 State、H1 Interface、H2 Prediction、Anchor Budget 是解耦实验模块，不是严格线性的阶段流程。允许修改 H2 → 回归 H2 → 回归 Anchor Budget → 需要时回到 H1。H2/Anchor Budget 复用兼容的 H1 canonical bridge，这是模型依赖，不要求读取 H0/H1/H2 旧结果。
 
-## H0 State — Latent-State Feasibility
+## H0 State
 
-H0 回答“learning-based VSLAM 的 hidden frame 最少需要什么 latent visual state”。conditions 固定为 Full RGB、Sparse RGB 和 True FMap。hidden packet 只保存 `fmap`；`patch_xy` 按 FrameIdentity/seed 确定性派生，`gmap/fmap2` 从 FMap 派生，`imap` 为 zero，colors 删除；pose/depth、factor、update、BA 与 upstream culling 保持正常 DPVO 语义。H0 不加载 JEPA、bridge 或 predictor。
+回答 latent visual state 是否可以替代 RGB-derived state。比较 Full RGB、Sparse RGB、True FMap；固定 DPVO FMap-only/zero-context state contract。每次 fresh 评估本次请求的 sequences，不产生 checkpoint。
 
 ```bash
 python -m research.src.run_h0 --sequences MH_01_easy
 ```
 
-## H1 Interface — Representation-Interface Feasibility
+## H1 Interface
 
-H1 验证 Oracle JEPA 能否经 coordinate-correct block-5→FMap interface 提供 H0 latent state。每次显式运行都在 MH01 fresh 训练一次 `bridge.pt`，并使用本轮刚训练的同一个 bridge fresh 评估全部 requested sequences。H1 不读取 H0 results，MH03/MH05 是本轮 bridge 的 frozen zero-shot evaluation。
+回答 JEPA representation 是否可以映射到 DPVO state。每次在 MH01 fresh 训练 bridge，使用本轮同一个 bridge 评估全部 requested sequences。MH03/MH05 是 frozen zero-shot evaluation。比较 Full RGB、Sparse RGB、True FMap、Oracle JEPA→Bridge。
+
+训练保留 seed 1236 初始化、两次 30 epochs、第二 pass seed 1234、batch 4、AMP、AdamW、相同 epoch-local batch order 和 pass 间 optimizer/scaler reset。正式 checkpoint 仍取第二 pass 最后 epoch；最低 validation 的 `best_epoch` 仅作为诊断，结果另记录实际 `selected_epoch` 和 selector。
 
 ```bash
-python -m research.src.run_h1 --sequences MH_01_easy
+python -m research.src.run_h1 --sequences MH_01_easy MH_03_medium MH_05_difficult
 ```
 
-## H2 Prediction — Sparse-Anchor Prediction Feasibility
+## H2 Prediction
 
-H2 只加载 canonical H1 `bridge.pt`，不会调用 H1 或训练 bridge。加载前验证 bridge 与当前 H1 科学 config/source/protocol lineage 兼容；不兼容时 fail closed 并要求先运行 H1。兼容后，每次 H2 显式运行都在 MH01 fresh 训练一次 `predictor.pt`，其 training lineage 绑定当前 bridge hash，再使用本轮 predictor fresh 评估全部 requested sequences。
-
-strict 在线 capability 只有 uploaded anchor RGB、anchor identity 和 hidden identity/timestamp。anchor RGB 通过 native DPVO FNet/Patchifier 形成 VSLAM observation 并提取 JEPA context；hidden observation 只能来自 predicted JEPA 经 frozen bridge 生成的 FMap-only packet。
-
-A5 必须真实到达并完成 JEPA 编码，随后才按时间戳顺序提交 buffered hidden observations，且每个 candidate 只消费一次。因此 H2 是 delayed/bracketed、non-causal deployment，`timestamp_causal=false`，不声明 causal 或 strict real-time。
+回答 sparse-anchor predicted hidden JEPA 能否驱动 VSLAM。只加载兼容的 canonical H1 bridge，不训练 bridge，也不读取 H1 results。每次 fresh 训练 predictor 并评估 Full RGB、Sparse RGB、Anchor JEPA only、Oracle JEPA、Predicted JEPA。保留 tiny-overfit gate、30 epochs、seed 1234、interval batch 2、AMP、原 loss/AdamW 和 lowest-validation-total checkpoint selection。
 
 ```bash
-python -m research.src.run_h2 --sequences MH_01_easy
-```
-
-三条 CLI 均支持一次请求多个 sequence。需要三序列横向比较时，必须让它们共享同一次 fresh 模型运行：
-
-```bash
-python -m research.src.run_h2 \
+CUDA_VISIBLE_DEVICES=0,1,2 python -m research.src.run_h2 \
     --sequences MH_01_easy MH_03_medium MH_05_difficult
 ```
 
-三条常规 fresh runner 会把性能诊断与 canonical 结果一起持久化：每个 sequence 的
-`results.json` 包含独立的 `result.performance_diagnostics`；H1/H2 的训练诊断同时保存在
-`INDEX.json -> canonical_checkpoint.training.performance_diagnostics`。sequence 和 aggregate
-summary 会显示简要 wall time、逐卡利用率以及 H2 predictor 的 CPU/CUDA outer totals。
-这些字段固定标记为 diagnostic-only，不进入评价指标、科学 gate、checkpoint tensor、
-模型输入或方法 lineage 决策。H2 还在常规 strict replay 中记录 predictor exclusive
-fine stages和transfer/IPC；H1/H2 training记录data/H2D、forward/loss、backward、
-optimizer/scaler及独立 synchronization wait。
+## Anchor Budget
 
-## 正式执行协议
+研究 anchor upload budget / prediction horizon 对 communication、accuracy、latency 的影响。默认 MH01、strides 3/5/10，也接受新的 distinct integer strides ≥ 2，例如 5/7/8。每个 stride fresh 训练独立 predictor，复用 H1 canonical bridge；不复制 bridge，不使用其他 stride 的 predictor zero-shot 替代训练。H2 的 tiny-overfit gate 不在这个模块重复执行。
 
-- H0/H1/H2 的 baseline/control 均在 GPU0 上逐 sequence、逐 condition 执行；每条 trajectory 使用独立 DPVO 进程，退出后再启动下一条，不并行多个 DPVO 实验。
-- H2 Predicted JEPA 每次只运行一条 trajectory、一个 DPVO consumer：GPU2 编码 V-JEPA，GPU1 执行 correspondence/transport/predictor，GPU0 执行 native frontend、frozen bridge 和 DPVO。多个 sequence 依次使用同一三卡映射。
-- Stage C 与标准 DPVO 使用相同固定 CPU profile；predictor/encoder 使用隔离的 CPU cores 和单线程配置。正式运行不动态选择 profile。
-- H1/H2 保留多 GPU preparation 和 GPU-resident train/validation；batch、RNG、AMP、optimizer/scaler、两 pass 或 best-checkpoint selection 均按各模块原 recipe 执行。训练准备与 trajectory 生命周期分离。
-- matched trajectory timing 排除训练、离线 preparation、模型加载、worker 启动、warmup 和 artifact I/O；包括在线 observation 处理、pipeline fill/steady/drain、DPVO terminate 及完成所需同步。
-- 正式路径保留 identity/order、exactly-once、capability、轻量 timing/transfer/provenance。完整 payload 验证和 decision trace 不进入正式计时。GPU telemetry 仅用于解释执行环境，不作为资源准入 gate。
-- scientific lineage 与 execution provenance 分离；执行源码变化不绕过或放宽 checkpoint 科学兼容检查。
+配置直接读取 `h2_prediction.yaml`，再用 `anchor_budget.yaml` 和请求的 stride 局部覆盖 schedule、固定 split、output；不另存 H2 科学配置副本。训练 architecture、loss、optimizer、batch、epochs、AMP 和 seed 均沿用 H2。train-only transport calibration 按各 stride 的 train endpoints 计算。
 
-## Artifact 与执行策略
+每次先运行一次标准 Full RGB，再逐 stride fresh train → Sparse → Ours。GT 仅是 reference，Sparse/Ours 使用同一 schedule 和配对的 GT-associable anchor evaluation population。跨 stride population 可以不同，必须结合 hash/count 解读。Full RGB 保留固定 stride-5 evaluation population。RPE 仍使用 1 秒 horizon、1 ms tolerance；这个模块显式允许没有合法 pairs 时记录 null/count 0，不插值或替换 horizon。
 
-Canonical outputs 位于 `research/results/phase1-feasibility/{h0_state,h1_interface,h2_prediction}/`。现阶段采用 fresh current-canonical replace：H0 每次 fresh 执行 requested sequences；H1 每次 fresh 训练 bridge 并 fresh 评估；H2 验证当前 H1 bridge 后 fresh 训练 predictor 并 fresh 评估。
+Schedule 使用原 ratio accumulator，ratio=1/K。Bootstrap candidate 0–7，第一个 post-bootstrap anchor 为 candidate 8；缺少 closing anchor 的尾段按原完整 interval 规则排除。不同 stride 保留各自自然尾段，不为匹配 Full RGB 人为截断或提升 anchor。固定时间区域直接保存在 YAML；只有两端 anchor 均处于同一区域的完整 interval 才进入该 split。
 
-本次 requested sequences 是模块完整的当前有效集合。只有整轮成功且通过 artifact manifest 验证后才替换旧模块，未请求的旧 sequence 不保留。每个模块根 `INDEX.json` 仅作为本轮 canonical provenance/artifact manifest，记录 requested sequences、dataset/config/source/protocol/schedule、适用的 bridge/predictor 及 sequence artifact hashes，不承担 cache 或 reuse 职责。
-
-## Phase 2 — Anchor Budget Sensitivity / Prediction Horizon
-
-Phase 1 — Feasibility 已完成并冻结，H0 State、H1 Interface、H2 Prediction 的既有结论、canonical results、checkpoint 和 H1 bridge 不变。本阶段以该方法为基础，不重新验证三个猜想。
-
-科学问题：降低 anchor upload budget 时，Sparse 因真实观测减少、Ours 因 prediction horizon 延长，各自如何变化；哪个 budget 区间可能出现精度优势？提高 anchor 密度时，两者是否改善？退化速度、单调性、交叉点都必须由后续实测验证，当前不写实验结论。独立变量为 `anchor_stride=K`，第一轮仅 MH_01_easy 的 3/5/10 三点。
-
-每点比较 GT / Full RGB / Sparse RGB / Ours（Predicted JEPA）四条轨迹。GT 仅作为 reference 引用一次；Full RGB 在固定有效 population 上标准 single-GPU DPVO 正式运行一次并共享；Sparse 和 Ours 使用完全相同的 schedule，分别 fresh、串行运行独立 DPVO。Ours 原样复用 GPU2 V-JEPA、GPU1 predictor、GPU0 bridge + DPVO 的正式 pipeline，不增加 Oracle trajectory。
-
-每个 stride 使用 `train_predictor` fresh 初始化独立 predictor，保持相同 architecture、loss、optimizer、30 epochs、AMP、seed 1234、interval batch size 2 和 lowest-validation-total checkpoint selection；H1 bridge 冻结复用。不会使用 stride-5 predictor zero-shot 代替其他 stride 的正式训练，也不会重新执行 Phase 1 tiny-overfit feasibility gate。不同 stride 每 epoch 的 interval/batch 数随数据自然改变，不额外配平训练步数。
-
-Schedule 直接调用 canonical ratio accumulator，令 ratio=1/K，不重新定义 K=5：candidate 0–7 为 bootstrap anchors，candidate 8 为第一个 post-bootstrap anchor，随后 K−1 hidden、closing anchor；没有 closing anchor 的 tail 按原逻辑排除。三个 pilot 点均自然保留 candidate 0–1838（1839 observations），末尾 2 candidates 排除，无需人为截断或提升 tail 为 anchor。
-
-固定时间切分来自冻结 H2 `INDEX.json` 的 split，端点 inclusive。所有 stride 只保留两端 anchor 都落在同一个固定区域内的完整 interval，跨区域或落入原 boundary gap 的 interval 丢弃，不共享 anchor identity，不按新的 interval 数量重新切 60/20/20。
-
-| Split | Candidate range | 原始 frame_id range | Timestamp ns range |
+| Split | Candidate（inclusive） | Frame ID | Timestamp ns |
 | --- | --- | --- | --- |
 | Train | 8–1103 | 16–2206 | 1403636580563555584–1403636690063555584 |
 | Validation | 1108–1468 | 2216–2936 | 1403636690563555584–1403636726563555584 |
 | Test | 1473–1838 | 2946–3676 | 1403636727063555584–1403636763563555584 |
 
-这些是固定的许可时间区域；不同 stride 的有效 interval 端点可能向区域内部移动，不能把这些端点再当作新的 split 定义。Trajectory evaluation 仍沿用 Phase 1 的整段 in-sequence feasibility protocol；held-out/test 仅用于训练后 representation diagnostics，不声称 held-out trajectory generalization。
-
-只读构造的 population（不是模型或 SLAM 实验结果）：
-
-| Stride | 理论 Anchor % | 实际 Anchor % | Anchors | Hidden | Complete intervals | Dropped split intervals | Train/Val/Test intervals |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
-| 3 | 33.333 | 33.660 | 619 | 1220 | 610 | 5 | 365 / 119 / 121 |
-| 5 | 20.000 | 20.392 | 375 | 1464 | 366 | 2 | 219 / 72 / 73 |
-| 10 | 10.000 | 10.440 | 192 | 1647 | 183 | 2 | 109 / 36 / 36 |
-
-实际比例的分母为 1839 个有效 observations，分子包括 bootstrap 上传。Encoded bytes 使用原 PNG 文件大小，和 Phase 1 一致；Full RGB 665,764,973 bytes，stride 3/5/10 分别上传 224,141,816 / 135,800,130 / 69,529,672 bytes，byte reduction 分别为 66.333% / 79.602% / 89.556%。Split boundary drops 只用于训练/验证/test划分，不从完整在线轨迹中删除。
+Trajectory evaluation 仍为整段 in-sequence feasibility；held-out/test 只用于训练后的 representation diagnostics，不声称 held-out trajectory generalization。Stride-5 guard 直接比较当前 ratio schedule/interval/split、冻结时间区域与 exactly-once order，不依赖已经生成的 H2 results。
 
 ```bash
-# 已有正式结果时只读验证并报告 complete；首次运行仅在 /tmp 做 CPU preparation。
-python -m research.src.run_anchor_budget --sequence MH_01_easy --strides 3 5 10
+# CPU preparation / dry-run：重新构造本次请求，在 /tmp 输出 PREPARATION.json。
+python -m research.src.run_anchor_budget --strides 5 7 8
 
-# 仅迁移已完成的旧目录；已有 compact 产物时验证后直接返回。
-CUDA_VISIBLE_DEVICES="" python -m research.src.run_anchor_budget --consolidate-existing
-
-# 仅凭 results.json + trajectories.npz 重建两张 PNG，不加载模型或数据集。
-CUDA_VISIBLE_DEVICES="" python -m research.src.run_anchor_budget --render-figures
+# 正式运行：fresh 训练与评估，成功后替换本模块 canonical 集合。
+CUDA_VISIBLE_DEVICES=0,1,2 python -m research.src.run_anchor_budget --strides 5 7 8 --execute
 ```
 
-首轮 3/5/10 实验已由用户完成。本次只聚合已有产物和绘图，没有重新训练或运行 DPVO。正式运行仍需显式添加 `--execute`；已有正式结果或 predictor 时拒绝覆盖/重跑。首次正式执行的 staging、worker 和 training cache 均在 `/tmp/anchor_budget_run_*/`，整轮成功后验证并发布；失败时保留 `/tmp` 现场供诊断，不自动恢复。默认 preparation 也只写 `/tmp/anchor_budget_prepare_*/`。
-
-协议配置为 `research/configs/phase2_anchor_budget.yaml`，只保存实验变量、冻结 split、canonical 引用和 hashes。Runner 读取现有 H2 YAML 并局部覆盖 schedule/split/output，不建立配置继承框架。Checkpoint 的 Phase 2 lineage 绑定 stride、实际 train anchor identities、固定 split、canonical H2 config/scientific contract、H1 hash、DPVO config/checkpoint、seed、训练源码 hashes 与 train-only calibration；加载时精确匹配，拒绝跨 stride 和 Phase 1 checkpoint。
-
-正式产物收敛为以下五个文件，可以独立打包 results 目录而不携带模型：
+# Configs and Artifacts
 
 ```text
-research/results/phase2-anchor-budget/
-├── SUMMARY.md
-├── results.json
-├── trajectories.npz
-└── figures/
-    ├── trajectories.png
-    └── tradeoffs.png
-research/checkpoints/phase2-anchor-budget/
-├── predictor_stride_3.pt
-├── predictor_stride_5.pt
-└── predictor_stride_10.pt
+research/configs/
+  h0_state.yaml
+  h1_interface.yaml
+  h2_prediction.yaml
+  anchor_budget.yaml
+research/results/
+  h0-state/
+  h1-interface/
+  h2-prediction/
+  anchor-budget/
+research/checkpoints/
+  h1-interface/bridge.pt
+  h2-prediction/predictor.pt
+  anchor-budget/predictor_stride_<K>.pt
 ```
 
-`results.json` schema v2 的顶层为 `metadata`、`full_rgb`、`strides`；每个 stride 包含 `schedule`、`communication`、`training`、`sparse`、`ours`、`horizon`、`comparison` 和 `provenance`。保留已有 ATE/RPE、evaluation population、Sim(3)、coverage、graph workload、matched wall、stage timing、context wait、held-out quality。Epoch metrics 和所有 test query diagnostics 用无损 columnar 表保存（`columns` + `rows`），可按任一 anchor 时间距离重新分组。模型 provenance 包括相对仓库路径、SHA256、stride、seed、best epoch 和原始完整 scientific lineage/hash。实验 Git commit 和产物发布 commit 分开记录；当前产物二者均有记录，并标明 dirty worktree。兼容旧目录时，如原 runner 未记录实验 commit 则明确保留 unknown，不拿当前 commit 冒充原实验版本。
+唯一公开实验 CLI 是 `research.src.run_h0`、`run_h1`、`run_h2`、`run_anchor_budget`。`parallel_runtime`、`pipeline_worker`、`jepa_worker` 仅是内部 fresh-process worker 入口。旧产物由用户手动删除；当前代码不读取、迁移或合并它们。
 
-`trajectories.npz` 包含 GT、Full_RGB 和每个 stride 的 sparse/ours，共八条轨迹，字段为 `<name>__timestamps_ns`、`__translation`、`__quaternion_xyzw`。七条 SLAM 轨迹的原始 dtype、点数、timestamp、pose 逐项完全相同；GT 保存原 reference 的全部点，遵循 Phase 1 reader 的 timestamp/quaternion 语义。另保留原 schedule 的 roles/intervals/query payload 压缩数组，以免清理旧 schedule JSON 时丢失身份与时间信息。`anchor_budget_artifacts.reconstruct_trajectory` 和 `reconstruct_schedule` 可完整还原。
+四个正式 runner 使用 **fresh-current-replace**（metadata 标识为 `fresh_current_canonical_replace`）。已有产物不会阻止 fresh execution。本次 requested sequences/strides 就是完整的新 canonical 集合；不保留未请求的旧项。
 
-轨迹图仅应用已保存的 Sim(3)，不重新 fitting 或 evaluation；三个 panel 使用同一 XY 坐标范围、aspect、颜色和起终点标记。Tradeoffs 的六个 panel 只画已有实测点，不插值。所有绘图仅依赖 JSON+NPZ。迁移先在 `/tmp` 验证替代产物、checkpoint 字节、轨迹数组和数值，再发布并删除已审计旧文件；原目录暂存于 `/tmp/anchor_budget_before_publish_*/artifacts` 以便恢复。正式目录不保留逐帧 worker telemetry 或多份 JSON/CSV。
+训练、evaluation、绘图和 artifact 验证全部在临时 staging 完成，results/checkpoint 的发布 staging 分别创建在目标目录所在文件系统。成功后才 rename：旧目录 → 临时 backup，staging → canonical；涉及两个目录时，在任一 rename 失败后逆序回滚两者。发布完成后删除 backup，staging 在成功或失败时均清理。父目录 advisory lock 串行化 publisher，不留下锁文件或 generation 目录。每个目录 rename 原子；跨 results/checkpoints 的两次 rename 不是一个文件系统级原子操作，因此并发 reader 可能短暂看到路径缺失。该事务处理 Python 异常和中断，不承诺断电/SIGKILL 恢复。
 
-Offline true JEPA / FMap 在 checkpoint selection 之后提取并在 deployment 前关闭，不进入正式 Ours capability。
+H0/H1/H2 继续保留 `INDEX.json`、aggregate `SUMMARY_H*.md`、requested `sequences/` 下的结果 JSON、summary、trajectory NPZ/PNG，以及 H1/H2 必要的 feature diagnostics。results 禁止模型文件；H1/H2 的 INDEX 记录 repository-relative checkpoint path、SHA256、scientific lineage、seed、best epoch 和 selector。模型只在 checkpoints 内。
 
-ATE 和 Sim(3) fitting 使用每个 stride 的 GT-associable anchor population，Sparse/Ours 完全配对；跨 stride 的 scoring timestamps 因 anchor schedule 而不同，必须连同 population hash/count 解释。Full RGB 的一次性 ATE 使用冻结的 stride-5 population，同时保存 dense diagnostics。RPE 保留 1 秒 horizon 和 1 ms tolerance：stride 3 经 GT association 后没有合法 pairs，记录 null 和 pair count 0；stride 5/10 分别有 362/181 pairs。不会插值、改变 horizon 或替换成 frame-offset RPE。默认 Phase 1 无 pair 时仍报错，只有 Phase 2 显式启用空 RPE population。
+Anchor Budget 只发布：
 
-Stride-5 hard gate 只读比较原 ratio schedule/split 与 canonical artifacts：candidate/anchor/hidden identities、interval/query alpha/delta、timestamp/order、split membership、boundary drops、exactly-once order hash 和 communication counts/bytes。`anchor_budget_canonical_sha256.json` 固定全部 22 个现有 Phase 1 artifacts；正式执行前后验证 SHA256，不更新 legacy lineage。本次迁移再次只读核对这些 artifacts，不重跑 GPU 等价性或正式实验。
+```text
+anchor-budget/
+  SUMMARY.md
+  results.json
+  trajectories.npz
+  figures/trajectories.png
+  figures/tradeoffs.png
+```
 
-实现审计与检查范围见 [ANCHOR_BUDGET_IMPLEMENTATION.md](ANCHOR_BUDGET_IMPLEMENTATION.md)。Phase 2 测试位于 `research/src/test_anchor_budget.py` 和 `test_anchor_budget_artifacts.py`；本次产物收口执行全部 117 条 CPU/unit tests，均通过。未运行 GPU smoke、fresh training 或 SLAM。
+`results.json` 是唯一正式数值真源。NPZ 聚合 GT、Full_RGB、每个请求 stride 的 sparse/ours trajectories，以及压缩 schedule identities/intervals。绘图仅消费 JSON/NPZ 和已保存的 Sim(3)，不重新拟合或评价。训练、worker、merge、diagnostic 中间文件不会进入 canonical results。
+
+Scientific lineage 严格校验 architecture、objective、representation/coordinate/transport/deployment definition、split、scientific config、seed/protocol、train-only calibration 和依赖模型 hash；Anchor Budget 还绑定 stride 与实际 train anchor population。产物路径、可见 GPU 数、物理 GPU ID 和执行源码 hash 不作为科学兼容条件。执行源码 hash、资源分配和硬件信息单独进入 provenance。
+
+# Execution Resources
+
+`CUDA_VISIBLE_DEVICES` 是唯一外部 CUDA 资源选择入口。`CudaDevicePool` 只依据 `torch.cuda.device_count()` 构造可见 logical devices。primary 为 logical cuda:0，worker devices 为其余可见卡；不把 logical ordinal 当成 physical GPU index。重排序 `CUDA_VISIBLE_DEVICES=2,0,1` 后，科学代码仍只使用 logical 0/1/2。
+
+| 可见 GPU 数 | Training / preparation | 当前 H2 / Ours online |
+| --- | --- | --- |
+| 1 | primary forward/backward + resident store；preparation 串行在 primary | fail closed |
+| 2 | primary 训练；preparation 按完整原 batch/独立 interval 分到两卡 | fail closed |
+| 3 | primary 训练；preparation 分到三卡 | Stage C=logical 0，predictor=logical 1，V-JEPA=logical 2 |
+| 4+ | primary 训练；preparation 使用可见池 | 只用 logical 0/1/2，其余卡不加入 online |
+
+当前 H2/Ours 必须至少 3 visible GPUs；不足时明确报错：`current online runtime requires 3 visible CUDA devices; single-GPU runtime will be evaluated separately`。Step C 尚未实施，当前没有新 single-GPU online candidate。
+
+H0/H1 controls、H2 Full/Sparse/Oracle/Anchor-only、Anchor Budget Full/Sparse 都在 primary 以单 DPVO instance 顺序运行；不并行多个 condition 或 sequence。H2/Ours 仍使用原三阶段 bounded pipeline、CPU shared-memory IPC、pinned host transfer 和固定 CPU profile。CPU/NUMA affinity 优先按 logical device 对应 PCI topology 选择，读取失败采用已有 cpuset fallback；GPU 模型/UUID/PCI 查询均为 best-effort telemetry，不构成 admission gate。
+
+Preparation 维持完整原 JEPA batch，不切碎 batch；correspondence 按独立 interval 分片。合并校验 duplicate/missing identity、native dtype、identity order 和 ordered content hash。H1 train/validation、H2 development store 保持 GPU-resident，不使用 DDP，不改 batch/AMP/RNG/optimizer/selection。显存不足自然 OOM，没有 free-VRAM gate 或自动 batch 修改。
+
+所有 worker 使用现有 fresh Python subprocess（独立解释器，不 fork CUDA coordinator），继承原 visibility mask，在模型/stream 创建前只选择获分配 logical device；嵌套 JEPA sidecar 沿用该 ordinal。物理 UUID/PCI 由不创建 CUDA context 的 driver 查询采集，失败时记录 unknown，不猜测映射。标准 matched online timing 和 offline preparation/training/diagnostic time 继续分开报告。
+
+# Validation
+
+```bash
+CUDA_VISIBLE_DEVICES="" python -m unittest discover -s research/src -t . -v
+python -m compileall -q research/src
+git diff --check
+python -m research.src.run_h0 --help
+python -m research.src.run_h1 --help
+python -m research.src.run_h2 --help
+python -m research.src.run_anchor_budget --help
+```
+
+A+B 的配置逐字段与科学源码 AST 核对、mock/spawn/transaction 验证结果见 [STEP_AB_VALIDATION.md](STEP_AB_VALIDATION.md)。Anchor Budget 的 compact artifact 实现约定见 [ANCHOR_BUDGET_IMPLEMENTATION.md](ANCHOR_BUDGET_IMPLEMENTATION.md)。

@@ -5,21 +5,21 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import shutil
 import tempfile
 from pathlib import Path
 
 import numpy as np
 
 from .anchor_budget import (DEFAULT_CONFIG, PILOT_STRIDES, budget_config, load_protocol,
-                            population_summary, prepare_protocol, verify_canonical_artifacts)
+                            population_summary, prepare_protocol)
 from .anchor_budget_results import comparison_row, publish_index, save_trajectory
 from .anchor_budget_artifacts import (CHECKPOINT_ROOT, publish_compact,
-                                      repository_provenance, validate_compact)
+                                      repository_provenance)
 from .anchor_budget_training import (fresh_train_budget, load_budget_predictor,
                                      release_training_before_trajectory)
+from .artifact_runtime import staged_directory
 from .execution_runtime import (FormalExecution, cpu_numa_layout, fixed_cpu_profile,
-                                initialize_formal_main_process)
+                                initialize_formal_main_process, execution_provenance)
 from .parallel_runtime import run_sequential_trajectory_jobs
 from .protocol import (atomic_write_json, load_sequence_records, repo_path,
                        sha256_file)
@@ -48,15 +48,16 @@ def predicted_task(common, budget, trained, config, profile):
             "predictor_state": checkpoint["state_dict"],
             "predictor_checkpoint": str(path),
             "predictor_state_hash": checkpoint["state_dict_sha256"],
-            "pipeline_cpu_profile": profile, "execution": dataclasses.asdict(FormalExecution())}
+            "pipeline_cpu_profile": profile, "execution": dataclasses.asdict(FormalExecution.from_pool())}
 
 
 def execute_sequence(records, budgets, protocol, canonical, root, temporary, index):
-    runtime = initialize_formal_main_process(required_logical_devices=(0, 1, 2))
-    profile = {"schema": "phase1_h2_fixed_cpu_profile_v1", "selection": "fixed_same_as_h0_h1",
+    runtime = initialize_formal_main_process(require_online=True)
+    profile = {"schema": "research_h2_fixed_cpu_profile_v1", "selection": "fixed_same_as_h0_h1",
                "dynamic_calibration": False,
                "components": fixed_cpu_profile(cpu_numa_layout(runtime["hardware"]))}
     index["execution"] = {"runtime": runtime, "profile": profile,
+                          "provenance": execution_provenance(),
                           "maximum_concurrent_dpvo_instances": 1,
                           "measurement_order": ["full_rgb", *[
                               f"stride_{s}/{c}" for s in index["anchor_strides"]
@@ -127,21 +128,16 @@ def run(sequence="MH_01_easy", strides=PILOT_STRIDES, *, config_path=DEFAULT_CON
     strides = tuple(strides)
     if sequence != protocol["sequence"]:
         raise ValueError("only MH_01_easy is allowed in the first pilot")
-    if not strides or len(strides) != len(set(strides)) or not set(strides) <= set(PILOT_STRIDES):
-        raise ValueError("choose distinct strides from 3, 5, 10")
+    if not strides or len(strides) != len(set(strides)) or any(
+            isinstance(s, bool) or not isinstance(s, int) or s < 2 for s in strides):
+        raise ValueError("choose distinct integer strides >= 2")
     root = repo_path(protocol["output_root"])
-    if (root / "results.json").exists():
-        if execute:
-            raise FileExistsError("completed compact results already exist; automatic rerun is disabled")
-        completed = validate_compact(root, check_checkpoints=False)
-        return {"status": "complete", "sequence": completed["metadata"]["sequence"],
-                "anchor_strides": completed["metadata"]["anchor_strides"], "results": str(root / "results.json")}
-    if execute and ((root.exists() and any(root.iterdir())) or
-                    (CHECKPOINT_ROOT.exists() and any(CHECKPOINT_ROOT.glob("*.pt")))):
-        raise FileExistsError("existing artifacts/checkpoints must not be overwritten or rerun")
+    if execute:
+        from .cuda_devices import CudaDevicePool
+        CudaDevicePool.discover().online_mapping()
     records = load_sequence_records(canonical, sequence)
-    budgets, preparation = prepare_protocol(records, protocol)
-    index = {"schema_version": 1, "protocol": "anchor_budget_fresh_predictor_v1",
+    budgets, preparation = prepare_protocol(records, protocol, strides)
+    index = {"schema_version": 1, "run_policy": "fresh_current_canonical_replace", "protocol": "anchor_budget_fresh_predictor_v1",
              "sequence": sequence, "anchor_strides": list(strides),
              "trajectory_comparison": ["GT", "Full RGB", "Sparse RGB", "Ours / Predicted JEPA"],
              "status": "running" if execute else "prepared_no_experiment_run",
@@ -154,62 +150,37 @@ def run(sequence="MH_01_easy", strides=PILOT_STRIDES, *, config_path=DEFAULT_CON
         atomic_write_json(temporary / "PREPARATION.json", preparation)
         index["preparation_path"] = str(temporary / "PREPARATION.json")
         return index
-    CHECKPOINT_ROOT.parent.mkdir(parents=True, exist_ok=True)
-    lock = CHECKPOINT_ROOT.parent / ".anchor_budget.execute.lock"
-    with lock.open("x"):
-        temporary = Path(tempfile.mkdtemp(prefix="anchor_budget_run_", dir="/tmp"))
+    # All intermediate models/worker/diagnostic files disappear on either outcome.
+    with staged_directory(root) as temporary:
         staged = temporary / "artifacts"
         staged.mkdir()
         index["repository"] = repository_provenance()
-        try:
-            publish_index(staged, index)
-            execute_sequence(records, budgets, protocol, canonical, staged, temporary / "workers", index)
-            index["status"] = "complete"
-            index["canonical_artifacts_after"] = verify_canonical_artifacts(protocol)
-            publish_index(staged, index)
-            publish_compact(staged, root, CHECKPOINT_ROOT)
-        except BaseException as error:
-            index["status"] = "failed"
-            index["error"] = f"{type(error).__name__}: {error}"
-            index["recovery_staging_directory"] = str(temporary)
-            publish_index(staged, index)
-            raise
-        else:
-            shutil.rmtree(temporary)
-        finally:
-            lock.unlink()
+        publish_index(staged, index)
+        bridge = repo_path(canonical["paths"]["h1_bridge"])
+        bridge_hash = sha256_file(bridge)
+        execute_sequence(records, budgets, protocol, canonical, staged, temporary / "workers", index)
+        index["status"] = "complete"
+        if sha256_file(bridge) != bridge_hash:
+            raise RuntimeError("canonical H1 bridge changed during Anchor Budget execution")
+        publish_index(staged, index)
+        publish_compact(staged, root, CHECKPOINT_ROOT)
     return index
 
 
 def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--sequence", choices=["MH_01_easy"], default="MH_01_easy")
-    result.add_argument("--strides", nargs="+", type=int, choices=PILOT_STRIDES, default=list(PILOT_STRIDES))
+    result.add_argument("--strides", nargs="+", type=int, default=list(PILOT_STRIDES))
     result.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
-    action = result.add_mutually_exclusive_group()
-    action.add_argument("--execute", action="store_true",
-                        help="explicitly run Full RGB once and fresh training + Sparse/Ours per stride")
-    action.add_argument("--consolidate-existing", action="store_true",
-                        help="aggregate completed artifacts and relocate checkpoints; no training or SLAM")
-    action.add_argument("--render-figures", action="store_true",
-                        help="rebuild the two PNGs from results.json + trajectories.npz only")
+    result.add_argument("--execute", action="store_true",
+                        help="fresh Full RGB and per-stride training + Sparse/Ours; replaces the canonical request set")
     return result
 
 
 def main():
     args = parser().parse_args()
-    if args.consolidate_existing or args.render_figures:
-        from .anchor_budget import OUTPUT_ROOT
-        if args.render_figures:
-            from .anchor_budget_figures import render_figures
-            render_figures(OUTPUT_ROOT)
-            compact = validate_compact(OUTPUT_ROOT, check_checkpoints=False)
-        else:
-            compact = publish_compact(OUTPUT_ROOT, OUTPUT_ROOT, CHECKPOINT_ROOT)
-        result = {"status": "complete", "sequence": compact["metadata"]["sequence"],
-                  "anchor_strides": compact["metadata"]["anchor_strides"]}
-    else:
-        result = run(args.sequence, args.strides, config_path=args.config, execute=args.execute)
+    print("Anchor Budget — Communication-Budget Sensitivity")
+    result = run(args.sequence, args.strides, config_path=args.config, execute=args.execute)
     print(json.dumps({"status": result["status"], "sequence": result["sequence"],
                       "strides": result["anchor_strides"]}, indent=2))
     return 0

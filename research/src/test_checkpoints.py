@@ -144,29 +144,30 @@ class FreshCheckpointPolicyTest(unittest.TestCase):
 
 
 class ScientificLineageTest(unittest.TestCase):
-    def test_legacy_manifest_preserves_fail_closed_scientific_contracts(self) -> None:
-        manifest = json.loads(Path(scientific_lineage.__file__).with_name(
-            "legacy_scientific_lineage.json",
-        ).read_text())
-        for module, migrations in manifest.items():
+    def test_only_exact_scientific_contracts_are_compatible(self) -> None:
+        for module in ("h1", "h2"):
             fingerprint = scientific_lineage.scientific_fingerprint(module)
             expected = {"source_sha256": fingerprint["source_sha256"], "dataset_sha256": "data"}
-            for source in migrations:
-                actual = expected | {"source_sha256": source}
-                self.assertTrue(scientific_lineage.compatible_training_input(actual, expected, module=module))
+            self.assertTrue(scientific_lineage.compatible_training_input(expected, expected, module=module))
+            for field in expected:
                 self.assertFalse(scientific_lineage.compatible_training_input(
-                    actual | {"dataset_sha256": "changed"}, expected, module=module,
-                ))
-            self.assertFalse(scientific_lineage.compatible_training_input(
-                expected | {"source_sha256": "unknown"}, expected, module=module,
-            ))
+                    expected | {field: "obsolete"}, expected, module=module))
             for key in ("architecture", "objective", "training"):
                 with patch.dict(scientific_lineage.MODULE_CONTRACTS[module], {key: "changed"}):
                     changed = scientific_lineage.scientific_fingerprint(module)["source_sha256"]
                     self.assertNotEqual(changed, expected["source_sha256"])
                     self.assertFalse(scientific_lineage.compatible_training_input(
-                        actual, expected | {"source_sha256": changed}, module=module,
-                    ))
+                        expected, expected | {"source_sha256": changed}, module=module))
+
+    def test_execution_pool_and_artifact_paths_do_not_change_scientific_config(self):
+        config, _ = run_h2.load_config()
+        changed = copy.deepcopy(config)
+        changed["paths"]["output_root"] = "/tmp/other-results"
+        changed["paths"]["h1_bridge"] = "/tmp/other-checkpoints/bridge.pt"
+        changed["runtime"].update(visible_cuda_count=1, primary_device="cuda:0", physical_gpu_id="other")
+        self.assertEqual(registry._scientific_config(config), registry._scientific_config(changed))
+        changed["training"]["intervals_per_batch"] += 1
+        self.assertNotEqual(registry._scientific_config(config), registry._scientific_config(changed))
 
 
 class CanonicalCheckpointCompatibilityTest(unittest.TestCase):
@@ -174,9 +175,9 @@ class CanonicalCheckpointCompatibilityTest(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls) -> None:
-        cls.root = REPO_ROOT / "research/results/phase1-feasibility"
-        cls.bridge_path = cls.root / "h1_interface/bridge.pt"
-        cls.predictor_path = cls.root / "h2_prediction/predictor.pt"
+        cls.root = REPO_ROOT / "research/checkpoints"
+        cls.bridge_path = cls.root / "h1-interface/bridge.pt"
+        cls.predictor_path = cls.root / "h2-prediction/predictor.pt"
         if not cls.bridge_path.is_file() or not cls.predictor_path.is_file():
             raise unittest.SkipTest("canonical H1/H2 artifacts are not installed")
         cls.before = cls._artifact_hashes()
@@ -209,7 +210,7 @@ class CanonicalCheckpointCompatibilityTest(unittest.TestCase):
                 expected_training_lineage=details["lineage"],
             )
         self.assertEqual(state_dict_sha256(model.state_dict()), loaded["state_dict_sha256"])
-        self.assertEqual(metadata["file_sha256"], self.before["h1_interface/bridge.pt"])
+        self.assertEqual(metadata["file_sha256"], self.before["h1-interface/bridge.pt"])
         self.assertTrue(all(Path(path).parent == Path("research/src")
                             for path in provenance["sources"]["files"]))
         for key in ("dataset_sha256", "config_protocol_sha256", "source_sha256",

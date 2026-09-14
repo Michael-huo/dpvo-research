@@ -1,4 +1,4 @@
-"""Small artifact and trajectory helpers for Phase 1 feasibility."""
+"""Small artifact and trajectory helpers for experiment modules."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ def load_yaml(path: str | Path, *, schema_version: int = 1) -> tuple[dict[str, A
     resolved = Path(path).resolve()
     payload = yaml.safe_load(resolved.read_text(encoding="utf-8"))
     if not isinstance(payload, dict) or payload.get("schema_version") != schema_version:
-        raise ValueError(f"invalid Phase 1 config schema: {resolved}")
+        raise ValueError(f"invalid experiment config schema: {resolved}")
     return payload, resolved
 
 

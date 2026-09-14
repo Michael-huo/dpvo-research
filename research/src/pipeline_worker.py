@@ -18,8 +18,11 @@ def emit(value):
     print(json.dumps(value, allow_nan=False), flush=True)
 
 
-def run(config, component):
-    encoded_profile = os.environ.get("PHASE1_CPU_PROFILE")
+def run(config, component, logical_device):
+    from .cuda_devices import select_worker_device
+    select_worker_device(logical_device)
+    config = dict(config, worker_device=logical_device)
+    encoded_profile = os.environ.get("RESEARCH_CPU_PROFILE")
     if encoded_profile:
         apply_cpu_profile(json.loads(encoded_profile))
     settings = config["worker_settings"]
@@ -123,10 +126,11 @@ def run(config, component):
 def main():
     parser = argparse.ArgumentParser(); parser.add_argument("--config", required=True)
     parser.add_argument("--component", choices=["encoder", "predictor"], required=True)
+    parser.add_argument("--logical-device", type=int, required=True)
     args = parser.parse_args()
     try:
         with open(args.config) as source: config = json.load(source)
-        run(config, args.component)
+        run(config, args.component, args.logical_device)
     except BaseException as error:
         import traceback
         emit({"status": "error", "error": str(error), "traceback": traceback.format_exc()})

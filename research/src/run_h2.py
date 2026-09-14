@@ -59,6 +59,9 @@ from .registry import (
     sequence_entry, validate_module_manifest, write_registry_and_summary,
     write_sequence_metadata,
 )
+from .artifact_runtime import staged_directory
+from .registry import CHECKPOINT_ROOTS
+from .cuda_devices import CudaDevicePool
 from .execution_runtime import (
     FormalExecution, cpu_numa_layout,
     execution_provenance, initialize_formal_main_process,
@@ -72,7 +75,7 @@ from .training_runtime import (
     ResidentH2View, resident_correspondence, tensor_footprint,
 )
 
-DEFAULT_CONFIG = REPO_ROOT / "research/configs/phase1_feasibility_h2.yaml"
+DEFAULT_CONFIG = REPO_ROOT / "research/configs/h2_prediction.yaml"
 TRAINING_SEQUENCE = "MH_01_easy"
 TRAINING_ANCHOR_RATIO = 0.2
 CONDITIONS = (
@@ -661,10 +664,11 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
     config, config_path = load_config()
     requested = resolve_sequences(sequences, config["experiment"]["default_sequences"])
     formal_runtime = initialize_formal_main_process(
-        required_logical_devices=(0, 1, 2),
+        require_online=True,
     )
     root = repo_path(config["paths"]["output_root"])
     root.parent.mkdir(parents=True, exist_ok=True)
+    checkpoint_root = CHECKPOINT_ROOTS["h2_prediction"]
     calibration = np.loadtxt(repo_path(config["paths"]["calibration"]), delimiter=" ")
     training_source_files = tuple(Path(__file__).with_name(name) for name in (
         "run_h2.py", "h2_training.py", "predictor.py",
@@ -689,11 +693,11 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         h1_bridge_sha256=bridge_meta["file_sha256"],
     )
 
-    with tempfile.TemporaryDirectory(prefix=".phase1_h2_", dir=root.parent) as name:
+    with tempfile.TemporaryDirectory(prefix=".research_h2_", dir=root.parent) as name, staged_directory(checkpoint_root) as staged_checkpoints:
         temporary = Path(name)
         staged_root = temporary / "h2_prediction"
         (staged_root / "sequences").mkdir(parents=True)
-        checkpoint_path = staged_root / "predictor.pt"
+        checkpoint_path = staged_checkpoints / "predictor.pt"
         index = empty_index("h2_prediction", requested)
         layout = cpu_numa_layout(formal_runtime["hardware"])
         schedule_stage_c = fixed_cpu_profile(layout)["stage_c"]
@@ -724,7 +728,6 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                 dev_store, dev_extraction = extract_parallel(
                     training_records, _unique_identities(development), calibration,
                     config, training_temp, training["transform"],
-                    devices=(0, 1, 2),
                 )
             with training_performance.phase("train_only_threshold_calibration"):
                 mask = torch.from_numpy(
@@ -737,16 +740,16 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             with training_performance.phase("development_correspondence_precompute"):
                 robust_dev, robust_dev_meta = correspondence_parallel(
                     development, dev_store, training["transform"], mask, thresholds,
-                    training_temp / "correspondence", devices=(0, 1, 2),
+                    training_temp / "correspondence",
                 )
             with training_performance.phase("resident_initialization"):
                 resident_dev = None
                 try:
                     resident_dev = ResidentH2View(
-                        dev_store, development, device=torch.device("cuda:1"),
+                        dev_store, development, device=torch.device(CudaDevicePool.discover().primary_device),
                     )
                     resident_robust = resident_correspondence(
-                        robust_dev, torch.device("cuda:1"),
+                        robust_dev, torch.device(CudaDevicePool.discover().primary_device),
                     )
                 except torch.cuda.OutOfMemoryError as error:
                     if resident_dev is not None:
@@ -762,10 +765,10 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                                 ],
                             }
                         setattr(
-                            error, "phase1_feature_resident_cleanup", owner_cleanup,
+                            error, "research_feature_resident_cleanup", owner_cleanup,
                         )
                     raise
-                torch.cuda.synchronize(torch.device("cuda:1"))
+                torch.cuda.synchronize(torch.device(CudaDevicePool.discover().primary_device))
                 correspondence_footprint = tensor_footprint({
                     f"interval_{interval_index}.{field}": getattr(row, field)
                     for interval_index, row in resident_robust.rows.items()
@@ -795,10 +798,10 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             ]
             try:
                 residency["allocated_after_bytes"] = int(
-                    torch.cuda.memory_allocated(torch.device("cuda:1"))
+                    torch.cuda.memory_allocated(torch.device(CudaDevicePool.discover().primary_device))
                 )
                 residency["reserved_after_bytes"] = int(
-                    torch.cuda.memory_reserved(torch.device("cuda:1"))
+                    torch.cuda.memory_reserved(torch.device(CudaDevicePool.discover().primary_device))
                 )
                 residency["memory_telemetry_error"] = None
             except Exception as error:
@@ -968,7 +971,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         cleanup_before_trajectories = release_cuda_training_state()
         require_lifecycle_cleanup(cleanup_before_trajectories)
         selected_profile = {
-            "schema": "phase1_h2_fixed_cpu_profile_v1",
+            "schema": "research_h2_fixed_cpu_profile_v1",
             "selection": "fixed_same_as_h0_h1",
             "dynamic_calibration": False,
             "components": fixed_cpu_profile(layout),
@@ -1000,7 +1003,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
                  "predictor_checkpoint": str(checkpoint_path),
                  "predictor_state_hash": predictor_state_sha256(predictor_state),
                  "pipeline_cpu_profile": selected_profile,
-                 "execution": dataclasses.asdict(FormalExecution())},
+                 "execution": dataclasses.asdict(FormalExecution.from_pool())},
             ))
         with PersistentPerformanceAudit(
             "h2_prediction", "sequential_trajectory_evaluation",
@@ -1080,9 +1083,8 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             ]
             add_cuda_worker_mapping(performance_payload, {
                 "worker_pid": worker_usage.get("jepa_worker_pid"),
-                "physical_device": 2,
                 "logical_cuda_ordinal": worker_usage.get(
-                    "jepa_worker_logical_cuda_ordinal", 0,
+                    "jepa_worker_logical_cuda_ordinal", int(FormalExecution.from_pool().encoder_device),
                 ),
             })
             performance_payload["strict_h2_predictor"] = result["efficiency"][
@@ -1107,10 +1109,13 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             )
 
         index["canonical_checkpoint"] = {
-            "file": "predictor.pt", "file_sha256": sha256_file(checkpoint_path),
+            "file": str((checkpoint_root / "predictor.pt").relative_to(REPO_ROOT)),
+            "path_base": "repository_root", "seed": config["experiment"]["seed"],
+            "best_epoch": training_summary["best_epoch"], "file_sha256": sha256_file(checkpoint_path),
             "state_dict_sha256": predictor_state_sha256(predictor_state),
             "training_lineage_sha256": checkpoint["training_lineage"]["training_lineage_sha256"],
             "h1_bridge_sha256": bridge_meta["file_sha256"],
+            "scientific_lineage": checkpoint["training_lineage"],
             "training": training_record,
         }
         predicted_seconds = sum(
@@ -1150,7 +1155,7 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
         )
         total_makespan = time.perf_counter() - command_started
         index["execution"] = {
-            "schema": "phase1_formal_execution_summary_v1",
+            "schema": "research_formal_execution_summary_v1",
             "hardware": formal_runtime,
             "provenance": execution_provenance(),
             "parallel_preparation": dev_extraction,
@@ -1171,11 +1176,12 @@ def run(sequences: Sequence[str]) -> dict[str, Any]:
             "domain": "research_and_online_deployment_reported_separately",
         }
         write_registry_and_summary(staged_root, "h2_prediction", index)
-        validate_module_manifest(staged_root, "h2_prediction", index)
+        validate_module_manifest(staged_root, "h2_prediction", index, checkpoint_root=staged_checkpoints)
         if sha256_file(repo_path(config["paths"]["h1_bridge"])) != bridge_meta["file_sha256"]:
             raise RuntimeError("canonical H1 bridge changed during H2 run; run run_h2 again")
-        publish_current_canonical(staged_root, root)
         torch.cuda.empty_cache()
+        publish_current_canonical(staged_root, root, checkpoint_staged=staged_checkpoints,
+                                  checkpoint_destination=checkpoint_root)
     return {
         "status": "complete",
         "module": "h2_prediction",
@@ -1206,7 +1212,7 @@ def main() -> int:
     args = parser().parse_args()
     config, _ = load_config()
     requested = resolve_sequences(args.sequences, config["experiment"]["default_sequences"])
-    print("Phase 1: H2 Prediction — Sparse-Anchor Prediction Feasibility")
+    print("H2 Prediction — Sparse-Anchor Prediction Feasibility")
     print("Input mode: native_anchor_rgb_plus_predicted_hidden_jepa_bridge")
     print("Deployment: delayed/bracketed; timestamp_causal=false; closing A5 must be online")
     print(json.dumps(run(requested), indent=2, sort_keys=True))

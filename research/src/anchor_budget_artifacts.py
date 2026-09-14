@@ -11,14 +11,17 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 
 import numpy as np
 
 from .protocol import REPO_ROOT, atomic_write_json, canonical_sha256, sha256_file
+from .artifact_runtime import (
+    staged_directory, publish_current_canonical, validate_lightweight_results,
+    without_worker_log_paths,
+)
 
-CHECKPOINT_ROOT = REPO_ROOT / "research/checkpoints/phase2-anchor-budget"
+CHECKPOINT_ROOT = REPO_ROOT / "research/checkpoints/anchor-budget"
 FORMAL_FILES = {"SUMMARY.md", "results.json", "trajectories.npz",
                 "figures/trajectories.png", "figures/tradeoffs.png"}
 
@@ -91,13 +94,13 @@ def _compact_condition(row, population_ref):
                                 if key not in {"timeline", "waits", "jepa_worker_pid", "worker_provenance",
                                                "lifecycle_cleanup", "workers"}}
     result["execution"] = {key: copy.deepcopy(row["sequential_execution"][key]) for key in (
-        "kind", "condition", "physical_device", "required_physical_devices", "elapsed_seconds")
+        "kind", "condition", "logical_device", "required_logical_devices", "elapsed_seconds")
         if key in row["sequential_execution"]}
     if "h2_stage_profile" in result:
         result["h2_stage_profile"].pop("stage_c_runtime", None)
         # Already retained verbatim in h2_stage_profile, not two copies.
         result["runtime"].pop("stage_c_timing", None)
-    return result
+    return without_worker_log_paths(result)
 
 
 def _compact_training(training):
@@ -108,7 +111,6 @@ def _compact_training(training):
     result["total_wall_seconds"] = result["training_and_diagnostics_wall_seconds"]
     result["predictor_wall_seconds"] = result["summary"]["elapsed_seconds"]
     result["total_wall_definition"] = "original_training_and_diagnostics_wall_seconds_includes_preparation"
-    result["development_extraction"].pop("workers", None)
     # Batch-level extraction timing is debugging detail, not a training target/result.
     samples = result["test_extraction"].pop("encoder_inference_ms", [])
     result["test_extraction"]["encoder_inference_summary"] = {
@@ -152,20 +154,18 @@ def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
     if index["status"] != "complete":
         raise RuntimeError("only a completed experiment can be consolidated")
     strides, sequence = index["anchor_strides"], index["sequence"]
-    if sequence != "MH_01_easy" or not strides or not set(strides) <= {3,5,10}:
+    if sequence != "MH_01_easy" or not strides or len(set(strides)) != len(strides) or any(isinstance(s, bool) or not isinstance(s, int) or s < 2 for s in strides):
         raise ValueError("unsupported completed pilot")
     result = {"schema_version": 2, "metadata": {
         "status": "complete", "sequence": sequence, "anchor_strides": strides,
+        "run_policy": "fresh_current_canonical_replace",
         "scientific_question": "How do Sparse RGB and Ours change as anchor upload budget and prediction horizon change?",
         "fresh_predictor_per_stride": True,
         "fixed_split": index["preparation"]["fixed_split"],
         "protocol": index["protocol"], "trajectory_comparison": index["trajectory_comparison"],
         "config_path": os.path.relpath(index["config"], REPO_ROOT), "config_sha256": index["config_sha256"],
-        "original_run_repository": index.get("repository", {"git_commit": None,
-            "status": "not_recorded_by_original_runner; training_source_hashes_are_preserved_in_checkpoint_lineage"}),
-        "artifact_publication_repository": repository_provenance(),
-        "original_execution": index["execution"],
-        "canonical_artifact_guards": index.get("canonical_artifacts_after", index["preparation"]["canonical_artifacts"]),
+        "repository": index["repository"],
+        "execution": without_worker_log_paths(index["execution"]),
         "stride5_equivalence": index["preparation"]["stride5_equivalence"],
         "evaluation_populations": {}, "trajectories": {},
         "plotting": {"projection": "xy", "alignment": "apply_saved_sim3_no_refit",
@@ -180,12 +180,12 @@ def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
     if sha256_file(gt_path) != gt_ref["sha256"]:
         raise RuntimeError("groundtruth reference changed")
     gt = np.loadtxt(gt_path)
-    # Identical to the Phase 1 evaluation reader, including float64 timestamp rounding.
+    # Identical to the feasibility evaluation reader, including float64 timestamp rounding.
     gt_ts = np.rint(gt[:, 0]).astype(np.int64)
     gt_poses = np.concatenate((gt[:, 1:4], gt[:, [5,6,7,4]]), axis=1)
     metadata["groundtruth"] = {"source_path": os.path.relpath(gt_path, REPO_ROOT),
                                "source_sha256": gt_ref["sha256"], "role": "reference_not_slam_run",
-                               "timestamp_semantics": "phase1_np_loadtxt_float64_rint_int64",
+                               "timestamp_semantics": "research_np_loadtxt_float64_rint_int64",
                                "scope": "entire_original_gt_reference_included"}
     metadata["trajectories"]["GT"] = add_trajectory(bundle, "GT", gt_ts, gt_poses)
     proof["trajectories"]["GT"] = {"timestamps_ns": gt_ts, "poses": gt_poses}
@@ -239,8 +239,9 @@ def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
                "horizon": {"by_relative_index": training["horizon_resolved_quality"], "queries": columnar(query_rows)},
                "comparison": old["comparison"],
                "provenance": {"checkpoint": checkpoint, "H1_bridge_sha256": training["lineage"]["h1_bridge_sha256"],
-                              "canonical_H2_config_sha256": training["lineage"]["canonical_h2_config_sha256"],
+                              "scientific_config": training["lineage"]["scientific_config"],
                               "training_cleanup": old["training_cleanup"]}}
+        row = without_worker_log_paths(row)
         result["strides"][str(stride)] = row
         for name, condition, old_row in (("sparse", "sparse_rgb", sparse), ("ours", "predicted_jepa", ours)):
             trajectory(f"stride_{stride}_{name}", folder / condition, old_row)
@@ -262,26 +263,15 @@ def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
                                ("PREPARATION.json", index["preparation"])):
         if filename in original and read(filename) != expected:
             raise RuntimeError(f"duplicate scientific artifact disagrees: {filename}")
-    if "IMPLEMENTATION_CHECKS.json" in original:
-        metadata["prior_implementation_checks"] = read("IMPLEMENTATION_CHECKS.json")
     derived = {"SUMMARY.md", "accuracy_vs_communication.csv", "prediction_quality_vs_horizon.csv"}
     unknown = set(original) - used - derived
     if unknown:
         raise RuntimeError(f"unmapped files must be audited before cleanup: {sorted(unknown)}")
-    metadata["migration"] = {
-        "original_file_count": len(original), "original_total_bytes": sum(r["bytes"] for r in original.values()),
-        "original_checkpoint_bytes": sum(p.stat().st_size for p,_,_ in checkpoints),
-        "original_artifacts": original,
-        "discarded_debug_fields": ["provider_usage.timeline", "provider_usage.waits", "worker PIDs/runtime telemetry",
-                                    "per-batch test extraction inference samples (aggregate/hash retained)"],
-        "preservation": {"trajectory_arrays_exact": True, "schedule_identities_intervals_exact": True,
-                         "scientific_values_exact": True, "checkpoint_bytes_and_lineage_exact": True,
-                         "no_slam_training_alignment_fit_or_evaluation_run": True}}
     proof["inventory"] = original
     return result, bundle, checkpoints, proof
 
 
-def validate_compact(root, *, check_checkpoints=True, proof=None, allow_legacy_models=False):
+def validate_compact(root, *, check_checkpoints=True, proof=None, checkpoint_root=None):
     root = Path(root)
     result = json.loads((root / "results.json").read_text())
     if result["schema_version"] != 2 or result["metadata"]["status"] != "complete":
@@ -313,30 +303,24 @@ def validate_compact(root, *, check_checkpoints=True, proof=None, allow_legacy_m
         from .anchor_budget_training import validate_stride_lineage
         for stride, row in result["strides"].items():
             expected = row["provenance"]["checkpoint"]
-            path = REPO_ROOT / expected["relative_path"]
+            path = (Path(checkpoint_root) / Path(expected["relative_path"]).name
+                    if checkpoint_root is not None else REPO_ROOT / expected["relative_path"])
             if path.resolve().is_relative_to(root.resolve()) or sha256_file(path) != expected["sha256"]:
                 raise RuntimeError("checkpoint location/hash mismatch")
             checkpoint = torch.load(path, map_location="cpu", weights_only=False)
             validate_stride_lineage(checkpoint["training_lineage"], expected["scientific_lineage"], int(stride))
-    if not allow_legacy_models and any(p.suffix in {".pt", ".pth"} for p in root.rglob("*")):
-        raise RuntimeError("models must not be in compact results")
+    validate_lightweight_results(root)
     return result
 
 
 def publish_compact(source, destination, checkpoint_root=CHECKPOINT_ROOT):
-    """Validate all replacements before removing the audited old artifacts."""
+    """Aggregate fresh staging only, then replace both canonical directories."""
     from .anchor_budget_figures import render_figures, write_summary
-    source, destination = Path(source), Path(destination)
-    if (source / ".execute.lock").exists():
-        raise RuntimeError("cannot consolidate an active experiment")
-    if (destination / "results.json").exists():
-        return validate_compact(destination)
+    source, destination, checkpoint_root = Path(source), Path(destination), Path(checkpoint_root)
+    if source.resolve() == destination.resolve():
+        raise ValueError("fresh staging must be separate from canonical results")
     result, arrays, checkpoints, proof = build_compact(source, checkpoint_root)
-    for _, target, expected in checkpoints:
-        if target.exists() and sha256_file(target) != expected:
-            raise FileExistsError(f"refusing to replace different checkpoint: {target}")
-    with tempfile.TemporaryDirectory(prefix="anchor_budget_publish_", dir="/tmp") as name:
-        staged = Path(name)
+    with staged_directory(destination) as staged, staged_directory(checkpoint_root) as staged_checkpoints:
         np.savez_compressed(staged / "trajectories.npz", **arrays)
         result["metadata"]["trajectories_npz_sha256"] = sha256_file(staged / "trajectories.npz")
         atomic_write_json(staged / "results.json", result)
@@ -345,39 +329,16 @@ def publish_compact(source, destination, checkpoint_root=CHECKPOINT_ROOT):
         write_summary(staged)
         if set(inventory(staged)) != FORMAL_FILES:
             raise RuntimeError("unexpected staging outputs")
-        # Copy bytes, never reserialize checkpoints. Old files remain until verified publication.
         for origin, target, expected in checkpoints:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            if not target.exists():
-                shutil.copy2(origin, target)
-            if sha256_file(target) != expected:
-                raise RuntimeError("checkpoint relocation changed bytes")
-        validate_compact(staged, proof=proof)
+            staged_path = staged_checkpoints / target.name
+            shutil.copy2(origin, staged_path)
+            if sha256_file(staged_path) != expected:
+                raise RuntimeError("checkpoint staging changed bytes")
+        validate_compact(staged, proof=proof, checkpoint_root=staged_checkpoints)
+        if {p.name for p in staged_checkpoints.iterdir()} != {p.name for _, p, _ in checkpoints}:
+            raise RuntimeError("checkpoint request set mismatch")
         if inventory(source) != proof["inventory"]:
-            raise RuntimeError("source artifacts changed during aggregation; cleanup cancelled")
-        destination.mkdir(parents=True, exist_ok=True)
-        if source.resolve() != destination.resolve() and inventory(destination):
-            raise FileExistsError("refusing to overwrite a nonempty result directory")
-        # Keep a temporary recovery copy when replacing an existing formal tree.
-        if source.resolve() == destination.resolve():
-            backup = Path(tempfile.mkdtemp(prefix="anchor_budget_before_publish_", dir="/tmp"))
-            shutil.copytree(source, backup / "artifacts")
-        for relative in sorted(FORMAL_FILES):
-            target = destination / relative
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(staged / relative, target)
-        # Validate the destination, not only the temporary copies, before deletion.
-        for relative in FORMAL_FILES:
-            if sha256_file(destination / relative) != sha256_file(staged / relative):
-                raise RuntimeError("publication copy mismatch; old files retained")
-        validate_compact(destination, proof=proof, allow_legacy_models=True)
-        for relative in proof["inventory"] if source.resolve() == destination.resolve() else ():
-            if relative not in FORMAL_FILES:
-                (destination / relative).unlink()
-        for path in sorted(destination.rglob("*"), key=lambda p: len(p.parts), reverse=True):
-            if path.is_dir() and not any(path.iterdir()):
-                path.rmdir()
-        validate_compact(destination, proof=proof)
-        if set(inventory(destination)) != FORMAL_FILES:
-            raise RuntimeError("formal output contains unexpected files")
+            raise RuntimeError("fresh source changed during aggregation")
+        publish_current_canonical(staged, destination, checkpoint_staged=staged_checkpoints,
+                                  checkpoint_destination=checkpoint_root)
     return result
