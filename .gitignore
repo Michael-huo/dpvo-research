@@ -146,14 +146,14 @@ dist
 *.vscode/
 *.pth
 tests
-!research/src/phase1_dpvo_feasibility/exp4/tests/
-!research/src/phase1_dpvo_feasibility/exp4/tests/__init__.py
-!research/src/phase1_dpvo_feasibility/exp4/tests/test_*.py
-!research/src/phase1_dpvo_feasibility/exp4/adapter/tests/
-!research/src/phase1_dpvo_feasibility/exp4/adapter/tests/__init__.py
-!research/src/phase1_dpvo_feasibility/exp4/adapter/tests/test_*.py
-checkpoints
-runs
+!/tests/
+/checkpoints/**/*.pt
+/checkpoints/**/*.pth
+/checkpoints/dpvo/auxiliary/
+/checkpoints/predictor/stride_sweep_training/
+/checkpoints/bridge/training.json
+/research/runs/*
+!/research/runs/.gitkeep
 cache
 *.out
 *.o
@@ -176,8 +176,14 @@ thirdparty/*
 # Research datasets
 research/assets/
 
+# Machine-local dataset paths
+/configs/paths.local.yaml
+
 # Experiment outputs
-research/results/
+/research/results/*
+!/research/results/inference/
+/research/results/inference/*
+!/research/results/inference/.gitkeep
 
 # External runtime assets
 ORBvoc.txt
