@@ -106,6 +106,16 @@ def execute_sequence(records, budgets, protocol, canonical, root, temporary, ind
         ours_row = _run_job(task, temporary / f"predicted_{stride}", runtime, profile)
         ours = save_trajectory(output / "predicted_jepa", ours_row, budget["records"],
                                 budget["roles"], config, dense=True)
+        from .scientific_lineage import deployment_lineage
+        ours["deployment_lineage"] = deployment_lineage(
+            config, predictor_sha256=task["predictor_state_hash"],
+            training_lineage_sha256=trained["record"]["lineage"]["training_lineage_sha256"],
+            bridge_sha256=trained["record"]["h1_bridge"]["file_sha256"],
+            dpvo_sha256=sha256_file(repo_path(config["paths"]["dpvo_checkpoint"])),
+            dpvo_config_sha256=sha256_file(repo_path(config["paths"]["dpvo_config"])),
+            schedule_sha256=budget["source_schedule"]["schedule_sha256"],
+        )
+        atomic_write_json(output / "predicted_jepa/results.json", ours)
         del ours_row, task
         comparison = comparison_row(population, sparse, ours, trained["record"])
         atomic_write_json(output / "results.json", {

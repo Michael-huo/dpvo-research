@@ -68,9 +68,22 @@ def _launch(task,path,device):
             command=["taskset","--cpu-list",cpus,*command]
         else:
             raise RuntimeError("NUMA/CPU binding requires numactl or taskset")
-    with (path/"worker.log").open("w") as log:
-        subprocess.run(command,cwd=REPO_ROOT,env=env,stdout=log,
-                       stderr=subprocess.STDOUT,check=True)
+    log_path = path / "worker.log"
+    try:
+        with log_path.open("w") as log:
+            subprocess.run(command,cwd=REPO_ROOT,env=env,stdout=log,
+                           stderr=subprocess.STDOUT,check=True)
+    except subprocess.CalledProcessError as error:
+        # Staging is cleaned on failure. Carry the traceback into the parent
+        # exception before that cleanup removes the only worker log.
+        with log_path.open("rb") as log:
+            log.seek(0, os.SEEK_END)
+            log.seek(max(0, log.tell() - 65536))
+            tail = log.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"{task.get('kind', 'trajectory')} worker exited with code {error.returncode} "
+            f"on logical CUDA device {device}.\nWorker log tail:\n{tail}"
+        ) from error
     return path
 
 
@@ -107,7 +120,7 @@ def run_sequential_trajectory_jobs(tasks, temporary, *, cpu_profile=None, hardwa
         path = temporary / f"job_{ordinal:03d}"
         path.mkdir()
         value = dict(task) | {
-            "settings": task.get("settings", capture_runtime()),
+            "settings": task.get("settings", capture_runtime(int(task["config"]["experiment"]["seed"]))),
             "logical_device": primary,
             "submitted_ns": time.monotonic_ns(),
             "cpu_profile": cpu_profile,
@@ -546,6 +559,9 @@ def worker(task_path):
             task["settings"], component="h2_stage_c_native_frontend_bridge_dpvo",
             model=bridge,
         )
+        runtime["observation_sampling_provenance"]["worker_seeds"]["stage_c"] = worker_runtime["settings"]["seed"]
+        if worker_runtime["settings"]["seed"] != task["config"]["experiment"]["seed"]:
+            raise RuntimeError("Stage C scientific seed mismatch")
         bridge.cpu(); predictor.cpu()
         cleanup = release_cuda_training_state()
         torch.save({

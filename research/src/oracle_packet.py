@@ -28,11 +28,6 @@ class NativeFeaturePacket:
     colors: Any
 
 
-@dataclass(frozen=True)
-class OracleFMap:
-    fmap: Any
-
-
 def normalize_rgb(image: Any) -> Any:
     """Apply exactly the normalization used by DPVO.__call__."""
     return 2.0 * (image[None, None] / 255.0) - 0.5
@@ -51,15 +46,6 @@ def extract_native_packet(slam: Any, image: Any) -> NativeFeaturePacket:
         fmap=fmap.detach(), gmap=gmap.detach(), imap=imap.detach(),
         patches=patches.detach(), colors=colors.detach(),
     )
-
-
-def extract_oracle_fmap(slam: Any, image: Any) -> OracleFMap:
-    import torch
-
-    normalized = normalize_rgb(image)
-    with torch.no_grad(), torch.cuda.amp.autocast(enabled=bool(slam.cfg.MIXED_PRECISION)):
-        fmap = slam.network.patchify.fnet(normalized) / 4.0
-    return OracleFMap(fmap=fmap.detach())
 
 
 PACKET_NAME = "FullOracleHiddenFrontendPacket"

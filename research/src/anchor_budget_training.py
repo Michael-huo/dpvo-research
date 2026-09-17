@@ -17,10 +17,9 @@ from .jepa_runtime import (RestrictedFeatureView, extract_block5_store,
                            extract_true_fmap_store, sequence_geometry)
 from .parallel_runtime import correspondence_parallel, extract_parallel
 from .protocol import atomic_write_json, canonical_sha256, repo_path, sha256_file
-from .run_h2 import (_hidden_identities, _load_bridge, _save_predictor,
-                     _unique_identities, _validate_fresh_predictor)
-from .scientific_lineage import scientific_fingerprint
-from .registry import config_protocol_fingerprint
+from .run_h2 import _load_bridge, _unique_identities
+from .h2_training import _hidden_identities
+from .predictor_checkpoint import build_training_lineage, load_predictor, save_predictor
 from .training_runtime import ResidentH2View, resident_correspondence
 from .transport import robust_protocol_metadata
 
@@ -29,32 +28,17 @@ def training_lineage(budget, protocol, geometry, config):
     train = budget["split"]["train"]
     anchors = {i.key: i for row in train for i in (row.anchor0, row.anchor1)}
     population = [i.public_dict() for i in sorted(anchors.values(), key=lambda i: i.candidate_index)]
-    return {
-        "protocol": "anchor_budget_fresh_predictor_v1",
-        "anchor_stride": budget["anchor_stride"],
-        "actual_train_anchor_population": population,
-        "actual_train_anchor_count": len(population),
-        "actual_train_anchor_population_sha256": canonical_sha256(population),
-        "fixed_split_definition": protocol["fixed_split"],
-        "split_sha256": budget["split_payload"]["split_sha256"],
-        "training_schedule_sha256": budget["source_schedule"]["schedule_sha256"],
-        "canonical_h2_scientific_settings": scientific_fingerprint("h2"),
-        "scientific_config": config_protocol_fingerprint(config),
-        "h1_bridge_sha256": sha256_file(repo_path(config["paths"]["h1_bridge"])),
-        "dpvo_checkpoint_sha256": sha256_file(repo_path(config["paths"]["dpvo_checkpoint"])),
-        "dpvo_config_sha256": sha256_file(repo_path(config["paths"]["dpvo_config"])),
-        "vjepa_checkpoint_sha256": config["jepa"]["checkpoint_sha256"],
-        "coordinate_transform_sha256": geometry["transform_sha256"],
-        "transport_calibration_protocol_sha256": canonical_sha256(robust_protocol_metadata()),
-        "seed": config["experiment"]["seed"],
-        "training_recipe": config["training"],
-        "initialization": "fresh_new_predictor_no_checkpoint_resume",
-    }
+    return build_training_lineage(
+        config=config, anchor_stride=budget["anchor_stride"], anchor_population=population,
+        fixed_split=protocol["fixed_split"], split_sha256=budget["split_payload"]["split_sha256"],
+        schedule_sha256=budget["source_schedule"]["schedule_sha256"],
+        coordinate_transform_sha256=geometry["transform_sha256"],
+    )
 
 
 def validate_stride_lineage(stored, expected, stride):
-    if stored.get("protocol") != "anchor_budget_fresh_predictor_v1":
-        raise RuntimeError("Anchor Budget predictor lineage required; generic/zero-shot checkpoint rejected")
+    if not stored.get("scientific_training_contract"):
+        raise RuntimeError("predictor scientific training lineage required")
     if stored.get("anchor_stride") != stride:
         raise RuntimeError("predictor anchor_stride mismatch")
     if dict(stored) != dict(expected):
@@ -65,7 +49,7 @@ def validate_stride_lineage(stored, expected, stride):
 
 
 def load_budget_predictor(path, config, expected, stride):
-    checkpoint = _validate_fresh_predictor(path, config, expected)
+    checkpoint = load_predictor(path, config, expected)
     validate_stride_lineage(checkpoint["training_lineage"], expected, stride)
     return checkpoint
 
@@ -122,7 +106,8 @@ def fresh_train_budget(records, budget, protocol, config, output, temporary):
         lineage["train_only_calibration_sha256"] = thresholds["calibration_sha256"]
         lineage["training_lineage_sha256"] = canonical_sha256(lineage)
         checkpoint_path = output / "predictor.pt"
-        _save_predictor(checkpoint_path, predictor, config, thresholds, lineage)
+        save_predictor(checkpoint_path, predictor, config, thresholds, lineage,
+                       best_epoch=summary["best_epoch"])
         checkpoint = load_budget_predictor(checkpoint_path, config, lineage, budget["anchor_stride"])
         dev.close()
         # Test features and true FMaps are created only after checkpoint freeze.
@@ -155,7 +140,8 @@ def fresh_train_budget(records, budget, protocol, config, output, temporary):
                   "test_extraction": test_meta, "test_correspondence": test_robust_meta,
                   "test_teacher_extraction": teacher_meta, "test_teacher_usage": teacher.usage_payload(),
                   "test_was_read_during_training_or_selection": False,
-                  "h1_bridge": bridge_meta, "training_and_diagnostics_wall_seconds": time.perf_counter()-started}
+                  "h1_bridge": bridge_meta, "scientific_training_contract": lineage["scientific_training_contract"],
+                  "training_and_diagnostics_wall_seconds": time.perf_counter()-started}
         bridge_state = {name: value.detach().cpu().clone() for name, value in bridge.state_dict().items()}
         atomic_write_json(output / "horizon_queries.json", horizon)
     finally:

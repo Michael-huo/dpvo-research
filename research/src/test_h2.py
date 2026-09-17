@@ -243,7 +243,7 @@ class H2ContractTest(unittest.TestCase):
         self.assertTrue(metadata["predicted_jepa_hidden"]["closing_anchor_online_available"])
         self.assertEqual(
             metadata["predicted_jepa_hidden"]["input_source"],
-            "native_anchor_rgb_plus_predicted_hidden_jepa_bridge",
+            "native_anchor_rgb_plus_uniform_budgeted_predicted_hidden_jepa_bridge",
         )
         self.assertEqual(TRAINING_ANCHOR_RATIO, 0.2)
         config, _ = load_config()
@@ -547,16 +547,17 @@ class H2ContractTest(unittest.TestCase):
     def test_true_fmap_is_diagnostic_only_and_deployment_isolated(self) -> None:
         from . import run_h2
         from . import h2_training
-        source = inspect.getsource(run_h2.run)
-        selected = source.index("predictor, training_summary = train_predictor")
-        saved = source.index("checkpoint = _save_predictor")
-        validated = source.index("_validate_fresh_predictor")
-        held_out_teacher = source.index("test_teacher_store, test_teacher_extraction")
+        from .anchor_budget_training import fresh_train_budget
+        source = inspect.getsource(fresh_train_budget)
+        selected = source.index("predictor, summary = train_predictor")
+        saved = source.index("save_predictor(checkpoint_path")
+        validated = source.index("checkpoint = load_budget_predictor")
+        held_out_teacher = source.index("teacher_store, teacher_meta")
         self.assertLess(selected, saved)
         self.assertLess(saved, validated)
         self.assertLess(validated, held_out_teacher)
         self.assertIn('"test_was_read_during_training_or_selection": False', source)
-        self.assertIn('"stores_closed_before_deployment": stores_closed', source)
+        self.assertIn('"stores_closed_before_deployment"', source)
         self.assertNotIn("extract_true_fmap_store", source[:held_out_teacher])
         provider_attributes = set(vars(self._provider()))
         self.assertFalse(any("teacher" in name for name in provider_attributes))
@@ -590,7 +591,8 @@ class H2ContractTest(unittest.TestCase):
 
     def test_checkpoint_recipe_and_h1_bridge_lineage_remain_canonical(self) -> None:
         from . import run_h2
-        save_source = inspect.getsource(run_h2._save_predictor)
+        from .predictor_checkpoint import save_predictor
+        save_source = inspect.getsource(save_predictor)
         run_source = inspect.getsource(run_h2.run)
         self.assertIn('"target": "offline_oracle_hidden_jepa_block5"', save_source)
         self.assertIn('"h1_bridge_sha256": bridge_meta["file_sha256"]', run_source)
@@ -603,7 +605,8 @@ class H2ContractTest(unittest.TestCase):
 
     def test_formal_h2_uses_residency_parallel_precompute_and_canonical_pipeline(self) -> None:
         from . import run_h2
-        source = inspect.getsource(run_h2.run)
+        from .anchor_budget_training import fresh_train_budget
+        source = inspect.getsource(fresh_train_budget)
         self.assertIn("extract_parallel(", source)
         self.assertIn("correspondence_parallel(", source)
         self.assertIn("ResidentH2View(", source)

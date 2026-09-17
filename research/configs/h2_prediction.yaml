@@ -24,6 +24,7 @@ paths:
   dpvo_checkpoint: research/assets/models/dpvo.pth
   dpvo_config: config/default.yaml
   h1_bridge: research/checkpoints/h1-interface/bridge.pt
+  h2_predictor: research/checkpoints/h2-prediction/predictor.pt
   output_root: research/results/h2-prediction
 runtime:
   jepa_python: /home/hx/miniforge3/envs/vjepa/bin/python
@@ -87,3 +88,18 @@ diagnostics:
   sampled_hidden_frames_per_sequence: 6
   seed: 1234
   artifact: feature_diagnostics.png
+
+admission:
+  type: uniform_budgeted
+  hidden_count: n = stride - 1; complete anchor bracket
+  k_rule: K = n // 2
+  ordinal_rule: 1 + ((2*j + 1)*n // (2*K)), j=0..K-1; one-based
+  order: strictly increasing hidden timestamp_ns
+  zero_budget: empty selection
+  anchors: all submitted to native DPVO
+  generation: all hidden predictor + H1 Bridge + FMap packets
+  gate: after FMap packet construction, before native packet conversion and DPVO insertion
+canonical_predictor:
+  state_dict_sha256: 4d33a2dfdcc0eb6965d5bb9788ac272dd6a969f5d41bd7169111e7bc77f139c8
+  training_lineage_sha256: 2e2285a22f869a2674fe4c81428e2a4150abd82fbfd062b7981dd498426277d4
+  best_epoch: 12

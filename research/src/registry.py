@@ -92,6 +92,7 @@ def _scientific_config(config: Mapping[str, Any]) -> dict[str, Any]:
     paths = payload.get("paths", {})
     paths.pop("output_root", None)
     paths.pop("h1_bridge", None)
+    paths.pop("h2_predictor", None)
     payload.pop("runtime", None)
     return payload
 
@@ -567,14 +568,6 @@ def render_aggregate_summary(root: Path, module: str, index: Mapping[str, Any]) 
             lines.append(
                 "- H2 Predicted JEPA sequences use the same exclusive three-GPU pipeline "
                 f"sequentially; online wall total {_fixed(execution.get('predicted_jepa_total_seconds'), 3)} s."
-            )
-        estimate = execution.get("formal_h2_component_wall_estimate")
-        if isinstance(estimate, Mapping):
-            lines.append(
-                "- H2 component wall estimate: "
-                f"{_fixed(estimate.get('estimated_formal_wall_seconds'), 3)} s "
-                "(parallel preparation + resident training + sequential logical cuda:0 controls/"
-                "three-GPU Predicted JEPA + artifact/evaluation work)."
             )
         lines.append("")
         control_performance = execution.get("trajectory_performance")

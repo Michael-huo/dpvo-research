@@ -279,7 +279,7 @@ class VariableQueryTest(unittest.TestCase):
 
     def test_checkpoint_lineage_rejects_cross_stride_and_legacy(self):
         for stride in (3, 5, 10):
-            lineage = {"protocol": "anchor_budget_fresh_predictor_v1", "anchor_stride": stride,
+            lineage = {"scientific_training_contract": {"seed": 1234}, "anchor_stride": stride,
                        "fixed_split_definition": {"frozen": True}}
             lineage["training_lineage_sha256"] = canonical_sha256(lineage)
             training.validate_stride_lineage(lineage, lineage, stride)
@@ -287,7 +287,7 @@ class VariableQueryTest(unittest.TestCase):
                 training.validate_stride_lineage(lineage, lineage, stride+1)
             with self.assertRaisesRegex(RuntimeError, "lineage mismatch"):
                 training.validate_stride_lineage(lineage, lineage | {"extra": 1}, stride)
-        with self.assertRaisesRegex(RuntimeError, "Anchor Budget predictor lineage"):
+        with self.assertRaisesRegex(RuntimeError, "scientific training lineage"):
             training.validate_stride_lineage({}, {}, 5)
 
     def test_empty_rpe_is_explicit_opt_in_and_ate_remains_available(self):
@@ -362,7 +362,7 @@ class BudgetExecutionTest(unittest.TestCase):
             checkpoint = output / "predictor.pt"
             checkpoint.write_bytes(b"test")
             return {"checkpoint_path": checkpoint, "bridge_state": {}, "transform": None,
-                    "record": {"lineage": {}, "stores_closed_before_deployment": True,
+                    "record": {"lineage": {"training_lineage_sha256": "training"}, "h1_bridge": {"file_sha256": "bridge"}, "stores_closed_before_deployment": True,
                                "horizon_resolved_quality": []}}
         def job(task, *_args):
             events.append((task["kind"], task["config"]["experiment"].get("anchor_stride")))

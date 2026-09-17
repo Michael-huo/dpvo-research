@@ -260,6 +260,22 @@ def population_coverage(
     }
 
 
+def admitted_native_evaluation(arrays, records, roles, groundtruth_path, config):
+    """Secondary metric on the predetermined admitted, GT-supported population."""
+    from .uniform_admission import validate_admission_trajectory
+    expected = validate_admission_trajectory(
+        arrays, records, roles, int(config["experiment"]["post_bootstrap_anchor_interval"]))
+    timestamps, excluded = filter_groundtruth_associable_timestamps(
+        groundtruth_path, expected.tolist(),
+        max_difference_ns=int(config["evaluation"]["groundtruth_max_association_ns"]))
+    population = freeze_evaluation_population(
+        timestamps, horizon_seconds=float(config["evaluation"]["rpe_horizon_seconds"]),
+        tolerance_ns=int(config["evaluation"]["rpe_pair_tolerance_ns"]),
+        allow_empty_rpe=True, source="canonical_admitted_gt_supported_native_timestamps")
+    return {"evaluation": evaluate_paired_trajectory(arrays, population, groundtruth_path),
+            "population": population.to_dict(), "gt_excluded_count": len(excluded)}
+
+
 def dense_hidden_ate(
     arrays: Mapping[str, np.ndarray], dense_timestamps_ns: Sequence[int],
     hidden_timestamps_ns: Sequence[int], groundtruth_path: str | Path,

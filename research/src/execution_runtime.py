@@ -385,6 +385,7 @@ def execution_provenance(options: FormalExecution | None = None) -> dict[str, An
         "anchor_budget_artifacts.py", "scientific_lineage.py", "registry.py",
         "predictor.py", "transport.py", "h1_training.py", "h2_training.py",
         "jepa_fmap.py", "h2_deployment.py",
+        "predictor_checkpoint.py", "uniform_admission.py", "observation_sampling.py",
     )
     files = {
         name: hashlib.sha256((Path(__file__).parent / name).read_bytes()).hexdigest()

@@ -158,13 +158,15 @@ class FreshCurrentReplaceTest(unittest.TestCase):
                 if module == "h0_state":
                     stack.enter_context(patch.object(runner, "load_sequence_records", return_value=()))
                 else:
-                    stack.enter_context(patch.dict(runner.CHECKPOINT_ROOTS, {module: checkpoint_root}))
                     if module == "h1_interface":
+                        stack.enter_context(patch.dict(runner.CHECKPOINT_ROOTS, {module: checkpoint_root}))
                         stack.enter_context(patch.object(runner, "h1_training_context", return_value=((), {}, {})))
                     else:
                         stack.enter_context(patch.object(runner, "load_sequence_records", return_value=[None]))
                         stack.enter_context(patch.object(runner, "sequence_geometry", return_value=(None, {})))
-                        stack.enter_context(patch.object(runner, "_load_bridge", return_value=(None, {"file_sha256": "bridge"})))
+                        stack.enter_context(patch.object(runner, "_load_bridge", return_value=(SimpleNamespace(state_dict=lambda: {}, cpu=lambda: None), {"file_sha256": "bridge"})))
+                        stack.enter_context(patch.object(runner, "release_cuda_training_state", return_value={"cleanup_complete": True}))
+                        stack.enter_context(patch.object(runner, "load_canonical_predictor", return_value=({"state_dict": {}, "train_only_calibration": {}}, checkpoint_root / "weight.pt", "hash")))
                         stack.enter_context(patch.object(runner, "base_lineage", return_value=({}, {})))
                 with self.assertRaisesRegex(RuntimeError, "mock preparation failed"):
                     runner.run(["MH_01_easy"])

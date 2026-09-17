@@ -14,6 +14,7 @@ import torch
 from . import bridge_checkpoint, registry, run_h0, run_h1, run_h2, scientific_lineage
 from .jepa_runtime import state_dict_sha256
 from .predictor import predictor_state_sha256
+from . import predictor_checkpoint as pc
 from .protocol import REPO_ROOT, canonical_sha256, repo_path, sha256_file
 from .schema import VISUAL_STATE_CONTRACT_SHA256
 
@@ -86,46 +87,34 @@ class FreshCheckpointPolicyTest(unittest.TestCase):
                         expected_training_input={"source_sha256": "current"},
                     )
 
-    def test_fresh_predictor_validation_binds_current_bridge_hash(self) -> None:
-        config = {"training": {
-            "cosine_weight": 1.0,
-            "smooth_l1_weight": .1,
-            "checkpoint_selector": "lowest_validation_total",
-        }}
+    def test_predictor_training_integrity_is_independent_of_admission(self):
+        config, _ = run_h2.load_config()
         state = {"weight": torch.arange(3, dtype=torch.float32)}
         calibration = {"threshold": 1.0}
         calibration["calibration_sha256"] = canonical_sha256(calibration)
-        lineage = {
-            "training_input": {"h1_bridge_sha256": "bridge-a"},
-            "bootstrap_end_candidate_index": 7,
-            "train_only_calibration_sha256": calibration["calibration_sha256"],
-        }
+        lineage = {"scientific_training_contract": pc.training_contract(config),
+                   "split_sha256": "training-population",
+                   "train_only_calibration_sha256": calibration["calibration_sha256"]}
         lineage["training_lineage_sha256"] = canonical_sha256(lineage)
-        checkpoint = {
-            "schema_version": 1,
-            "training_recipe": dict(config["training"]) | {
-                "target": "offline_oracle_hidden_jepa_block5",
-            },
-            "state_dict": state,
-            "state_dict_sha256": predictor_state_sha256(state),
-            "architecture": {},
-            "deployment_protocol": {"mode": "delayed_bracketed", "timestamp_causal": False},
-            "train_only_calibration": calibration,
-            "training_lineage": lineage,
-        }
-        with tempfile.TemporaryDirectory() as name:
+        with tempfile.TemporaryDirectory() as name, \
+             patch.object(pc, "new_predictor", return_value=_FakeModel(state)), \
+             patch.object(pc, "predictor_metadata", return_value={}):
             path = Path(name) / "predictor.pt"
-            torch.save(checkpoint, path)
-            with patch.object(run_h2, "_new_predictor", return_value=_FakeModel(state)), \
-                 patch.object(run_h2, "predictor_metadata", return_value={}):
-                validated = run_h2._validate_fresh_predictor(path, config, lineage)
-                self.assertEqual(validated["training_lineage"], lineage)
-                incompatible = {
-                    **lineage,
-                    "training_input": {"h1_bridge_sha256": "bridge-b"},
-                }
-                with self.assertRaisesRegex(RuntimeError, "training_lineage_mismatch"):
-                    run_h2._validate_fresh_predictor(path, config, incompatible)
+            pc.save_predictor(path, _FakeModel(state), config, calibration, lineage, best_epoch=12)
+            before = sha256_file(path)
+            changed = copy.deepcopy(config)
+            changed["admission"]["k_rule"] = "different deployment"
+            self.assertEqual(pc.training_contract(changed), pc.training_contract(config))
+            validated = pc.load_predictor(path, changed, lineage)
+            self.assertEqual(validated["training_lineage"], lineage)
+            self.assertEqual(sha256_file(path), before)
+            with self.assertRaisesRegex(RuntimeError, "lineage mismatch"):
+                pc.load_predictor(path, config, lineage | {"split_sha256": "changed"})
+            changed["training"]["learning_rate"] *= 2
+            with self.assertRaisesRegex(RuntimeError, "training contract mismatch"):
+                pc.load_predictor(path, changed)
+            with self.assertRaisesRegex(RuntimeError, "frozen state"):
+                pc.load_predictor(path, config, expected_state_sha256="different weights")
 
     def test_runners_have_no_checkpoint_or_sequence_reuse_path(self) -> None:
         for runner in (run_h0, run_h1, run_h2):
@@ -221,42 +210,28 @@ class CanonicalCheckpointCompatibilityTest(unittest.TestCase):
                     expected_training_input=bridge_checkpoint.h1_training_input(base) | {key: "changed"},
                 )
 
-    def test_canonical_predictor_validates_on_cpu_with_rebuilt_scientific_lineage(self) -> None:
+    def test_canonical_predictor_validates_on_cpu_without_source_artifact_access(self):
         config, _ = run_h2.load_config()
-        training_config = copy.deepcopy(config)
-        training_config.pop("evaluation", None)
-        training_config.pop("diagnostics", None)
-        # H2 scientific identity is selected by the runner name; source paths are provenance.
-        base, provenance = registry.base_lineage(
-            training_config, run_h2.TRAINING_SEQUENCE, [Path(run_h2.__file__)],
-            h0_contract_sha256=VISUAL_STATE_CONTRACT_SHA256,
-            h1_bridge_sha256=sha256_file(self.bridge_path),
-        )
-        checkpoint = torch.load(self.predictor_path, map_location="cpu", weights_only=False)
-        records = run_h2.load_sequence_records(config, run_h2.TRAINING_SEQUENCE)
-        calibration = np.loadtxt(repo_path(config["paths"]["calibration"]), delimiter=" ")
-        details = run_h2._predictor_training_details(
-            records, checkpoint["training_lineage"]["bootstrap_end_candidate_index"],
-            calibration, config, base,
-        )
-        lineage = details["lineage"] | {
-            "train_only_calibration_sha256": checkpoint["train_only_calibration"]["calibration_sha256"],
-        }
-        lineage["training_lineage_sha256"] = canonical_sha256(lineage)
-        validated = run_h2._validate_fresh_predictor(self.predictor_path, config, lineage)
-        self.assertEqual(validated["training_lineage"], lineage)
-        self.assertEqual(validated["training_recipe"], dict(config["training"]) | {
-            "seed": 1234, "training_sequence": run_h2.TRAINING_SEQUENCE,
-            "target": "offline_oracle_hidden_jepa_block5",
-            "checkpoint_contains_optimizer_or_scaler": False,
-        })
-        self.assertEqual(set(provenance["sources"]["files"]), {"research/src/run_h2.py"})
-        for key in ("split_sha256", "coordinate_transform_sha256",
-                    "transport_calibration_protocol_sha256"):
-            with self.subTest(field=key), self.assertRaisesRegex(RuntimeError, "lineage_mismatch"):
-                run_h2._validate_fresh_predictor(
-                    self.predictor_path, config, lineage | {key: "changed"},
-                )
+        audit = json.loads((REPO_ROOT / "research/H2_CANONICAL_PREDICTOR.json").read_text())
+        original_resolve = pc.repo_path
+        def resolve(value):
+            self.assertNotIn("anchor-budget", str(value))
+            return original_resolve(value)
+        with patch.object(pc, "repo_path", side_effect=resolve):
+            checkpoint, path, file_hash = pc.load_canonical_predictor(config)
+        self.assertEqual(path, self.predictor_path)
+        self.assertEqual(file_hash, audit["promotion"]["target_file_sha256"])
+        self.assertEqual(checkpoint["state_dict_sha256"], audit["source_predictor"]["state_dict_sha256"])
+        self.assertEqual(checkpoint["training_lineage"], audit["promotion"]["training_lineage"])
+        source = audit["source_checkpoint_metadata"]
+        for key in ("architecture", "training_recipe", "train_only_calibration"):
+            self.assertEqual(checkpoint[key], source[key])
+        self.assertNotIn("deployment_protocol", checkpoint)
+        self.assertNotIn("admission", json.dumps(checkpoint["training_lineage"]))
+        self.assertEqual(checkpoint["best_epoch"], 12)
+        self.assertEqual(checkpoint["promotion_provenance"]["source_checkpoint_metadata"], source)
+        with self.assertRaisesRegex(RuntimeError, "lineage mismatch"):
+            pc.load_predictor(path, config, checkpoint["training_lineage"] | {"split_sha256": "changed"})
 
 
 if __name__ == "__main__":

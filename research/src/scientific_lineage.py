@@ -4,6 +4,8 @@ from __future__ import annotations
 from typing import Mapping
 
 from .protocol import canonical_sha256
+from .uniform_admission import ADMISSION_CONTRACT
+from .observation_sampling import SAMPLING_PROTOCOL
 
 
 COMMON_CONTRACT = {
@@ -35,7 +37,9 @@ MODULE_CONTRACTS = {
         "objective": "canonical_prediction_loss_v1",
         "transport": "bidirectional_robust_correspondence_irls3_v1",
         "calibration": "train_only_frozen_thresholds_v1",
-        "deployment": "strict_delayed_bracketed_hidden_h1_h4_then_anchor_a5_v1",
+        "deployment": "strict_delayed_bracketed_uniform_budgeted_native_dpvo",
+        "admission": ADMISSION_CONTRACT,
+        "observation_sampling": SAMPLING_PROTOCOL,
     },
 }
 
@@ -54,3 +58,21 @@ def scientific_fingerprint(module: str) -> dict:
 
 def compatible_training_input(actual: Mapping, expected: Mapping, *, module="h1") -> bool:
     return dict(actual) == dict(expected)
+
+
+def deployment_lineage(config, *, predictor_sha256, training_lineage_sha256,
+                       bridge_sha256, dpvo_sha256, dpvo_config_sha256,
+                       schedule_sha256):
+    payload = {
+        "contract": scientific_fingerprint("h2"),
+        "admission": dict(config["admission"]),
+        "predictor_state_dict_sha256": predictor_sha256,
+        "predictor_training_lineage_sha256": training_lineage_sha256,
+        "h1_bridge_sha256": bridge_sha256,
+        "dpvo_checkpoint_sha256": dpvo_sha256,
+        "dpvo_config_sha256": dpvo_config_sha256,
+        "schedule_sha256": schedule_sha256,
+        "scientific_seed": config["experiment"]["seed"],
+        "evaluation": dict(config["evaluation"]),
+    }
+    return payload | {"deployment_lineage_sha256": canonical_sha256(payload)}

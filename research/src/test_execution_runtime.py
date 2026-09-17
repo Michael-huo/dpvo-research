@@ -3,6 +3,7 @@ from __future__ import annotations
 import inspect
 import os
 import queue
+import subprocess
 import sys
 import tempfile
 import threading
@@ -25,6 +26,23 @@ from .training_runtime import ResidentRows, resident_correspondence
 
 
 class FormalCleanupLifecycleTest(unittest.TestCase):
+    def test_failed_worker_traceback_survives_staging_cleanup(self):
+        def fail(command, **kwargs):
+            kwargs["stdout"].write(
+                "Traceback (most recent call last):\n"
+                "NameError: name 'runtime_provenance' is not defined\n")
+            raise subprocess.CalledProcessError(1, command)
+        with tempfile.TemporaryDirectory() as name:
+            path = Path(name)
+            with patch.object(torch, "save"), \
+                 patch.object(parallel_runtime.subprocess, "run", side_effect=fail), \
+                 self.assertRaises(RuntimeError) as caught:
+                parallel_runtime._launch({"kind": "formal_h2_predicted"}, path, 0)
+        self.assertFalse(path.exists())
+        self.assertIn("formal_h2_predicted worker exited with code 1", str(caught.exception))
+        self.assertIn("NameError: name 'runtime_provenance' is not defined", str(caught.exception))
+        self.assertIsInstance(caught.exception.__cause__, subprocess.CalledProcessError)
+
     def test_worker_launchers_use_functional_modules_and_original_gpu_mapping(self):
         with tempfile.TemporaryDirectory() as name, patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "2,0,1"}), patch.object(torch.cuda, "device_count", return_value=3), patch.object(torch.cuda, "current_device", return_value=0):
             root = Path(name)
@@ -41,12 +59,16 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
                 ready = {"status": "ready", "provenance": {
                     "cuda_visible_devices": "2,0,1", "logical_cuda_device_count": 3,
                     "current_logical_cuda_device": device,
+                    "settings": {"seed": 1234},
                 }}
                 with patch("subprocess.Popen") as popen, \
                      patch.object(threading.Thread, "start"), \
                      patch.object(GPUWorker, "receive", return_value=ready):
-                    GPUWorker(python=sys.executable, device=device, component=component,
-                              config_path=root / "worker.json")
+                    worker = GPUWorker(python=sys.executable, device=device, component=component,
+                                       config_path=root / "worker.json")
+                    self.assertEqual(worker.provenance["status"], "ready")
+                    self.assertEqual(worker.provenance["provenance"]["settings"]["seed"], 1234)
+                    self.assertNotIn("settings", worker.provenance)
                     command = popen.call_args.args[0]
                     self.assertEqual(command[:3], [sys.executable, "-m", "research.src.pipeline_worker"])
                     self.assertEqual(command[-2:], ["--logical-device", str(device)])
@@ -211,7 +233,7 @@ class FormalCleanupLifecycleTest(unittest.TestCase):
             parallel_runtime, "_gpu_process_telemetry", return_value=process_snapshot,
         ), patch.object(parallel_runtime, "_launch", side_effect=fake_launch), patch.object(torch.cuda, "device_count", return_value=1):
             rows, execution = parallel_runtime.run_sequential_trajectory_jobs(
-                ({"kind": "materialize_schedule", "sequence": "sequence"},),
+                ({"kind": "materialize_schedule", "sequence": "sequence", "config": {"experiment": {"seed": 1234}}},),
                 Path(name) / "jobs", hardware={"devices": []},
             )
         self.assertEqual(len(rows), 1)

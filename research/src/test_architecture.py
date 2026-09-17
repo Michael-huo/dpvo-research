@@ -186,6 +186,14 @@ class ArchitectureContractTest(unittest.TestCase):
             "4d5118e7ef6588a176827a4e306253d639fe0579",
             "24f73cbfb89d28415175beedf681a256644f22b1",
         ])
+        baseline = "16d5d5fc114778f891fc39b2c21b9dfd62d96377"
+        names = subprocess.check_output(
+            ["git", "ls-tree", "-r", "--name-only", baseline, "dpvo", "config"],
+            cwd=REPO_ROOT, text=True).splitlines()
+        for name in names:
+            with self.subTest(path=name):
+                expected = subprocess.check_output(["git", "show", f"{baseline}:{name}"], cwd=REPO_ROOT)
+                self.assertEqual((REPO_ROOT / name).read_bytes(), expected)
 
 
 if __name__ == "__main__":

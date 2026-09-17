@@ -547,7 +547,7 @@ def run_packet_observations(
 def run_deployment_observations(
     observations: Any, calibration: np.ndarray, config: Mapping[str, Any], *,
     image_height: int, image_width: int, condition_name: str,
-    expected_roles: Mapping[str, str], profiler: Any,
+    expected_roles: Mapping[str, str], profiler: Any, intervals: Sequence[Any],
     worker_barrier: Any | None = None,
     on_tracked: Any | None = None,
 ) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
@@ -557,6 +557,10 @@ def run_deployment_observations(
     expected_keys = list(expected_roles)
     if not expected_keys or set(expected_roles.values()) - {"anchor", "hidden"}:
         raise ValueError("expected_roles must define a non-empty anchor/hidden population")
+    from .uniform_admission import AdmissionReceipt
+    from .observation_sampling import observation_rng_scope, SAMPLING_PROTOCOL
+    receipt = AdmissionReceipt(expected_roles, intervals,
+                               int(config["experiment"]["post_bootstrap_anchor_interval"]))
     dummy = torch.empty((3, int(image_height), int(image_width)), dtype=torch.uint8)
     _, packet_class = _formal_classes()
     seed = int(config["experiment"]["seed"])
@@ -639,11 +643,17 @@ def run_deployment_observations(
             intrinsics = observation.intrinsics
             native_frontend_keys.add(identity.key)
             kind = "anchor"
+            receipt.receive(identity)
         else:
             if not isinstance(observation, PacketObservation) or observation.kind != "hidden":
                 raise PermissionError("hidden RGB capability entered deployment runtime")
             packet = observation.packet
             intrinsics = hidden_intrinsics
+            # The provider has predicted, bridged and constructed every FMap packet.
+            # Apply the exact canonical admission at the measured insertion boundary.
+            if not receipt.receive(identity):
+                del packet
+                continue
             slam.exp6_hidden_timestamps.add(int(identity.timestamp_ns))
             hidden_timestamps.add(int(identity.timestamp_ns))
             kind = "hidden"
@@ -670,9 +680,10 @@ def run_deployment_observations(
         graph_end = torch.cuda.Event(enable_timing=True)
         graph_cpu_started = time.perf_counter()
         graph_start.record()
-        slam.track_packet(
-            int(identity.timestamp_ns), intrinsics, packet=native_packet, kind=kind,
-        )
+        with observation_rng_scope(identity, seed):
+            slam.track_packet(
+                int(identity.timestamp_ns), intrinsics, packet=native_packet, kind=kind,
+            )
         graph_end.record()
         graph_cpu_ms = (time.perf_counter() - graph_cpu_started) * 1000.0
         profiler.add_stage_c_cpu(
@@ -697,6 +708,8 @@ def run_deployment_observations(
         if on_tracked is not None:
             on_tracked(observation, graph_cuda_ms)
         del packet, native_packet
+    admission_payload = receipt.finish()
+    expected_keys = receipt.inserted
     if processed_keys != expected_keys:
         missing = sorted(set(expected_keys) - processed_set)
         extra = sorted(processed_set - set(expected_keys))
@@ -804,6 +817,18 @@ def run_deployment_observations(
         },
     }
     arrays = {"poses": pose_array, "timestamps_ns": timestamp_array}
+    if not np.array_equal(timestamp_array, np.asarray(receipt.inserted_timestamps, dtype=np.uint64)):
+        raise RuntimeError("trajectory timestamps must exactly match canonical admission")
+    arrays.update(receipt.arrays())
+    metrics["admission"] = admission_payload
+    metrics["candidate_received_exactly_once"] = True
+    metrics["candidate_consumed_exactly_once"] = True
+    metrics["observation_sampling_provenance"] = {
+        "protocol": SAMPLING_PROTOCOL, "scientific_seed": seed,
+        "patches_per_image": int(slam.M), "patch_size": int(slam.P),
+        "native_centroid_selection": getattr(slam.cfg, "CENTROID_SEL_STRAT", None),
+        "seed_scope": "identity_and_role_independent_of_insertion_order",
+    }
     del slam
     torch.cuda.empty_cache()
     return metrics, arrays

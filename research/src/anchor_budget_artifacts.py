@@ -173,7 +173,7 @@ def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
                      "trend_samples": "measured_points_only_no_interpolation"}},
         "full_rgb": {}, "strides": {}}
     metadata = result["metadata"]
-    bundle, proof, checkpoints = {}, {"trajectories": {}, "schedules": {}, "scientific": {}}, []
+    bundle, proof, checkpoints = {}, {"trajectories": {}, "admission": {}, "schedules": {}, "scientific": {}}, []
     seqroot = Path("sequences") / sequence
     gt_ref = read(seqroot / "groundtruth.json")
     gt_path = Path(gt_ref["path"])
@@ -196,11 +196,27 @@ def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
         if sha256_file(source / path) != row["trajectory_sha256"]:
             raise RuntimeError(f"source trajectory hash changed: {name}")
         with np.load(source / path, allow_pickle=False) as old:
-            if set(old.files) != {"poses", "timestamps_ns"}:
+            allowed = {"poses", "timestamps_ns", "admission_identities", "admission_insert"}
+            if not {"poses", "timestamps_ns"} <= set(old.files) <= allowed:
                 raise ValueError(f"unmapped scientific arrays in {path}")
             arrays = {key: old[key].copy() for key in old.files}
         metadata["trajectories"][name] = add_trajectory(bundle, name, arrays["timestamps_ns"], arrays["poses"])
-        proof["trajectories"][name] = arrays
+        proof["trajectories"][name] = {key: arrays[key] for key in ("poses", "timestamps_ns")}
+        admission_keys = {"admission_identities", "admission_insert"}
+        if admission_keys & arrays.keys():
+            if not admission_keys <= arrays.keys():
+                raise ValueError(f"incomplete admission arrays: {name}")
+            identities, mask = arrays["admission_identities"], arrays["admission_insert"]
+            if (identities.ndim != 1 or identities.dtype.kind != "U"
+                    or mask.shape != identities.shape or mask.dtype != np.bool_
+                    or len(set(identities.tolist())) != len(identities)
+                    or int(mask.sum()) != len(arrays["timestamps_ns"])):
+                raise ValueError(f"invalid admission arrays: {name}")
+            proof["admission"][name] = {key: arrays[key].copy() for key in admission_keys}
+            metadata["trajectories"][name]["admission_arrays_sha256"] = {
+                key: _array_hash(arrays[key]) for key in sorted(admission_keys)}
+            for key in admission_keys:
+                bundle[name + "__" + key] = arrays[key]
 
     full = read(seqroot / "full_rgb/results.json")
     metadata["evaluation_populations"]["stride_5"] = full["canonical_population"]
@@ -238,8 +254,8 @@ def build_compact(source, checkpoint_root=CHECKPOINT_ROOT):
                "ours": _compact_condition(ours, population_key),
                "horizon": {"by_relative_index": training["horizon_resolved_quality"], "queries": columnar(query_rows)},
                "comparison": old["comparison"],
-               "provenance": {"checkpoint": checkpoint, "H1_bridge_sha256": training["lineage"]["h1_bridge_sha256"],
-                              "scientific_config": training["lineage"]["scientific_config"],
+               "provenance": {"checkpoint": checkpoint, "H1_bridge_sha256": training["h1_bridge"]["file_sha256"],
+                              "scientific_config": training["lineage"]["scientific_training_contract"],
                               "training_cleanup": old["training_cleanup"]}}
         row = without_worker_log_paths(row)
         result["strides"][str(stride)] = row
@@ -283,6 +299,14 @@ def validate_compact(root, *, check_checkpoints=True, proof=None, checkpoint_roo
             arrays = reconstruct_trajectory(bundle, name)
             if len(arrays["poses"]) != manifest["point_count"] or _array_hash(arrays["poses"]) != manifest["poses_sha256"] or _array_hash(arrays["timestamps_ns"]) != manifest["timestamps_sha256"]:
                 raise RuntimeError(f"trajectory array mismatch: {name}")
+            for field, digest in manifest.get("admission_arrays_sha256", {}).items():
+                value = bundle[name + "__" + field]
+                if _array_hash(value) != digest:
+                    raise RuntimeError(f"admission array mismatch: {name}/{field}")
+                if proof is not None:
+                    before = proof["admission"][name][field]
+                    if value.dtype != before.dtype or not np.array_equal(value, before):
+                        raise RuntimeError(f"admission array changed: {name}/{field}")
             if proof is not None:
                 for field, value in arrays.items():
                     before = proof["trajectories"][name][field]

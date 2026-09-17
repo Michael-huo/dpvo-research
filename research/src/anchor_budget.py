@@ -172,6 +172,8 @@ def backward_equivalence(records, protocol):
 
 def budget_config(canonical, protocol, stride):
     result = copy.deepcopy(canonical)
+    result.pop("canonical_predictor", None)
+    result["paths"].pop("h2_predictor", None)
     result["experiment"].update(anchor_stride=stride, anchor_ratio=1.0 / stride,
                                 post_bootstrap_anchor_interval=stride)
     result["paths"]["output_root"] = protocol["output_root"]

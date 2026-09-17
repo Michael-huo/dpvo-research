@@ -36,6 +36,9 @@ def evaluation_population(records, roles, config):
 def save_trajectory(output, row, records, roles, config, *, dense):
     output.mkdir(parents=True, exist_ok=False)
     arrays = row["arrays"]
+    admitted = "admission" in row["runtime"]
+    if admitted:
+        dense = False
     population, dense_timestamps, hidden_timestamps, gt = evaluation_population(records, roles, config)
     coverage = population_coverage(arrays, population.common_anchor_timestamps_ns)
     complete = coverage["canonical_pose_coverage"] == 1.0
@@ -62,6 +65,11 @@ def save_trajectory(output, row, records, roles, config, *, dense):
         "timing_protocol": "research_matched_online_wall_including_terminate_and_worker_flush",
         "warmup": row.get("warmup", row.get("online_profile", {}).get("warmup")),
     }
+    if admitted:
+        from .evaluation import admitted_native_evaluation
+        if not row["runtime"]["tracking_success"]:
+            raise RuntimeError("canonical Ours tracking failed")
+        result["secondary_native_evaluation"] = admitted_native_evaluation(arrays, records, roles, gt, config)
     if "online_profile" in row:
         result["h2_stage_profile"] = row["online_profile"]
         result["provider_usage"] = row["runtime"]["provider_usage"]

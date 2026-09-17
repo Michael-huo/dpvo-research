@@ -16,6 +16,7 @@ from . import run_anchor_budget as runner
 from .anchor_budget_figures import aligned_translation, render_figures
 from .predictor import build_anchor_intervals, predictor_state_sha256
 from .protocol import FrameIdentity, atomic_write_json, canonical_sha256, sha256_file
+from .uniform_admission import uniform_ordinals
 
 
 def staging_fixture(parent, strides=(3, 5, 10)):
@@ -43,7 +44,14 @@ def staging_fixture(parent, strides=(3, 5, 10)):
                "stage_c_runtime": {"pid": 123}, "stage_c_timing": {"total_ms": 30}}
     def condition(folder, selected, stride, ours=False):
         folder.mkdir(parents=True)
-        np.savez_compressed(folder / "trajectory.npz", timestamps_ns=ts[selected], poses=poses[selected])
+        admission = {}
+        if ours:
+            last_anchor = (len(ts) - 1) // stride * stride
+            selected = np.asarray([i % stride == 0 or (
+                i < last_anchor and i % stride in uniform_ordinals(stride)) for i in range(len(ts))])
+            admission = {"admission_identities": np.asarray([i.key for i in identities]),
+                         "admission_insert": selected}
+        np.savez_compressed(folder / "trajectory.npz", timestamps_ns=ts[selected], poses=poses[selected], **admission)
         row = {"condition": folder.name, "status": "complete", "runtime": {"elapsed_seconds": 3, "stage_c_timing": {"total_ms": 30}},
                "canonical_evaluation": {"ate_rmse_m": .12345678901234568 + stride/100,
                     "translation_rpe_rmse_m": None if stride == 3 else .01, "rotation_rpe_rmse_deg": None if stride == 3 else .2,
@@ -74,7 +82,7 @@ def staging_fixture(parent, strides=(3, 5, 10)):
                                         "encoded_anchor_bytes": 30, "encoded_full_bytes":100}}
         atomic_write_json(folder / "schedule.json", population | {"roles":roles,"intervals":[r.payload() for r in intervals]})
         lineage = {"protocol":"anchor_budget_fresh_predictor_v1", "anchor_stride":stride, "seed":1234,
-                   "h1_bridge_sha256":"h1", "scientific_config":{"config_protocol_sha256":"h2"}}
+                   "scientific_training_contract":{"contract_sha256":"training"}}
         lineage["training_lineage_sha256"] = canonical_sha256(lineage)
         modelroot = root / "models" / f"stride_{stride}"
         modelroot.mkdir(parents=True)
@@ -85,7 +93,7 @@ def staging_fixture(parent, strides=(3, 5, 10)):
                     "predicted_jepa_cosine":.9-q/100, "transport_baseline_cosine":.8-q/100,
                     "bridge_fmap_cosine":.7-q/100, "transport_bridge_fmap_cosine":.6-q/100}
                    for q in range(1,stride)]
-        training = {"anchor_stride":stride, "lineage":lineage, "split":fixed, "horizon_resolved_quality":horizon,
+        training = {"h1_bridge":{"file_sha256":"h1"}, "anchor_stride":stride, "lineage":lineage, "split":fixed, "horizon_resolved_quality":horizon,
                     "summary":{"best_epoch":2, "best_validation_total":.2, "elapsed_seconds":1.2345,
                                "history":[{"epoch":1,"train_total":.5,"validation_total":.3},
                                           {"epoch":2,"train_total":.4,"validation_total":.2}]},
@@ -179,6 +187,28 @@ class ArtifactAggregationTest(unittest.TestCase):
         self.assertLess(len((self.destination/"SUMMARY.md").read_text().splitlines()),40)
         self.assertEqual(artifacts.inventory(self.source), before)
         self.assertEqual(artifacts.publish_compact(self.source,self.destination,self.checkpoints)["strides"],data["strides"])
+
+    def test_admission_arrays_round_trip_and_detect_tampering(self):
+        data, bundle, _, proof = artifacts.build_compact(self.source, self.checkpoints)
+        for name, original in proof["admission"].items():
+            self.assertEqual(set(original), {"admission_identities", "admission_insert"})
+            for field, before in original.items():
+                after = bundle[name + "__" + field]
+                self.assertEqual(before.dtype, after.dtype)
+                self.assertTrue(np.array_equal(before, after))
+                self.assertEqual(data["metadata"]["trajectories"][name]["admission_arrays_sha256"][field],
+                                 artifacts._array_hash(before))
+        artifacts.publish_compact(self.source, self.destination, self.checkpoints)
+        path = self.destination / "trajectories.npz"
+        with np.load(path, allow_pickle=False) as stored:
+            changed = {key: stored[key].copy() for key in stored.files}
+        changed["stride_5_ours__admission_insert"][1] ^= True
+        np.savez_compressed(path, **changed)
+        result = json.loads((self.destination / "results.json").read_text())
+        result["metadata"]["trajectories_npz_sha256"] = sha256_file(path)
+        atomic_write_json(self.destination / "results.json", result)
+        with self.assertRaisesRegex(RuntimeError, "admission array mismatch"):
+            artifacts.validate_compact(self.destination, check_checkpoints=False)
 
     def test_figures_need_only_json_and_npz_and_do_not_refit(self):
         artifacts.publish_compact(self.source,self.destination,self.checkpoints)
