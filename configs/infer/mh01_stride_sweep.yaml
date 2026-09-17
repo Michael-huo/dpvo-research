@@ -1,0 +1,42 @@
+# Stride sweep overrides only; base scientific settings are loaded unchanged.
+schema_version: 1
+sequence: MH_01_easy
+anchor_strides:
+- 3
+- 5
+- 10
+base_infer_config: configs/infer/mh01_four_modes.yaml
+output_root: research/results/inference/mh01_stride_sweep
+fresh_predictor_per_stride: true
+fixed_split:
+  source: frozen_h2_timestamp_regions
+  source_split_sha256: 68eff0d531cb6d3f2d75c14d20a369fc32ef3c51edcfedcb9cae79c5dc364bda
+  bootstrap_end_candidate_index: 7
+  source_candidate_count: 1841
+  endpoint_bounds: inclusive
+  regions:
+    train:
+      candidate_start: 8
+      candidate_end: 1103
+      frame_start: 16
+      frame_end: 2206
+      timestamp_start_ns: 1403636580563555584
+      timestamp_end_ns: 1403636690063555584
+    validation:
+      candidate_start: 1108
+      candidate_end: 1468
+      frame_start: 2216
+      frame_end: 2936
+      timestamp_start_ns: 1403636690563555584
+      timestamp_end_ns: 1403636726563555584
+    test:
+      candidate_start: 1473
+      candidate_end: 1838
+      frame_start: 2946
+      frame_end: 3676
+      timestamp_start_ns: 1403636727063555584
+      timestamp_end_ns: 1403636763563555584
+full_rgb_population:
+  source: canonical_effective_population
+  candidate_start: 0
+  candidate_end: 1838

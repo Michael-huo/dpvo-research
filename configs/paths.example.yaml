@@ -1,0 +1,4 @@
+# Copy to paths.local.yaml and replace the placeholders with absolute directories.
+datasets:
+  euroc: <SHARED_DATASET_ROOT>/euroc
+  euroc_groundtruth: <SHARED_DATASET_ROOT>/euroc_groundtruth

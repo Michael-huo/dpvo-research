@@ -129,7 +129,7 @@ DPVO 使用以下第三方组件：
 
 所有研究过程、实验设计和结果分析记录于：
 
-    research/RESEARCH.md
+    research/reports/FEASIBILITY_RESEARCH.md
 
 ------------------------------------------------------------------------
 
