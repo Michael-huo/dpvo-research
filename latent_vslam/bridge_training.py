@@ -173,6 +173,8 @@ def train_bridge(
     config: Mapping[str, Any], checkpoint_path: Path,
     training_lineage: Mapping[str, Any] | None = None,
     *, profiler: Any | None = None, validation_profiler: Any | None = None,
+    sequences: Sequence[str] | None = None,
+    sample_counts: Mapping[str, Any] | None = None,
 ) -> tuple[torch.nn.Module, dict[str, Any]]:
     bridge = config["bridge"]; seed = int(config["experiment"]["seed"])
     init_seed = int(config["experiment"]["bridge_initialization_seed"])
@@ -258,7 +260,7 @@ def train_bridge(
         patch_size=int(config["jepa"]["patch_size"]),
         fmap_scale=int(config["teacher"]["fmap_scale"]),
     )
-    torch.save({
+    checkpoint = {
         "schema_version": 2, "architecture": BRIDGE_ARCHITECTURE,
         "layer_zero_based": 5, "state_dict": state,
         "state_dict_sha256": state_dict_sha256(state),
@@ -273,7 +275,13 @@ def train_bridge(
             "batch_size": batch_size, "checkpoint_selector": "second_pass_epoch_30_final",
         },
         "training_lineage": dict(training_lineage or {}),
-    }, checkpoint_path)
+    }
+    if sequences is not None:
+        checkpoint["sequences"] = list(sequences)
+        checkpoint["sample_counts"] = dict(sample_counts or {})
+        checkpoint["training_recipe"].pop("training_sequence")
+        checkpoint["training_recipe"]["sequences"] = list(sequences)
+    torch.save(checkpoint, checkpoint_path)
     summary = {
         "lineage": {
             "recipe": (

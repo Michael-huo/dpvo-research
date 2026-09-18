@@ -18,6 +18,7 @@ from prediction.jepa_runtime import (RestrictedFeatureView, extract_block5_store
 from latent_vslam.parallel_runtime import correspondence_parallel, extract_parallel
 from latent_vslam.protocol import atomic_write_json, canonical_sha256, repo_path, sha256_file
 from latent_vslam.inference_runtime import _load_bridge, _unique_identities
+from latent_vslam.bridge_checkpoint import load_compatible_bridge
 from latent_vslam.predictor_training import _hidden_identities
 from prediction.predictor_checkpoint import build_training_lineage, load_predictor, save_predictor
 from latent_vslam.training_runtime import ResidentPredictorView, resident_correspondence
@@ -27,7 +28,12 @@ from prediction.transport import robust_protocol_metadata
 def training_lineage(budget, protocol, geometry, config):
     train = budget["split"]["train"]
     anchors = {i.key: i for row in train for i in (row.anchor0, row.anchor1)}
-    population = [i.public_dict() for i in sorted(anchors.values(), key=lambda i: i.candidate_index)]
+    if "sequences" in budget:
+        rank = {sequence: index for index, sequence in enumerate(budget["sequences"])}
+        ordered = sorted(anchors.values(), key=lambda i: (rank[i.sequence], i.candidate_index))
+    else:
+        ordered = sorted(anchors.values(), key=lambda i: i.candidate_index)
+    population = [i.public_dict() for i in ordered]
     return build_training_lineage(
         config=config, anchor_stride=budget["anchor_stride"], anchor_population=population,
         fixed_split=protocol["fixed_split"], split_sha256=budget["split_payload"]["split_sha256"],
@@ -85,7 +91,20 @@ def train_stride_predictor(records, budget, protocol, config, output, temporary)
     robust_resident = None
     predictor = bridge = None
     try:
-        bridge, bridge_meta = _load_bridge(config, transform)
+        if "sequences" in budget:
+            bridge_path = repo_path(config["paths"]["bridge"])
+            bridge_payload = torch.load(bridge_path, map_location="cpu", weights_only=False)
+            if bridge_payload.get("sequences") != list(budget["sequences"]):
+                raise RuntimeError("B1 Bridge sequences do not match Predictor sequences")
+            bridge_lineage = bridge_payload["training_lineage"]
+            bridge, bridge_meta, _ = load_compatible_bridge(
+                bridge_path, transform,
+                hidden_channels=int(config["bridge"]["hidden_channels"]),
+                expected_training_input=bridge_lineage["training_input"],
+                expected_training_lineage=bridge_lineage,
+            )
+        else:
+            bridge, bridge_meta = _load_bridge(config, transform)
         mask = torch.from_numpy(coordinate_masks(transform)["valid_token_mask"]).cuda()
         dev, dev_meta = extract_parallel(
             records, _unique_identities(development), calibration, config,
@@ -107,8 +126,14 @@ def train_stride_predictor(records, budget, protocol, config, output, temporary)
         lineage["training_lineage_sha256"] = canonical_sha256(lineage)
         checkpoint_path = output / "predictor.pt"
         save_predictor(checkpoint_path, predictor, config, thresholds, lineage,
-                       best_epoch=summary["best_epoch"])
+                       best_epoch=summary["best_epoch"],
+                       sample_counts=budget.get("sample_counts"))
         checkpoint = load_stride_predictor(checkpoint_path, config, lineage, budget["anchor_stride"])
+        if "sequences" in budget and (
+            checkpoint.get("sequences") != list(budget["sequences"])
+            or checkpoint.get("sample_counts") != budget["sample_counts"]
+        ):
+            raise RuntimeError("B1 Predictor checkpoint sample provenance mismatch")
         dev.close()
         # Test features and true FMaps are created only after checkpoint freeze.
         test = budget["split"]["test"]
@@ -129,6 +154,13 @@ def train_stride_predictor(records, budget, protocol, config, output, temporary)
                                            predictor, bridge, teacher, horizon_rows=horizon)
         for row in horizon:
             row.update(anchor_stride=budget["anchor_stride"], split="test", role="offline_diagnostics_only")
+        if "sequences" in budget:
+            intervals_by_index = {interval.interval_index: interval for interval in test}
+            for row in horizon:
+                interval = intervals_by_index[row["interval_index"]]
+                row.update(sequence=interval.anchor0.sequence,
+                           local_interval_index=interval.local_interval_index,
+                           global_interval_index=interval.global_interval_index)
         expected_queries = [q.identity.key for interval in test for q in interval.hidden]
         if [row["identity"] for row in horizon] != expected_queries:
             raise RuntimeError("incomplete held-out horizon diagnostics")
@@ -142,6 +174,10 @@ def train_stride_predictor(records, budget, protocol, config, output, temporary)
                   "test_was_read_during_training_or_selection": False,
                   "bridge": bridge_meta, "scientific_training_contract": lineage["scientific_training_contract"],
                   "training_and_diagnostics_wall_seconds": time.perf_counter()-started}
+        if "sequences" in budget:
+            record["sequences"] = list(budget["sequences"])
+            record["sample_counts"] = budget["sample_counts"]
+            record["held_out_scope"] = "training_sequences_internal_only"
         bridge_state = {name: value.detach().cpu().clone() for name, value in bridge.state_dict().items()}
         atomic_write_json(output / "horizon_queries.json", horizon)
     finally:

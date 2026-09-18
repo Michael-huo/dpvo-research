@@ -37,12 +37,24 @@ class AnchorInterval:
     anchor0: FrameIdentity
     anchor1: FrameIdentity
     hidden: tuple[HiddenQuery, ...]
+    local_interval_index: int | None = None
+    global_interval_index: int | None = None
 
     def __post_init__(self) -> None:
         if not self.hidden or self.anchor0.timestamp_ns >= self.anchor1.timestamp_ns:
             raise ValueError("anchor interval must contain ordered hidden queries")
         if self.anchor0.key == self.anchor1.key:
             raise ValueError("anchor interval endpoints must be distinct")
+        if self.anchor0.sequence != self.anchor1.sequence or any(
+            query.identity.sequence != self.anchor0.sequence for query in self.hidden
+        ):
+            raise ValueError("anchor interval crosses sequences")
+        if self.global_interval_index is not None and self.global_interval_index != self.interval_index:
+            raise ValueError("global interval index must match the correspondence key")
+        if (self.local_interval_index is None) != (self.global_interval_index is None):
+            raise ValueError("local and global interval indices must be supplied together")
+        if self.local_interval_index is not None and self.local_interval_index < 0:
+            raise ValueError("local interval index must be non-negative")
         denominator = self.anchor1.timestamp_ns - self.anchor0.timestamp_ns
         for query in self.hidden:
             if not self.anchor0.timestamp_ns < query.identity.timestamp_ns < self.anchor1.timestamp_ns:
@@ -56,9 +68,13 @@ class AnchorInterval:
         return self.anchor0.key, self.anchor1.key
 
     def payload(self) -> dict[str, Any]:
-        return {"interval_index": int(self.interval_index),
+        result = {"interval_index": int(self.interval_index),
                 "anchor0": self.anchor0.public_dict(), "anchor1": self.anchor1.public_dict(),
                 "hidden": [query.payload() for query in self.hidden]}
+        if self.local_interval_index is not None:
+            result["local_interval_index"] = int(self.local_interval_index)
+            result["global_interval_index"] = int(self.global_interval_index)
+        return result
 
 
 def _identity(value: Any) -> FrameIdentity:

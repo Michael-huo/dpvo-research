@@ -1,0 +1,5 @@
+schema_version: 1
+train:
+  kind: bridge
+  base_config: configs/train/bridge_mh01.yaml
+  sequences: [MH_01_easy, MH_02_easy]

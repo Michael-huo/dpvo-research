@@ -22,6 +22,13 @@ def new_predictor(config):
     )
 
 
+def _training_sequences(config):
+    experiment = config["experiment"]
+    if "training_sequences" in experiment:
+        return {"sequences": list(experiment["training_sequences"])}
+    return {"training_sequence": experiment["training_sequence"]}
+
+
 def training_contract(config):
     """Explicit training inputs: never hash deployment, result paths or admission."""
     jepa = {k: copy.deepcopy(v) for k, v in config["jepa"].items()
@@ -35,7 +42,7 @@ def training_contract(config):
         "transport": copy.deepcopy(config["transport"]),
         "training": copy.deepcopy(config["training"]),
         "seed": int(config["experiment"]["seed"]),
-        "training_sequence": config["experiment"]["training_sequence"],
+        **_training_sequences(config),
         "target": "offline_oracle_hidden_jepa_block5",
         "transport_protocol_sha256": canonical_sha256(robust_protocol_metadata()),
     }
@@ -59,7 +66,8 @@ def build_training_lineage(*, config, anchor_stride, anchor_population,
     }
 
 
-def save_predictor(path, model, config, calibration, lineage, *, best_epoch=None):
+def save_predictor(path, model, config, calibration, lineage, *, best_epoch=None,
+                   sample_counts=None):
     state = {name: value.detach().cpu() for name, value in model.state_dict().items()}
     payload = {
         "schema_version": 1, "state_dict": state,
@@ -67,13 +75,16 @@ def save_predictor(path, model, config, calibration, lineage, *, best_epoch=None
         "architecture": predictor_metadata(model),
         "training_recipe": dict(config["training"]) | {
             "seed": int(config["experiment"]["seed"]),
-            "training_sequence": config["experiment"]["training_sequence"],
+            **_training_sequences(config),
             "target": "offline_oracle_hidden_jepa_block5",
             "checkpoint_contains_optimizer_or_scaler": False,
         },
         "train_only_calibration": dict(calibration),
         "training_lineage": dict(lineage), "best_epoch": best_epoch,
     }
+    if sample_counts is not None:
+        payload["sequences"] = list(config["experiment"]["training_sequences"])
+        payload["sample_counts"] = dict(sample_counts)
     buffer = io.BytesIO()
     torch.save(payload, buffer)
     atomic_write_bytes(Path(path), buffer.getvalue())
@@ -101,7 +112,7 @@ def load_predictor(path, config, expected_lineage=None, *, expected_state_sha256
         raise RuntimeError("predictor scientific training contract mismatch")
     expected_recipe = dict(config["training"]) | {
         "seed": int(config["experiment"]["seed"]),
-        "training_sequence": config["experiment"]["training_sequence"],
+        **_training_sequences(config),
         "target": "offline_oracle_hidden_jepa_block5",
         "checkpoint_contains_optimizer_or_scaler": False,
     }

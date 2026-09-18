@@ -1,0 +1,5 @@
+schema_version: 1
+train:
+  kind: predictor
+  base_config: configs/infer/mh01_four_modes.yaml
+  sequences: [MH_01_easy, MH_02_easy]

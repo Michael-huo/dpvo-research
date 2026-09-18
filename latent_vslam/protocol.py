@@ -14,7 +14,7 @@ from typing import Any, Mapping, Sequence
 PACKAGE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = PACKAGE_DIR.parent
 RATIO_SCHEDULE_METHOD = "exp6_post_bootstrap_ratio"
-SUPPORTED_SEQUENCES = ("MH_01_easy", "MH_03_medium", "MH_05_difficult")
+SUPPORTED_SEQUENCES = ("MH_01_easy", "MH_02_easy", "MH_03_medium", "MH_05_difficult")
 
 
 class FrameRole(str, Enum):
